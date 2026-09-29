@@ -2,8 +2,9 @@
 PATH=/www/server/panel/pyenv/bin:/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
 export PATH
 
-PLUGIN_DIR=/www/server/panel/plugin/frpwaf
-WAF_HOME=/opt/frpwaf
+# 插件目录由脚本自身位置推导，不写死路径（宝塔可能装到其它目录 / 改目录名）。
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WAF_HOME="${FRPWAF_HOME:-/opt/frpwaf}"
 INIT=/etc/init.d/frpwaf
 FRPS_TOML=/usr/local/frps/frps.toml
 

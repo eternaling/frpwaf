@@ -24,13 +24,15 @@ import tempfile
 import time
 import urllib.request
 
+from . import config
+
 FRPS_DIR = "/usr/local/frps"
 FRPC_DIR = "/usr/local/frpc"
 FRPS_TOML = FRPS_DIR + "/frps.toml"
 FRPC_TOML = FRPC_DIR + "/frpc.toml"
 FRPS_INIT = "/etc/init.d/frps"
 FRPC_INIT = "/etc/init.d/frpc"
-BACKUP_DIR = "/opt/frpwaf/data/frp_backup"
+BACKUP_DIR = os.path.join(config.DATA_DIR, "frp_backup")
 
 GH_RELEASE = "https://github.com/fatedier/frp/releases/download/v{ver}/frp_{ver}_linux_{arch}.tar.gz"
 GH_API_LATEST = "https://api.github.com/repos/fatedier/frp/releases/latest"
@@ -43,8 +45,8 @@ MIRRORS = [
 ]
 
 # 异步安装任务状态文件（供前端轮询）
-JOB_FILE = "/opt/frpwaf/data/frp_job.json"
-JOB_LOG = "/opt/frpwaf/data/frp_job.log"
+JOB_FILE = os.path.join(config.DATA_DIR, "frp_job.json")
+JOB_LOG = os.path.join(config.DATA_DIR, "frp_job.log")
 
 
 def _dir(kind):

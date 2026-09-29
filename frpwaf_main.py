@@ -17,15 +17,18 @@ import traceback
 
 BASE_PATH = "/www/server/panel"
 os.chdir(BASE_PATH)
+
+# 插件自身所在目录：不写死 /www/server/panel/plugin/frpwaf，而是由本文件位置推导，
+# 这样无论宝塔把插件装到哪个目录（改名 / 迁移 / 其它面板版本）都能正确定位 app/。
+PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, PLUGIN_DIR)
 sys.path.insert(0, "class/")
-sys.path.insert(0, "/www/server/panel/plugin/frpwaf")
 import public
 
 WAF_HOME = "/opt/frpwaf"
 WAF_PORT = 7080
 
 WAF_INIT = "/etc/init.d/frpwaf"
-PLUGIN_DIR = "/www/server/panel/plugin/frpwaf"
 FRPS_TOML = "/usr/local/frps/frps.toml"
 PYTHON = "/www/server/panel/pyenv/bin/python"
 if not os.path.exists(PYTHON):
@@ -49,12 +52,22 @@ def _app_pkg_dir():
 
     首次安装时 WAF 尚未部署到 /opt/frpwaf，此时直接用插件目录里的代码，
     保证「点击插件」等操作在部署前也能正常工作（与旧版 sys.path 回退一致）。
+    插件目录由本文件位置推导，宝塔把插件装到其它路径也能找到。
     """
-    cands = [os.path.join(WAF_HOME, "app"), os.path.join(PLUGIN_DIR, "app")]
+    cands = [
+        os.path.join(WAF_HOME, "app"),
+        os.path.join(PLUGIN_DIR, "app"),
+        os.path.join(os.path.dirname(PLUGIN_DIR), "frpwaf", "app"),
+    ]
     for d in cands:
         if os.path.isfile(os.path.join(d, "__init__.py")):
             return d
-    return cands[0]
+    # 都找不到：明确报错（而不是抛出难懂的 FileNotFoundError），
+    # 通常说明上传的插件包结构不对（缺少 app/ 目录）或未完成安装。
+    raise FileNotFoundError(
+        "未找到 FRP WAF 运行代码包 app/（已尝试：%s）。"
+        "请确认上传的插件包根目录下包含 app/ 目录，或在宝塔插件页重新执行安装。"
+        % "，".join(cands))
 
 
 def _load_app_pkg():

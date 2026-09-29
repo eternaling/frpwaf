@@ -9,11 +9,13 @@ import ipaddress
 import os
 import threading
 
+from . import config
+
 # 候选数据库路径（按顺序探测）
 CANDIDATES = [
     "/www/server/panel/config/GeoLite2-City.mmdb",
     "/usr/share/GeoIP/GeoLite2-City.mmdb",
-    "/opt/frpwaf/data/GeoLite2-City.mmdb",
+    os.path.join(config.DATA_DIR, "GeoLite2-City.mmdb"),
 ]
 
 _reader = None

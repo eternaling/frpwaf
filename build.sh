@@ -1,23 +1,44 @@
 #!/bin/bash
-# 组装并安装 FRP WAF 宝塔插件
-# 用法: bash build.sh [install]
+# 组装 / 打包 / 安装 FRP WAF 宝塔插件
+#
+# 用法:
+#   bash build.sh            # 仅组装插件包 -> dist/frpwaf
+#   bash build.sh zip        # 组装并打成可上传的 zip -> dist/frpwaf.zip
+#   bash build.sh install    # 组装并直接安装到本机宝塔插件目录
+#
+# 目录约定（重要）：
+#   宝塔「上传安装」会扫描压缩包，找到同时含 info.json + install.sh 的目录
+#   作为插件根目录，并把该目录下的全部内容原样拷进 /www/server/panel/plugin/<name>。
+#   因此插件包根目录必须同时包含 info.json / install.sh / app/ / web/ ...
+#   本仓库根目录即为插件包根目录，dist/frpwaf 是从仓库根目录拷贝出的成品。
 set -e
-SRC=/opt/frpwaf
-PKG=/opt/frpwaf/dist/frpwaf
+SRC="$(cd "$(dirname "$0")" && pwd)"
+PKG="$SRC/dist/frpwaf"
+ZIP="$SRC/dist/frpwaf.zip"
 PLUGIN=/www/server/panel/plugin/frpwaf
 
 echo "[*] 组装插件包 -> $PKG"
-rm -rf "$PKG"; mkdir -p "$PKG"
-cp -a "$SRC/app"            "$PKG/"
-cp -a "$SRC/web"            "$PKG/"
-cp -a "$SRC/bt_plugin/frpwaf_main.py" "$PKG/"
-cp -a "$SRC/bt_plugin/install.sh"     "$PKG/"
-cp -a "$SRC/bt_plugin/uninstall.sh"   "$PKG/"
-cp -a "$SRC/bt_plugin/index.html"     "$PKG/"
-cp -a "$SRC/bt_plugin/info.json"      "$PKG/"
-cp -a "$SRC/frpwaf.init"              "$PKG/"
+rm -rf "$PKG" "$ZIP"; mkdir -p "$PKG"
+# 运行代码包与网页资源
+cp -a "$SRC/app" "$PKG/"
+cp -a "$SRC/web" "$PKG/"
+# 插件封装（后端 / 前端 / 元信息 / 安装卸载脚本 / 服务脚本）
+cp -a "$SRC/frpwaf_main.py" "$PKG/"
+cp -a "$SRC/index.html"     "$PKG/"
+cp -a "$SRC/info.json"      "$PKG/"
+cp -a "$SRC/install.sh"     "$PKG/"
+cp -a "$SRC/uninstall.sh"   "$PKG/"
+cp -a "$SRC/frpwaf.init"    "$PKG/"
 chmod +x "$PKG/install.sh" "$PKG/uninstall.sh" "$PKG/frpwaf.init"
 echo "[*] 包内容:"; ls -la "$PKG"
+
+if [ "$1" == "zip" ]; then
+  echo "[*] 打包可上传 zip -> $ZIP"
+  # 以包内文件为顶层（不含 frpwaf/ 外壳），宝塔上传即可直接识别
+  (cd "$PKG" && zip -rq "$ZIP" .)
+  echo "[*] 生成完成：$ZIP"
+  exit 0
+fi
 
 if [ "$1" == "install" ]; then
   echo "[*] 安装到宝塔插件目录 -> $PLUGIN"

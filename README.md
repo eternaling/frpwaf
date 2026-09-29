@@ -25,17 +25,41 @@
 ├── data/                       运行时数据（SQLite / 配置 / 日志 / PID）
 │   ├── frpwaf.db               名单、日志、封禁、统计
 │   └── frpwaf.json             配置（含管理员密码）
-├── bt_plugin/                  宝塔插件封装
-│   ├── frpwaf_main.py          插件后端（public 接口）
-│   ├── index.html              插件前端（宝塔面板内嵌页）
-│   ├── info.json               插件元信息
-│   └── install.sh              插件安装/卸载脚本
+├── frpwaf_main.py              插件后端（public 接口）
+├── index.html                  插件前端（宝塔面板内嵌页）
+├── info.json                   插件元信息
+├── install.sh                  插件安装/卸载脚本
+├── uninstall.sh                插件卸载脚本
 ├── frpwaf.init                 服务启动脚本（/etc/init.d/frpwaf）
-├── build.sh                    组装 & 安装插件
+├── build.sh                    组装 & 打包 & 安装插件
 └── README.md
 
 /www/server/panel/plugin/frpwaf/   宝塔插件安装位置（由 build.sh install 生成）
 ```
+
+> **插件包根目录 = 本仓库根目录**。宝塔「上传安装」会扫描压缩包，取同时含
+> `info.json` + `install.sh` 的目录作为插件根，并把其下内容原样拷入
+> `/www/server/panel/plugin/frpwaf/`。因此压缩包**根目录**必须直接包含
+> `app/`、`web/`、`frpwaf_main.py`、`info.json` 等（不能再多套一层文件夹），
+> 否则 `app/` 会缺失，点击插件即报 `FileNotFoundError: .../app/__init__.py`。
+> 用 `bash build.sh zip` 生成的 `dist/frpwaf.zip` 即为可直接上传的成品。
+
+---
+
+## 打包 / 上传安装
+
+```bash
+cd /opt/frpwaf
+
+# 生成可直接上传的插件 zip（结构：zip 根目录下就是 app/ web/ info.json ...）
+bash build.sh zip
+# -> /opt/frpwaf/dist/frpwaf.zip
+
+# 或直接安装到本机宝塔插件目录
+bash build.sh install
+```
+
+宝塔面板 → 软件商店 → 第三方插件 → **上传安装**，选择 `dist/frpwaf.zip` 即可。
 
 ---
 
