@@ -44,13 +44,26 @@ _APP_SIG = None
 _APP_LOCK = threading.Lock()
 
 
-def _load_app_pkg():
-    """把 /opt/frpwaf/app 目录以私有包名 frpwaf_app 注册到 sys.modules。
+def _app_pkg_dir():
+    """运行代码包目录：优先 /opt/frpwaf/app，未部署时回退插件自带 app/。
 
-    若同名包已存在但 __path__ 不是本插件目录（被顶替），则重建修复。
+    首次安装时 WAF 尚未部署到 /opt/frpwaf，此时直接用插件目录里的代码，
+    保证「点击插件」等操作在部署前也能正常工作（与旧版 sys.path 回退一致）。
+    """
+    cands = [os.path.join(WAF_HOME, "app"), os.path.join(PLUGIN_DIR, "app")]
+    for d in cands:
+        if os.path.isfile(os.path.join(d, "__init__.py")):
+            return d
+    return cands[0]
+
+
+def _load_app_pkg():
+    """把运行代码包目录以私有包名 frpwaf_app 注册到 sys.modules。
+
+    若同名包已存在但 __path__ 不是当前选定目录（被顶替），则重建修复。
     """
     import importlib.util
-    pkg_dir = os.path.join(WAF_HOME, "app")
+    pkg_dir = _app_pkg_dir()
     cur = sys.modules.get(_APP_PKG)
     if cur is not None and list(getattr(cur, "__path__", []) or []) == [pkg_dir]:
         return cur
@@ -72,21 +85,23 @@ def _load_app_pkg():
 
 
 def _app(modname):
-    """导入 /opt/frpwaf/app 下的子模块，源码有变更时自动重载。
+    """导入运行代码子模块，源码有变更时自动重载。
 
-    使用私有包名 frpwaf_app，避免与宝塔面板/其它插件的通用 "app" 包冲突。
+    使用私有包名 frpwaf_app，避免与宝塔面板/其它插件的通用 "app" 包冲突；
+    包目录优先 /opt/frpwaf/app，未部署时回退插件目录 app/。
     """
     global _APP_SIG
     with _APP_LOCK:
         if WAF_HOME not in sys.path:
             sys.path.insert(0, WAF_HOME)
         import importlib
-        pkg_dir = os.path.join(WAF_HOME, "app")
+        pkg_dir = _app_pkg_dir()
         sig = []
         try:
             for fn in sorted(os.listdir(pkg_dir)):
                 if fn.endswith(".py"):
-                    sig.append((fn, int(os.path.getmtime(os.path.join(pkg_dir, fn)))))
+                    sig.append((pkg_dir, fn,
+                                int(os.path.getmtime(os.path.join(pkg_dir, fn)))))
         except OSError:
             pass
         sig = tuple(sig)
@@ -96,7 +111,7 @@ def _app(modname):
                       if m == _APP_PKG or m.startswith(_APP_PKG + ".")]:
                 sys.modules.pop(m, None)
             _APP_SIG = sig
-        _load_app_pkg()   # 确保私有包存在且指向本插件目录（防被顶替）
+        _load_app_pkg()   # 确保私有包存在且指向当前选定目录（防被顶替）
         return importlib.import_module(_APP_PKG + "." + modname)
 
 
