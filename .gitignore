@@ -1,0 +1,28 @@
+# ---- 运行时数据（含密钥/密码/连接日志，绝不入库）----
+data/
+dist/
+*.db
+*.db-wal
+*.db-shm
+frpwaf.json
+frpwaf.log
+frpwaf.pid
+frp_job.json
+frp_backup/
+
+# ---- Python 字节码 ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# ---- frp 配置备份（可能含 token/密码）----
+*.bak.*
+*.premigrate.*
+*.migrate
+*.new.*

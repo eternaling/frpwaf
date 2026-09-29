@@ -1,0 +1,1214 @@
+<style>
+  /* 宝塔把插件内容放在固定 720px 宽的弹层 #plugin-view 里（内联样式），
+     这里用 !important 覆盖，放宽到接近全屏，才能左右铺开。 */
+  #plugin-view{width:min(1560px,96vw) !important;height:auto !important;max-height:calc(100vh - 24px) !important}
+  #plugin-view .layui-layer-content{height:auto !important;max-height:none !important;overflow:visible !important}
+  /* 插件主体：占满可视高度，尽量少滚动 */
+  .fw-main{height:calc(100vh - 150px);min-height:660px;background:#fff;
+    border:1px solid #e5e7eb;border-radius:8px;overflow:hidden}
+  .fw-main .bt-w-menu{width:150px;padding-top:6px}
+  .fw-main .bt-w-con{margin-left:150px;height:100%;overflow-y:auto;overflow-x:hidden;
+    padding:18px 22px;box-sizing:border-box}
+  /* 选中态沿用宝塔原生 .bgw 类，只加蓝色强调；不覆盖 height/line-height，避免文字错位 */
+  .fw-main .bt-w-menu p{font-size:14px;padding-left:20px}
+  .fw-main .bt-w-menu p.bgw{background:#fff;color:#2d8cf0;font-weight:600;
+      border-left:3px solid #2d8cf0;padding-left:17px}
+  .fw-wrap{font-size:13px;color:#333}
+  .fw-wrap h2{margin:0;font-size:17px;display:flex;align-items:center;gap:10px}
+  .fw-badge{padding:3px 10px;border-radius:20px;font-size:12px;font-weight:600}
+  .fw-badge.on{background:#e7f7ec;color:#1a9c48}
+  .fw-badge.off{background:#fdeaea;color:#d33}
+  .fw-tag{padding:2px 8px;border-radius:4px;font-size:11px}
+  .fw-tag.ok{background:#e7f7ec;color:#1a9c48}
+  .fw-tag.no{background:#fdeaea;color:#d33}
+  .fw-tag.gray{background:#f0f0f0;color:#999}
+  .fw-card{background:#fff;border:1px solid #e8eaed;border-radius:8px;padding:16px 18px;
+    box-shadow:0 1px 2px rgba(16,24,40,.03)}
+  .fw-card h3{margin:0 0 12px;font-size:14px;color:#1f2937}
+  .fw-row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .fw-kv{display:grid;grid-template-columns:110px 1fr;gap:9px 12px;font-size:13px}
+  .fw-kv .k{color:#8c8c8c}
+  .fw-tip{color:#999;font-size:12px;margin-top:9px;line-height:1.6}
+  .fw-wrap code{background:#f5f7fa;padding:2px 7px;border-radius:4px;color:#2d8cf0;word-break:break-all}
+  .fw-wrap pre{background:#0f172a;color:#cbd5e1;padding:12px;border-radius:8px;
+    max-height:400px;overflow:auto;font-size:12px;line-height:1.6;margin:0;white-space:pre-wrap;word-break:break-all}
+  .fw-wrap a{color:#2d8cf0}
+  .fw-table{width:100%;border-collapse:collapse;font-size:12px}
+  .fw-table th{background:#fafafa;color:#8c8c8c;font-weight:400;text-align:left;
+    padding:10px 12px;border-bottom:1px solid #f0f0f0;position:sticky;top:0;z-index:1}
+  .fw-table td{padding:10px 12px;border-bottom:1px solid #f5f5f5;color:#595959}
+  .fw-table tbody tr:hover{background:#fafafa}
+  .fw-table-wrap{max-height:300px;overflow:auto;border:1px solid #f0f0f0;border-radius:6px}
+  .fw-geo-result{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-top:12px}
+  .fw-geo-result .item{background:#f8fafc;border:1px solid #eef2f6;border-radius:8px;padding:10px 12px}
+  .fw-geo-result .item .k{color:#94a3b8;font-size:12px;margin-bottom:4px}
+  .fw-geo-result .item .v{font-size:14px;color:#1f2937;font-weight:500;word-break:break-all}
+
+  /* 分栏布局：卡片并排，减少纵向滚动 */
+  .fw-main .bt-w-con .bt-w-item{display:none;height:auto}
+  .fw-main .bt-w-con .bt-w-item.active{display:flex;flex-direction:column;gap:14px;height:auto}
+  .fw-grid{display:grid;gap:14px;align-items:start}
+  .fw-grid.cols-2{grid-template-columns:1fr 1fr}
+  .fw-grid.cols-3{grid-template-columns:repeat(3,1fr)}
+  .fw-span-2{grid-column:1 / -1}
+  .fw-cols{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}
+  .fw-col{display:flex;flex-direction:column;gap:14px;min-width:0}
+  .fw-wrap pre.fw-fill{height:calc(100vh - 320px);min-height:260px;max-height:none}
+  .fw-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px}
+  .fw-stats .st{background:#fff;border:1px solid #e8eaed;border-radius:8px;padding:12px 14px;
+    box-shadow:0 1px 2px rgba(16,24,40,.03)}
+  .fw-stats .st .k{color:#94a3b8;font-size:12px;margin-bottom:6px}
+  .fw-stats .st .v{font-size:22px;font-weight:700;color:#1f2937}
+  .fw-stats .st .v.err{color:#d33} .fw-stats .st .v.pri{color:#2d8cf0}
+  .fw-seg{display:inline-flex;border:1px solid #d9dee5;border-radius:6px;overflow:hidden}
+  .fw-seg button{background:#fff;border:none;padding:5px 14px;font-size:13px;color:#595959;cursor:pointer}
+  .fw-seg button.on{background:#2d8cf0;color:#fff}
+  .fw-switches{display:flex;flex-direction:column;gap:10px;font-size:13px;color:#595959}
+  .fw-switches label{display:flex;align-items:center;gap:8px;cursor:pointer}
+  .fw-eye{cursor:pointer;user-select:none;margin-left:4px;opacity:.65;font-size:13px}
+  .fw-eye:hover{opacity:1}
+  @media (max-width:1080px){
+    .fw-grid.cols-2,.fw-grid.cols-3,.fw-cols{grid-template-columns:1fr}
+    .fw-span-2{grid-column:auto}
+  }
+</style>
+
+<div class="bt-w-main fw-main">
+  <div class="bt-w-menu">
+    <p class="bgw" data-item="status">概览</p>
+    <p data-item="ban">IP 名单 / 封禁</p>
+    <p data-item="ai">AI 审查</p>
+    <p data-item="connlog">连接日志</p>
+    <p data-item="proxy">代理统计</p>
+    <p data-item="frp">frp 管理</p>
+    <p data-item="frps">frps 集成</p>
+    <p data-item="geo">IP 归属查询</p>
+    <p data-item="settings">设置</p>
+    <p data-item="log">运行日志</p>
+  </div>
+  <div class="bt-w-con">
+    <div class="fw-wrap">
+
+      <!-- 概览 -->
+      <div class="bt-w-item active" data-item="status">
+        <h2>概览 <span id="fwStatus" class="fw-badge off">检测中…</span></h2>
+        <div class="fw-stats" id="fwStats"></div>
+        <div class="fw-cols">
+          <div class="fw-col">
+            <div class="fw-card">
+              <h3>运行信息</h3>
+              <div class="fw-kv" id="fwInfo"></div>
+            </div>
+            <div class="fw-card">
+              <h3>服务控制</h3>
+              <div class="fw-row">
+                <button class="btn btn-success btn-sm" onclick="fwCtl('start')">启动</button>
+                <button class="btn btn-default btn-sm" onclick="fwCtl('restart')">重启</button>
+                <button class="btn btn-danger btn-sm" onclick="fwCtl('stop')">停止</button>
+                <span style="flex:1"></span>
+                <button class="btn btn-default btn-sm" onclick="fwInstall()">安装 / 更新</button>
+                <button class="btn btn-danger btn-sm" onclick="fwUninstall()">卸载</button>
+              </div>
+              <div class="fw-tip">管理面板：<a id="fwUrl" href="#" target="_blank"></a>（账号 <code id="fwCredUser">admin</code>，密码 <code id="fwCredPwd">••••••</code>
+                <span class="fw-eye" id="fwCredEye" title="显示 / 隐藏密码" onclick="fwToggleCred()">👁</span>）</div>
+            </div>
+          </div>
+          <div class="fw-col">
+            <div class="fw-card">
+              <h3>最近连接 <span style="color:#999;font-size:12px;font-weight:400">最新 15 条</span></h3>
+              <div class="fw-table-wrap" style="max-height:300px">
+                <table class="fw-table"><thead><tr><th>时间</th><th>来源 IP</th><th>归属地</th><th>代理</th><th>动作</th></tr></thead>
+                <tbody id="fwDashLogs"><tr><td colspan="5" style="color:#bbb;text-align:center">加载中…</td></tr></tbody></table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- IP 封禁 -->
+      <div class="bt-w-item" data-item="ban">
+        <h2>IP 名单 / 封禁</h2>
+        <div class="fw-grid cols-2">
+          <div class="fw-card">
+            <h3>添加 IP / CIDR</h3>
+            <div class="fw-row">
+              <input id="fwBanIp" class="bt-input-text" placeholder="IP 或 CIDR，如 1.2.3.4 或 1.2.3.0/24" style="width:240px">
+              <select id="fwBanMode" class="bt-input-text" style="width:170px" onchange="fwBanModeChange()">
+                <option value="black">黑名单（拒绝）</option>
+                <option value="white">白名单（放行）</option>
+                <option value="temp">临时封禁</option>
+              </select>
+              <input id="fwBanSec" class="bt-input-text" type="number" value="3600" style="width:110px;display:none" title="封禁秒数">
+            </div>
+            <div class="fw-row" style="margin-top:10px">
+              <input id="fwBanRemark" class="bt-input-text" placeholder="备注（可选）" style="width:240px">
+              <button class="btn btn-danger btn-sm" onclick="fwBan()">添加</button>
+            </div>
+            <details style="margin-top:10px">
+              <summary style="cursor:pointer;color:#999;font-size:12px">批量导入（每行一个，支持 <code>CIDR,备注</code>）</summary>
+              <textarea id="fwBatchText" class="bt-input-text" style="width:100%;height:90px;margin-top:8px;font-family:Menlo,Consolas,monospace;font-size:12px" placeholder="1.2.3.4,恶意扫描&#10;10.0.0.0/8,内网"></textarea>
+              <div class="fw-row" style="margin-top:8px">
+                <button class="btn btn-default btn-sm" onclick="fwBatchImport('black')">导入到黑名单</button>
+                <button class="btn btn-default btn-sm" onclick="fwBatchImport('white')">导入到白名单</button>
+              </div>
+            </details>
+            <div class="fw-tip">黑名单=拒绝，白名单=优先放行（需在「设置」中启用白名单）；临时封禁到期自动解除。</div>
+          </div>
+
+          <div class="fw-card">
+            <h3>内核级封禁 <span id="fwKernBanState" class="fw-badge off">检测中…</span></h3>
+            <div class="fw-kv" id="fwKernBanInfo" style="grid-template-columns:120px 1fr"></div>
+            <div class="fw-row" style="margin-top:10px">
+              <button class="btn btn-default btn-sm" onclick="fwKernBanSync()">立即同步</button>
+              <button class="btn btn-default btn-sm" onclick="fwLoadKernBan()">刷新</button>
+            </div>
+            <div class="fw-tip">把黑名单与生效中的封禁同步到 <code>ipset + iptables</code>，被禁 IP 的数据包在<b>内核层直接丢弃</b>，连不到 frps，因此「连接数」不再增长，也节省 frps/CPU 资源。<br>说明：frp 的插件钩子是应用层准入，被拒的连接其 TCP 仍会被内核接受，所以仅靠插件拦截时计数仍会持续上涨——这正是本功能要解决的问题。</div>
+          </div>
+
+          <div class="fw-card">
+            <h3>名单列表 <span style="color:#999;font-size:12px;font-weight:400" id="fwIpListCount"></span></h3>
+            <div class="fw-row" style="margin-bottom:10px">
+              <div class="fw-seg" id="fwIpListSeg">
+                <button class="on" onclick="fwIpListType('black',this)">黑名单</button>
+                <button onclick="fwIpListType('white',this)">白名单</button>
+                <button onclick="fwIpListType('',this)">全部</button>
+              </div>
+              <span style="flex:1"></span>
+              <button class="btn btn-default btn-sm" onclick="fwLoadIpList()">刷新</button>
+            </div>
+            <div class="fw-table-wrap" style="max-height:320px">
+              <table class="fw-table"><thead><tr><th>条目</th><th>类型</th><th>归属地</th><th>备注</th><th>添加时间</th><th style="width:70px">操作</th></tr></thead>
+              <tbody id="fwIpList"><tr><td colspan="6" style="color:#bbb;text-align:center">加载中…</td></tr></tbody></table>
+            </div>
+          </div>
+
+          <div class="fw-card">
+            <h3>临时封禁（生效中） <span style="color:#999;font-size:12px;font-weight:400" id="fwTempCount"></span></h3>
+            <div class="fw-table-wrap" style="max-height:320px">
+              <table class="fw-table"><thead><tr><th>IP</th><th>归属地</th><th>原因</th><th>到期时间</th><th style="width:70px">操作</th></tr></thead>
+              <tbody id="fwTempList"><tr><td colspan="5" style="color:#bbb;text-align:center">暂无</td></tr></tbody></table>
+            </div>
+          </div>
+
+          <div class="fw-card fw-span-2">
+            <h3>封禁历史 <span style="color:#999;font-size:12px;font-weight:400">最近 100 条</span></h3>
+            <div class="fw-table-wrap" style="max-height:300px">
+              <table class="fw-table"><thead><tr><th>IP</th><th>归属地</th><th>原因</th><th>封禁时间</th><th>到期时间</th><th>状态</th></tr></thead>
+              <tbody id="fwBanHis"><tr><td colspan="6" style="color:#bbb;text-align:center">暂无</td></tr></tbody></table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- AI 审查 -->
+      <div class="bt-w-item" data-item="ai">
+        <h2>AI 自动 IP 审查 <span id="fwAiState" class="fw-badge off">未启用</span></h2>
+        <div class="fw-grid cols-2">
+          <div class="fw-card">
+            <h3>接口配置</h3>
+            <div class="fw-kv" style="grid-template-columns:110px 1fr">
+              <div class="k">启用审查</div>
+              <div><input type="checkbox" id="ai_enabled"> 每隔一段时间自动审查一次</div>
+              <div class="k">协议</div>
+              <div><select id="ai_protocol" class="bt-input-text" style="width:200px">
+                <option value="openai">OpenAI 协议</option>
+                <option value="anthropic">Anthropic 协议</option>
+              </select></div>
+              <div class="k">接口地址</div>
+              <div><input id="ai_base_url" class="bt-input-text" placeholder="如 http://127.0.0.1:3000" style="width:100%"></div>
+              <div class="k">API Key</div>
+              <div><input id="ai_api_key" class="bt-input-text" placeholder="sk-..." style="width:100%" autocomplete="off"></div>
+              <div class="k">模型</div>
+              <div><input id="ai_model" class="bt-input-text" placeholder="如 claude-haiku-4.5" style="width:100%"></div>
+            </div>
+            <div class="fw-row" style="margin-top:12px">
+              <button class="btn btn-default btn-sm" onclick="fwAiTest()">测试连接</button>
+              <button class="btn btn-success btn-sm" onclick="fwAiSave()">保存配置</button>
+            </div>
+            <div class="fw-tip">接口地址填到根即可，如 <code>http://127.0.0.1:3000</code>；若填 <code>.../v1</code> 或完整路径也能自动识别，不会重复拼接。</div>
+          </div>
+
+          <div class="fw-card">
+            <h3>审查策略</h3>
+            <div class="fw-kv" style="grid-template-columns:150px 1fr">
+              <div class="k">审查间隔（秒）</div>
+              <div><input id="ai_interval" class="bt-input-text" type="number" style="width:130px" value="300"></div>
+              <div class="k">分析时间窗口（秒）</div>
+              <div><input id="ai_window" class="bt-input-text" type="number" style="width:130px" value="300"></div>
+              <div class="k">最小连接数阈值</div>
+              <div><input id="ai_min_conns" class="bt-input-text" type="number" style="width:130px" value="20"></div>
+              <div class="k">每次最多审查 IP 数</div>
+              <div><input id="ai_max_ips" class="bt-input-text" type="number" style="width:130px" value="20"></div>
+              <div class="k">自动封禁恶意 IP</div>
+              <div><input type="checkbox" id="ai_auto_ban" checked></div>
+              <div class="k">AI 封禁时长（秒）</div>
+              <div><input id="ai_ban_seconds" class="bt-input-text" type="number" style="width:130px" value="1800"></div>
+              <div class="k">接口超时（秒）</div>
+              <div><input id="ai_timeout" class="bt-input-text" type="number" style="width:130px" value="120"></div>
+            </div>
+            <div class="fw-row" style="margin-top:12px">
+              <button class="btn btn-danger btn-sm" onclick="fwAiRun()">立即审查一次</button>
+              <button class="btn btn-default btn-sm" onclick="fwAiLoadResults()">刷新结果</button>
+              <span id="fwAiLast" style="color:#999;font-size:12px"></span>
+            </div>
+          </div>
+
+          <div class="fw-card fw-span-2">
+            <h3>审查结果 <span style="color:#999;font-size:12px;font-weight:400">最近 100 条</span></h3>
+            <div class="fw-table-wrap" style="max-height:340px">
+              <table class="fw-table"><thead><tr><th>时间</th><th>IP</th><th>判定</th><th>理由</th><th>动作</th></tr></thead>
+              <tbody id="fwAiResults"><tr><td colspan="5" style="color:#bbb;text-align:center">暂无</td></tr></tbody></table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- frp 管理（合并自官方 frp管理器） -->
+      <div class="bt-w-item" data-item="frp">
+        <h2>frp 管理 <span id="fwFrpState" class="fw-badge off">检测中…</span></h2>
+
+        <div class="fw-card">
+          <div class="fw-row">
+            <span>管理对象：</span>
+            <select id="fwFrpKind" class="bt-input-text" style="width:150px" onchange="fwFrpSwitch()">
+              <option value="frps">frps 服务端</option>
+              <option value="frpc">frpc 客户端</option>
+            </select>
+            <span style="flex:1"></span>
+            <button class="btn btn-default btn-sm" onclick="fwFrpLoad()">刷新</button>
+          </div>
+        </div>
+
+        <div class="fw-cols">
+          <div class="fw-col">
+            <div class="fw-card">
+              <h3>服务状态</h3>
+              <div class="fw-kv" id="fwFrpInfo"></div>
+              <div class="fw-row" style="margin-top:12px">
+                <button class="btn btn-success btn-sm" onclick="fwFrpCtl('start')">启动</button>
+                <button class="btn btn-default btn-sm" onclick="fwFrpCtl('restart')">重启</button>
+                <button class="btn btn-danger btn-sm" onclick="fwFrpCtl('stop')">停止</button>
+                <span style="flex:1"></span>
+                <button class="btn btn-info btn-sm" onclick="fwFrpEnsureConfig()">预创建配置文件</button>
+              </div>
+              <div class="fw-tip">若 <code>frps.toml</code> / <code>frpc.toml</code> 缺失，打开本页或点此按钮会自动生成一份可用的默认配置。</div>
+            </div>
+
+            <div class="fw-card">
+              <h3>版本管理</h3>
+              <div class="fw-kv" id="fwFrpVer"></div>
+              <div class="fw-row" style="margin-top:12px">
+                <input id="fwFrpVerInput" class="bt-input-text" placeholder="留空=最新版，或填 0.71.0" style="width:200px">
+                <button class="btn btn-success btn-sm" id="fwFrpInstallBtn" onclick="fwFrpInstall()">安装 / 升级</button>
+                <button class="btn btn-warning btn-sm" id="fwFrpRollbackBtn" onclick="fwFrpRollback()">回滚</button>
+                <button class="btn btn-default btn-sm" onclick="fwFrpCheckVer()">检查最新版</button>
+              </div>
+              <div id="fwFrpProgress" style="display:none;margin-top:12px">
+                <div style="background:#eef1f5;border-radius:6px;height:16px;overflow:hidden">
+                  <div id="fwFrpBar" style="height:100%;width:0;background:#2d8cf0;transition:width .3s"></div>
+                </div>
+                <div id="fwFrpProgMsg" class="fw-tip" style="margin-top:6px"></div>
+              </div>
+              <div class="fw-tip">升级只替换二进制，<b>保留现有配置文件</b>（官方插件会清空配置，这里已修复）。升级会自动迁移旧版配置字段，若新版无法启动会<b>自动回滚</b>；也可点“回滚”手动还原到上一次升级前的版本。</div>
+            </div>
+
+            <div class="fw-card">
+              <h3 style="color:#d33">危险操作</h3>
+              <div class="fw-row">
+                <button class="btn btn-danger btn-sm" onclick="fwFrpUninstall()">卸载当前 frp</button>
+              </div>
+              <div class="fw-tip">卸载会停止服务并删除程序目录（<code>/usr/local/frps</code> 或 <code>/usr/local/frpc</code>）。</div>
+            </div>
+          </div>
+
+          <div class="fw-col">
+            <div class="fw-card">
+              <h3>配置修改 <span style="color:#999;font-size:12px;font-weight:400">结构化，保存后自动校验</span></h3>
+              <div id="fwFrpForm"></div>
+              <div class="fw-row" style="margin-top:12px">
+                <button class="btn btn-success btn-sm" onclick="fwFrpSaveForm()">保存配置</button>
+                <button class="btn btn-default btn-sm" onclick="fwFrpVerify()">校验配置</button>
+                <button class="btn btn-info btn-sm" onclick="fwFrpReleasePorts()">一键放行端口</button>
+              </div>
+              <div class="fw-tip">保存会保留 <code>[[httpPlugins]]</code> 等未展示字段，并在写前自动备份、写后 <code>verify</code> 校验，失败自动回滚。</div>
+            </div>
+
+            <div class="fw-card">
+              <h3>配置文件（原文） <span style="color:#999;font-size:12px;font-weight:400" id="fwFrpPath"></span></h3>
+              <textarea id="fwFrpRaw" class="bt-input-text" style="width:100%;height:300px;font-family:Menlo,Consolas,monospace;font-size:12px"></textarea>
+              <div class="fw-row" style="margin-top:10px">
+                <button class="btn btn-success btn-sm" onclick="fwFrpSaveRaw()">保存原文</button>
+                <button class="btn btn-default btn-sm" onclick="fwFrpLoad()">重新加载</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="fw-card">
+          <h3>运行日志</h3>
+          <div class="fw-row" style="margin-bottom:10px">
+            <button class="btn btn-default btn-sm" onclick="fwFrpLoadLog()">刷新</button>
+          </div>
+          <pre id="fwFrpLog" class="fw-fill">加载中…</pre>
+        </div>
+      </div>
+
+      <!-- frps 集成 -->
+      <div class="bt-w-item" data-item="frps">
+        <h2>frps 集成</h2>
+        <div class="fw-grid cols-2">
+          <div class="fw-card">
+            <h3>集成状态</h3>
+            <div class="fw-kv" id="fwFrps"></div>
+            <div class="fw-row" style="margin-top:14px">
+              <button class="btn btn-default btn-sm" onclick="fwLoadFrps()">刷新</button>
+            </div>
+          </div>
+          <div class="fw-card">
+            <h3>操作说明</h3>
+            <div class="fw-tip" style="margin-top:0">
+              点击下方按钮会向 frps.toml 注入 <code>[[httpPlugins]]</code> 配置并重启 frps，
+              之后 frps 会在每次用户连接时回调本 WAF，按其决策放行或拒绝。<br><br>
+              <b>注意：</b>此操作会重启 frps（隧道瞬断 1~2 秒）。
+            </div>
+            <div class="fw-row" style="margin-top:14px">
+              <button class="btn btn-info btn-sm" onclick="fwApply()">一键注入 frps 插件配置并重启 frps</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- IP 归属查询 -->
+      <div class="bt-w-item" data-item="geo">
+        <h2>IP 归属地查询 <span class="fw-badge on" id="fwGeoDb" style="display:none">离线库已加载</span></h2>
+        <div class="fw-cols">
+          <div class="fw-col">
+            <div class="fw-card">
+              <h3>查询 IP</h3>
+              <div class="fw-row">
+                <input id="fwGeoIp" class="bt-input-text" placeholder="输入 IP，如 8.8.8.8" style="width:240px">
+                <button class="btn btn-success btn-sm" onclick="fwGeoQuery()">查询</button>
+              </div>
+              <div id="fwGeoResult"></div>
+            </div>
+          </div>
+          <div class="fw-col">
+            <div class="fw-card">
+              <h3>高频来源 IP <span style="color:#999;font-size:12px;font-weight:400">按连接数排序</span></h3>
+              <div class="fw-table-wrap" style="max-height:420px">
+                <table class="fw-table"><thead><tr><th>来源 IP</th><th>归属地</th><th>连接数</th></tr></thead>
+                <tbody id="fwGeoTop"><tr><td colspan="3" style="color:#bbb;text-align:center">加载中…</td></tr></tbody></table>
+              </div>
+              <div class="fw-row" style="margin-top:10px"><button class="btn btn-default btn-sm" onclick="fwLoadGeoTop()">刷新</button></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 运行日志 -->
+      <div class="bt-w-item" data-item="log">
+        <h2>运行日志</h2>
+        <div class="fw-card">
+          <div class="fw-row" style="margin-bottom:10px">
+            <button class="btn btn-default btn-sm" onclick="fwLoadLog()">刷新</button>
+            <button class="btn btn-default btn-sm" onclick="fwClearLog()">清空</button>
+          </div>
+          <pre id="fwLog" class="fw-fill">加载中…</pre>
+        </div>
+      </div>
+
+      <!-- 连接日志 -->
+      <div class="bt-w-item" data-item="connlog">
+        <h2>连接日志 <span style="color:#999;font-size:12px;font-weight:400" id="fwLogTotal"></span></h2>
+        <div class="fw-card">
+          <div class="fw-row" style="margin-bottom:10px">
+            <input id="fwLogIp" class="bt-input-text" placeholder="按 IP 过滤" style="width:180px">
+            <select id="fwLogAction" class="bt-input-text" style="width:130px">
+              <option value="">全部动作</option>
+              <option value="allow">allow</option>
+              <option value="reject">reject</option>
+            </select>
+            <button class="btn btn-default btn-sm" onclick="fwLogPage(0)">查询</button>
+            <button class="btn btn-default btn-sm" onclick="fwLogReset()">重置</button>
+            <span style="flex:1"></span>
+            <button class="btn btn-danger btn-sm" onclick="fwPurgeLogs()">清空日志</button>
+          </div>
+          <div class="fw-table-wrap" style="max-height:calc(100vh - 320px);min-height:260px">
+            <table class="fw-table"><thead><tr><th>时间</th><th>来源 IP</th><th>归属地</th><th>端口</th><th>代理</th><th>类型</th><th>用户</th><th>动作</th><th>原因</th></tr></thead>
+            <tbody id="fwConnLogs"><tr><td colspan="9" style="color:#bbb;text-align:center">加载中…</td></tr></tbody></table>
+          </div>
+          <div class="fw-row" style="margin-top:12px">
+            <button class="btn btn-default btn-sm" onclick="fwLogPrev()">上一页</button>
+            <span style="color:#999;font-size:12px" id="fwLogPageInfo"></span>
+            <button class="btn btn-default btn-sm" onclick="fwLogNext()">下一页</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 代理统计 -->
+      <div class="bt-w-item" data-item="proxy">
+        <h2>代理连接统计 <span style="color:#999;font-size:12px;font-weight:400">按总连接数排序</span></h2>
+        <div class="fw-card">
+          <div class="fw-row" style="margin-bottom:10px">
+            <button class="btn btn-default btn-sm" onclick="fwLoadProxies()">刷新</button>
+          </div>
+          <div class="fw-table-wrap" style="max-height:calc(100vh - 260px);min-height:280px">
+            <table class="fw-table"><thead><tr><th>代理名</th><th>类型</th><th>总连接</th><th>被拒绝</th><th>最后活动</th></tr></thead>
+            <tbody id="fwProxyTable"><tr><td colspan="5" style="color:#bbb;text-align:center">加载中…</td></tr></tbody></table>
+          </div>
+        </div>
+      </div>
+
+      <!-- 设置 -->
+      <div class="bt-w-item" data-item="settings">
+        <h2>准入策略</h2>
+        <div class="fw-grid cols-2">
+          <div class="fw-card">
+            <h3>开关</h3>
+            <div class="fw-switches">
+              <label><input type="checkbox" id="s_blacklist_enabled"> 启用黑名单</label>
+              <label><input type="checkbox" id="s_whitelist_enabled"> 启用白名单（优先于黑名单）</label>
+              <label><input type="checkbox" id="s_auto_ban_enabled"> 启用自动封禁</label>
+              <label><input type="checkbox" id="s_rate_limit_enabled"> 启用单 IP 限速</label>
+              <label><input type="checkbox" id="s_fw_sync_enabled"> 内核级封禁（ipset+iptables 直接丢包）</label>
+              <label><input type="checkbox" id="s_ai_enabled"> 启用 AI 自动审查</label>
+            </div>
+            <div class="fw-tip">修改后需点右侧「保存策略」生效；自动封禁默认关闭，请确认阈值合理后再开启。</div>
+          </div>
+          <div class="fw-card">
+            <h3>阈值参数</h3>
+            <div class="fw-kv" style="grid-template-columns:190px 1fr">
+              <div class="k">自动封禁窗口（秒）</div>
+              <div><input id="s_auto_ban_window" class="bt-input-text" type="number" style="width:150px"></div>
+              <div class="k">窗口内连接数阈值</div>
+              <div><input id="s_auto_ban_threshold" class="bt-input-text" type="number" style="width:150px"></div>
+              <div class="k">自动封禁时长（秒）</div>
+              <div><input id="s_auto_ban_seconds" class="bt-input-text" type="number" style="width:150px"></div>
+              <div class="k">限速（每秒新连接数，0=关）</div>
+              <div><input id="s_rate_limit_per_sec" class="bt-input-text" type="number" style="width:150px"></div>
+              <div class="k">日志保留条数</div>
+              <div><input id="s_log_max_rows" class="bt-input-text" type="number" style="width:150px"></div>
+            </div>
+            <div class="fw-row" style="margin-top:14px">
+              <button class="btn btn-success btn-sm" onclick="fwSavePolicy()">保存策略</button>
+              <button class="btn btn-default btn-sm" onclick="fwLoadPolicy()">重新加载</button>
+            </div>
+          </div>
+          <div class="fw-card fw-span-2">
+            <h3>管理员账号 <span style="color:#999;font-size:12px;font-weight:400">Web 管理面板（7080）</span></h3>
+            <div class="fw-kv" style="grid-template-columns:130px 1fr">
+              <div class="k">当前用户名</div>
+              <div><code id="fwAdminUser">-</code></div>
+              <div class="k">原用户名</div>
+              <div><input id="fwOldUser" class="bt-input-text" placeholder="可选，填写则一并校验" style="width:260px" autocomplete="off"></div>
+              <div class="k">原密码</div>
+              <div><input id="fwPwOld" class="bt-input-text" type="password" placeholder="修改前需验证原密码" style="width:260px" autocomplete="off"></div>
+              <div class="k">新用户名</div>
+              <div><input id="fwNewUser" class="bt-input-text" placeholder="留空=不修改用户名" style="width:260px" autocomplete="off"></div>
+              <div class="k">新密码</div>
+              <div><input id="fwPwNew" class="bt-input-text" type="password" placeholder="留空=不修改密码" style="width:260px" autocomplete="off"></div>
+            </div>
+            <div class="fw-row" style="margin-top:14px">
+              <button class="btn btn-success btn-sm" onclick="fwChangePwd()">保存账号</button>
+              <button class="btn btn-default btn-sm" onclick="fwLoadAdmin()">重新加载</button>
+            </div>
+            <div class="fw-tip">可只改用户名、只改密码，或两者一起改（须填写原密码校验）。</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<script>
+/* 放大插件弹层：宝塔默认把插件塞进 720px 宽的 .layui-layer-page(#plugin-view)，
+   官方 aliesa 插件也是靠 JS 把它改宽才铺得开。这里同步做，并加宽到接近全屏。 */
+(function(){
+  var WANT='min(1560px,96vw)';
+  function fwWiden(){
+    var v=document.getElementById('plugin-view')||document.querySelector('.layui-layer-page');
+    if(!v) return;
+    if(v.getAttribute('data-fw-wide')==='1') return;   // 已处理，避免重复触发
+    v.setAttribute('data-fw-wide','1');
+    try{
+      // 只调宽高；不要设 left/top 的 !important，否则会锁死面板拖拽（拖拽靠改内联 left/top 实现）
+      v.style.setProperty('width',WANT,'important');
+      v.style.setProperty('height','auto','important');
+      // 宽度变了，按新尺寸重新居中（普通内联样式，仍可被拖拽覆盖）
+      var w=v.offsetWidth||0, h=v.offsetHeight||0;
+      if(w){ v.style.left=Math.max(0,(window.innerWidth-w)/2)+'px'; }
+      if(h){ v.style.top=Math.max(0,(window.innerHeight-h)/2)+'px'; }
+    }catch(e){}
+  }
+  fwWiden();
+  // 面板异步创建弹层，早期多试几次（fwWiden 自带去重，实际只生效一次）
+  [80,300,800,1500].forEach(function(t){ setTimeout(fwWiden,t); });
+})();
+function fwSend(s, data, cb){
+  bt_tools.send({url:'/plugin?action=a&name=frpwaf&s='+s, data:data||{}}, cb);
+}
+/* HTML 转义：所有来自后端 / 外部可控的数据在拼接进 innerHTML 前必须转义，防存储型 XSS */
+function fwEsc(v){
+  if(v===null || v===undefined) return '';
+  return String(v).replace(/[&<>"']/g, function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+/* 左侧菜单切换 */
+document.querySelectorAll('.fw-main .bt-w-menu p').forEach(function(p){
+  p.onclick = function(){
+    document.querySelectorAll('.fw-main .bt-w-menu p').forEach(function(x){x.classList.remove('bgw')});
+    p.classList.add('bgw');
+    var t = p.getAttribute('data-item');
+    document.querySelectorAll('.fw-main .bt-w-con .bt-w-item').forEach(function(it){
+      it.classList.toggle('active', it.getAttribute('data-item')===t);
+    });
+    if(t==='status'){ fwLoadInfo(); fwLoadDashLogs(); }
+    if(t==='geo'){ fwLoadGeoTop(); }
+    if(t==='log'){ fwLoadLog(); }
+    if(t==='ban'){ fwLoadBans(); fwLoadIpList(); fwLoadBanHistory(); fwLoadKernBan(); }
+    if(t==='ai'){ fwAiLoad(); }
+    if(t==='connlog'){ fwLogPage(0); }
+    if(t==='proxy'){ fwLoadProxies(); }
+    if(t==='settings'){ fwLoadPolicy(); fwLoadAdmin(); }
+    if(t==='frp'){ fwFrpLoad(); }
+  };
+});
+
+function fwLoadInfo(){
+  fwSend('get_waf_info', {}, function(r){
+    var b=document.getElementById('fwStatus');
+    if(r && r.status){ b.className='fw-badge on'; b.textContent='运行中'; }
+    else { b.className='fw-badge off'; b.textContent='已停止'; }
+    document.getElementById('fwInfo').innerHTML =
+      '<div class="k">监听端口</div><div>'+((r&&r.port)||7080)+'</div>'+
+      '<div class="k">安装状态</div><div>'+((r&&r.install_status)?'已安装':'未安装')+'</div>'+
+      '<div class="k">frps 集成</div><div>'+((r&&r.plugin_configured)?'已注入 ✓':'未注入')+'</div>'+
+      '<div class="k">配置文件</div><div><code>'+((r&&r.frps_toml)||'')+'</code></div>';
+    var a=document.getElementById('fwUrl'); a.textContent=(r&&r.url)||''; a.href=(r&&r.url)||'#';
+    // 凭据：账号直接显示，密码默认打码，可点眼睛切换
+    fwCred.user=(r&&r.admin_user)||'admin';
+    fwCred.pwd=(r&&r.admin_password)||'';
+    var u=document.getElementById('fwCredUser'); if(u) u.textContent=fwCred.user;
+    fwRenderCred();
+  });
+  fwLoadOverview();
+}
+var fwCred={user:'',pwd:'',show:false};
+function fwRenderCred(){
+  var p=document.getElementById('fwCredPwd'); if(!p) return;
+  p.textContent = fwCred.show ? (fwCred.pwd||'(未设置)') : '••••••';
+  var e=document.getElementById('fwCredEye'); if(e) e.textContent = fwCred.show?'🙈':'👁';
+}
+function fwToggleCred(){ fwCred.show=!fwCred.show; fwRenderCred(); }
+function fwLoadOverview(){
+  fwSend('waf_overview', {}, function(r){
+    var d=(r&&r.data)||{};
+    var cards=[
+      ['今日连接', d.today_conns||0, 'pri'],
+      ['今日拦截', d.today_rejected||0, 'err'],
+      ['今日独立IP', d.today_uniq_ip||0, ''],
+      ['生效封禁', d.active_bans||0, 'err'],
+      ['黑名单', d.black_count||0, ''],
+      ['白名单', d.white_count||0, ''],
+      ['累计连接', d.total_conns||0, '']
+    ];
+    document.getElementById('fwStats').innerHTML = cards.map(function(c){
+      return '<div class="st"><div class="k">'+c[0]+'</div><div class="v '+(c[2]||'')+'">'+c[1]+'</div></div>';
+    }).join('');
+  });
+}
+function fwLoadDashLogs(){
+  fwSend('conn_logs', {limit:15, offset:0}, function(r){
+    var rows=(r&&r.data)||[];
+    document.getElementById('fwDashLogs').innerHTML = rows.length
+      ? rows.map(function(x){
+          return '<tr><td>'+fwFmtTime(x.ts)+'</td><td>'+fwEsc(x.ip)+'</td><td>'+fwEsc(x.geo||'-')+'</td>'
+            +'<td>'+fwEsc(x.proxy_name||'-')+'</td>'
+            +'<td><span class="fw-tag '+(x.action==='allow'?'ok':'no')+'">'+fwEsc(x.action||'')+'</span></td></tr>';
+        }).join('')
+      : '<tr><td colspan="5" style="color:#bbb;text-align:center">暂无记录</td></tr>';
+  });
+}
+function fwCtl(act){
+  fwSend('waf_admin', {status:act}, function(r){
+    bt_tools.msg(r && r.msg ? r.msg : '操作完成', (r&&r.status));
+    setTimeout(fwLoadInfo, 1500);
+  });
+}
+function fwInstall(){
+  layer.confirm('确认安装 / 更新 FRP WAF？', {icon:3, title:'提示'}, function(i){
+    layer.close(i);
+    fwSend('install_waf', {}, function(r){ bt_tools.msg(r&&r.msg?r.msg:'完成',(r&&r.status)); setTimeout(fwLoadInfo,2000); });
+  });
+}
+function fwUninstall(){
+  layer.confirm('确认卸载 FRP WAF？将停止服务、移除 frps 插件配置与内核封禁规则（数据保留在 /opt/frpwaf/data）。', {icon:2, title:'危险操作'}, function(i){
+    layer.close(i);
+    fwSend('uninstall_waf', {}, function(r){ bt_tools.msg(r&&r.msg?r.msg:'完成',(r&&r.status)); setTimeout(fwLoadInfo,2000); });
+  });
+}
+function fwLoadFrps(){
+  fwSend('get_frps_status', {}, function(r){
+    document.getElementById('fwFrps').innerHTML =
+      '<div class="k">frps 状态</div><div>'+((r&&r.status)?'运行中':'已停止')+'</div>'+
+      '<div class="k">插件配置</div><div>'+((r&&r.has_plugin)?'已配置 ✓':'未配置')+'</div>';
+  });
+}
+function fwApply(){
+  layer.confirm('将向 frps.toml 注入 httpPlugins 并重启 frps，隧道会短暂中断。继续？', {icon:3, title:'提示'}, function(i){
+    layer.close(i);
+    fwSend('apply_to_frps', {}, function(r){ bt_tools.msg(r&&r.msg?r.msg:'完成',(r&&r.status)); setTimeout(fwLoadFrps,2000); });
+  });
+}
+function fwLoadLog(){
+  fwSend('get_log', {lines:300}, function(r){
+    document.getElementById('fwLog').textContent=(r&&r.log)||'（暂无日志）';
+  });
+}
+function fwClearLog(){
+  fwSend('clear_log', {}, function(r){ bt_tools.msg(r&&r.msg?r.msg:'已清空',(r&&r.status)); fwLoadLog(); });
+}
+function fwGeoQuery(){
+  var ip=(document.getElementById('fwGeoIp').value||'').trim();
+  if(!ip){ bt_tools.msg('请输入 IP', false); return; }
+  fwSend('geo_query', {ip:ip}, function(r){
+    if(!r || !r.status){ bt_tools.msg((r&&r.msg)||'查询失败', false); return; }
+    var d=r.data;
+    document.getElementById('fwGeoResult').innerHTML =
+      '<div class="fw-geo-result">'+
+      [['IP',d.ip],['归属地',d.geo||'未知'],['国家/地区',d.country||'-'],
+       ['省份',d.province||'-'],['城市',d.city||'-'],['运营商',d.isp||'-']]
+      .map(function(kv){ return '<div class="item"><div class="k">'+fwEsc(kv[0])+'</div><div class="v">'+fwEsc(kv[1]||'-')+'</div></div>'; }).join('')+
+      '</div>';
+  });
+}
+function fwLoadGeoTop(){
+  fwSend('geo_db_info', {}, function(r){
+    var el=document.getElementById('fwGeoDb');
+    if(r&&r.data&&r.data.available) el.style.display='inline-block'; else el.style.display='none';
+  });
+  fwSend('geo_top', {limit:30}, function(r){
+    var rows=(r&&r.data)||[];
+    document.getElementById('fwGeoTop').innerHTML = rows.length
+      ? rows.map(function(x){ return '<tr><td>'+fwEsc(x.ip)+'</td><td>'+fwEsc(x.geo||'-')+'</td><td>'+fwEsc(x.conns)+'</td></tr>'; }).join('')
+      : '<tr><td colspan="3" style="color:#bbb;text-align:center">暂无数据</td></tr>';
+  });
+}
+
+fwLoadInfo(); fwLoadDashLogs(); fwLoadFrps(); fwLoadGeoTop(); fwLoadLog();
+document.getElementById('fwGeoIp').addEventListener('keydown', function(e){ if(e.key==='Enter') fwGeoQuery(); });
+document.getElementById('fwBanIp').addEventListener('keydown', function(e){ if(e.key==='Enter') fwBan(); });
+document.getElementById('fwLogIp').addEventListener('keydown', function(e){ if(e.key==='Enter') fwLogPage(0); });
+
+/* ---- IP 封禁 / 解禁 ---- */
+function fwFmtTime(ts){
+  if(!ts) return '-';
+  var d=new Date(ts*1000), p=function(n){return (n<10?'0':'')+n;};
+  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+}
+function fwBanModeChange(){
+  var m=document.getElementById('fwBanMode').value;
+  document.getElementById('fwBanSec').style.display = (m==='temp')?'inline-block':'none';
+}
+function fwBan(){
+  var ip=(document.getElementById('fwBanIp').value||'').trim();
+  var mode=document.getElementById('fwBanMode').value;
+  var sec=parseInt(document.getElementById('fwBanSec').value||'3600',10);
+  var remark=(document.getElementById('fwBanRemark').value||'').trim();
+  if(!ip){ bt_tools.msg('请输入 IP 或 CIDR', false); return; }
+  if(mode==='temp'){
+    fwSend('ban_ip', {ip:ip, mode:'temp', seconds:sec, remark:remark}, function(r){
+      bt_tools.msg((r&&r.msg)||'完成', (r&&r.status));
+      if(r&&r.status){ document.getElementById('fwBanIp').value=''; document.getElementById('fwBanRemark').value=''; fwLoadBans(); fwLoadBanHistory(); }
+    });
+  } else {
+    fwSend('add_ip_entry', {cidr:ip, list_type:mode, remark:remark}, function(r){
+      bt_tools.msg((r&&r.msg)||'完成', (r&&r.status));
+      if(r&&r.status){ document.getElementById('fwBanIp').value=''; document.getElementById('fwBanRemark').value=''; fwLoadIpList(); fwLoadBans(); }
+    });
+  }
+}
+function fwBatchImport(type){
+  var text=(document.getElementById('fwBatchText').value||'').trim();
+  if(!text){ bt_tools.msg('请粘贴要导入的内容', false); return; }
+  fwSend('batch_import_ips', {text:text, list_type:type}, function(r){
+    bt_tools.msg((r&&r.msg)||'完成', (r&&r.status));
+    if(r&&r.status){ document.getElementById('fwBatchText').value=''; fwLoadIpList(); fwLoadBans(); }
+  });
+}
+var fwCurListType='black';
+function fwIpListType(type, btn){
+  fwCurListType=type;
+  var seg=document.getElementById('fwIpListSeg');
+  seg.querySelectorAll('button').forEach(function(b){ b.classList.remove('on'); });
+  if(btn) btn.classList.add('on');
+  fwLoadIpList();
+}
+function fwLoadIpList(){
+  fwSend('list_ips', {type:fwCurListType}, function(r){
+    var rows=(r&&r.data)||[];
+    document.getElementById('fwIpListCount').textContent = '共 '+rows.length+' 条';
+    document.getElementById('fwIpList').innerHTML = rows.length
+      ? rows.map(function(x){
+          var isBlack = x.list_type==='black';
+          return '<tr><td><code>'+fwEsc(x.cidr)+'</code></td>'
+            +'<td><span class="fw-tag '+(isBlack?'no':'ok')+'">'+(isBlack?'黑名单':'白名单')+'</span></td>'
+            +'<td>'+fwEsc(x.geo||'-')+'</td><td>'+fwEsc(x.remark||'')+'</td>'
+            +'<td>'+fwFmtTime(x.created_at)+'</td>'
+            +'<td><button class="btn btn-danger btn-xs" onclick="fwDelIp('+x.id+')">删除</button></td></tr>';
+        }).join('')
+      : '<tr><td colspan="6" style="color:#bbb;text-align:center">暂无条目</td></tr>';
+  });
+}
+function fwDelIp(id){
+  layer.confirm('确认删除该名单条目？', {icon:3, title:'提示'}, function(i){
+    layer.close(i);
+    fwSend('del_ip_entry', {id:id}, function(r){
+      bt_tools.msg((r&&r.msg)||'完成', (r&&r.status)); fwLoadIpList(); fwLoadBans();
+    });
+  });
+}
+function fwLoadBanHistory(){
+  fwSend('ban_history', {}, function(r){
+    var rows=(r&&r.data)||[];
+    document.getElementById('fwBanHis').innerHTML = rows.length
+      ? rows.map(function(x){
+          var active = !x.released && x.expire_at*1000 > Date.now();
+          return '<tr><td>'+fwEsc(x.ip)+'</td><td>'+fwEsc(x.geo||'-')+'</td><td>'+fwEsc(x.reason||'')+'</td>'
+            +'<td>'+fwFmtTime(x.banned_at)+'</td><td>'+fwFmtTime(x.expire_at)+'</td>'
+            +'<td><span class="fw-tag '+(active?'no':'gray')+'">'+(active?'生效中':'已解封')+'</span></td></tr>';
+        }).join('')
+      : '<tr><td colspan="6" style="color:#bbb;text-align:center">暂无历史</td></tr>';
+  });
+}
+function fwUnbanTemp(ip){
+  fwSend('unban_ip', {kind:'temp', ip:ip}, function(r){
+    bt_tools.msg((r&&r.msg)||'完成', (r&&r.status)); fwLoadBans(); fwLoadBanHistory();
+  });
+}
+function fwLoadBans(){
+  fwSend('list_bans', {}, function(r){
+    if(!r || !r.status){ return; }
+    var temp=r.bans||[];
+    document.getElementById('fwTempCount').textContent = temp.length?('共 '+temp.length+' 条'):'';
+    document.getElementById('fwTempList').innerHTML = temp.length
+      ? temp.map(function(x){
+          return '<tr><td>'+fwEsc(x.ip)+'</td><td>'+fwEsc(x.geo||'-')+'</td><td>'+fwEsc(x.reason||'')+'</td>'
+            +'<td>'+fwFmtTime(x.expire_at)+'</td>'
+            +'<td><button class="btn btn-default btn-xs" onclick="fwUnbanTemp('+fwEsc(JSON.stringify(x.ip||''))+')">解禁</button></td></tr>';
+        }).join('')
+      : '<tr><td colspan="5" style="color:#bbb;text-align:center">暂无临时封禁</td></tr>';
+  });
+}
+
+/* ---- 连接日志 ---- */
+var fwLogOff=0, fwLogLimit=50;
+function fwLogQuery(){
+  var q={limit:fwLogLimit, offset:fwLogOff};
+  var ip=(document.getElementById('fwLogIp').value||'').trim();
+  var ac=document.getElementById('fwLogAction').value;
+  if(ip) q.ip=ip;
+  if(ac) q.log_action=ac;
+  return q;
+}
+function fwLogPage(off){
+  fwLogOff=Math.max(0, off);
+  fwSend('conn_logs', fwLogQuery(), function(r){
+    var rows=(r&&r.data)||[], total=(r&&r.total)||0;
+    document.getElementById('fwLogTotal').textContent='共 '+total+' 条';
+    document.getElementById('fwConnLogs').innerHTML = rows.length
+      ? rows.map(function(x){
+          return '<tr><td>'+fwFmtTime(x.ts)+'</td><td>'+fwEsc(x.ip)+'</td><td>'+fwEsc(x.geo||'-')+'</td>'
+            +'<td>'+fwEsc(x.port||'')+'</td><td>'+fwEsc(x.proxy_name||'-')+'</td><td>'+fwEsc(x.proxy_type||'')+'</td>'
+            +'<td>'+fwEsc(x.user||'')+'</td>'
+            +'<td><span class="fw-tag '+(x.action==='allow'?'ok':'no')+'">'+fwEsc(x.action||'')+'</span></td>'
+            +'<td>'+fwEsc(x.reason||'')+'</td></tr>';
+        }).join('')
+      : '<tr><td colspan="9" style="color:#bbb;text-align:center">暂无记录</td></tr>';
+    var page=Math.floor(fwLogOff/fwLogLimit)+1, pages=Math.max(1,Math.ceil(total/fwLogLimit));
+    document.getElementById('fwLogPageInfo').textContent='第 '+page+' / '+pages+' 页';
+  });
+}
+function fwLogPrev(){ fwLogPage(Math.max(0, fwLogOff-fwLogLimit)); }
+function fwLogNext(){ fwLogPage(fwLogOff+fwLogLimit); }
+function fwLogReset(){
+  document.getElementById('fwLogIp').value='';
+  document.getElementById('fwLogAction').value='';
+  fwLogPage(0);
+}
+function fwPurgeLogs(){
+  layer.confirm('确定清空所有连接日志？此操作不可恢复。', {icon:3, title:'提示'}, function(i){
+    layer.close(i);
+    fwSend('purge_conn_logs', {}, function(r){
+      bt_tools.msg((r&&r.msg)||'已清空', (r&&r.status)); fwLogPage(0);
+    });
+  });
+}
+
+/* ---- 代理统计 ---- */
+function fwLoadProxies(){
+  fwSend('proxy_stats', {}, function(r){
+    var rows=(r&&r.data)||[];
+    document.getElementById('fwProxyTable').innerHTML = rows.length
+      ? rows.map(function(x){
+          return '<tr><td>'+fwEsc(x.proxy_name)+'</td><td>'+fwEsc(x.proxy_type||'')+'</td>'
+            +'<td>'+fwEsc(x.total)+'</td><td style="color:'+(x.rejected?'#d33':'')+'">'+fwEsc(x.rejected)+'</td>'
+            +'<td>'+fwFmtTime(x.last_ts)+'</td></tr>';
+        }).join('')
+      : '<tr><td colspan="5" style="color:#bbb;text-align:center">暂无数据</td></tr>';
+  });
+}
+
+/* ---- 准入策略 / 密码 ---- */
+var FW_POLICY_BOOL=['blacklist_enabled','whitelist_enabled','auto_ban_enabled','rate_limit_enabled','fw_sync_enabled','ai_enabled'];
+var FW_POLICY_INT=['auto_ban_window','auto_ban_threshold','auto_ban_seconds','rate_limit_per_sec','log_max_rows'];
+function fwLoadPolicy(){
+  fwSend('get_policy', {}, function(r){
+    var c=(r&&r.data)||{};
+    FW_POLICY_BOOL.forEach(function(k){ var e=document.getElementById('s_'+k); if(e) e.checked=!!c[k]; });
+    FW_POLICY_INT.forEach(function(k){ var e=document.getElementById('s_'+k); if(e) e.value=(c[k]===undefined?'':c[k]); });
+  });
+}
+function fwSavePolicy(){
+  var b={};
+  FW_POLICY_BOOL.forEach(function(k){ var e=document.getElementById('s_'+k); if(e) b[k]=e.checked?1:0; });
+  FW_POLICY_INT.forEach(function(k){ var e=document.getElementById('s_'+k); if(e) b[k]=parseInt(e.value||'0',10)||0; });
+  fwSend('save_policy', b, function(r){
+    bt_tools.msg((r&&r.msg)||'已保存', (r&&r.status)); fwLoadPolicy();
+  });
+}
+function fwLoadAdmin(){
+  fwSend('get_admin', {}, function(r){
+    var d=(r&&r.data)||{};
+    var u=document.getElementById('fwAdminUser'); if(u) u.textContent=d.user||'-';
+    fwCred.user=d.user||fwCred.user; fwCred.pwd=d.password||fwCred.pwd;
+    fwRenderCred();
+  });
+}
+function fwChangePwd(){
+  var old=document.getElementById('fwPwOld').value;
+  var nw=document.getElementById('fwPwNew').value;
+  var nu=(document.getElementById('fwNewUser').value||'').trim();
+  var ou=(document.getElementById('fwOldUser').value||'').trim();
+  if(!old){ bt_tools.msg('请先填写原密码', false); return; }
+  if(!nw && !nu){ bt_tools.msg('请填写新用户名或新密码', false); return; }
+  fwSend('change_admin_pwd', {old:old, new:nw, new_user:nu, old_user:ou}, function(r){
+    bt_tools.msg((r&&r.msg)||'完成', (r&&r.status));
+    if(r&&r.status){
+      document.getElementById('fwPwOld').value='';
+      document.getElementById('fwPwNew').value='';
+      document.getElementById('fwNewUser').value='';
+      document.getElementById('fwOldUser').value='';
+      fwLoadAdmin();
+    }
+  });
+}
+
+/* ---- 内核级封禁 ---- */
+function fwLoadKernBan(){
+  fwSend('kernban_status', {}, function(r){
+    var b=document.getElementById('fwKernBanState');
+    var d=(r&&r.data)||{};
+    var info=document.getElementById('fwKernBanInfo');
+    if(!d.available){
+      b.className='fw-badge off'; b.textContent='不可用';
+      info.innerHTML='<div class="k">状态</div><div>当前环境不支持（需 root 且安装 ipset/iptables）</div>';
+      return;
+    }
+    if(d.enabled && d.rule){ b.className='fw-badge on'; b.textContent='已启用'; }
+    else if(d.enabled){ b.className='fw-badge off'; b.textContent='待同步'; }
+    else { b.className='fw-badge off'; b.textContent='已关闭'; }
+    info.innerHTML =
+      '<div class="k">同步开关</div><div>'+(d.enabled?'已开启':'已关闭')+'</div>'+
+      '<div class="k">规则状态</div><div>'+(d.rule?'已生效 ✓':'未生效')+'</div>'+
+      '<div class="k">已下发封禁</div><div>IPv4 <b>'+(d.set4||0)+'</b> 条 · IPv6 <b>'+(d.set6||0)+'</b> 条</div>';
+  });
+}
+function fwKernBanSync(){
+  fwSend('kernban_sync', {}, function(r){
+    bt_tools.msg((r&&r.msg)||'完成', (r&&r.status)); fwLoadKernBan();
+  });
+}
+
+/* ---- AI 审查 ---- */
+function fwAiLoad(){
+  fwSend('ai_get_config', {}, function(r){
+    if(!r || !r.status) return;
+    var d=r.data||{};
+    document.getElementById('ai_enabled').checked = !!d.ai_enabled;
+    document.getElementById('ai_protocol').value = d.ai_protocol||'openai';
+    document.getElementById('ai_base_url').value = d.ai_base_url||'';
+    document.getElementById('ai_api_key').value = d.ai_api_key||'';
+    document.getElementById('ai_model').value = d.ai_model||'';
+    document.getElementById('ai_interval').value = d.ai_interval||300;
+    document.getElementById('ai_window').value = d.ai_window||300;
+    document.getElementById('ai_min_conns').value = d.ai_min_conns||20;
+    document.getElementById('ai_max_ips').value = d.ai_max_ips||20;
+    document.getElementById('ai_auto_ban').checked = !!d.ai_auto_ban;
+    document.getElementById('ai_ban_seconds').value = d.ai_ban_seconds||1800;
+    document.getElementById('ai_timeout').value = d.ai_timeout||120;
+    var st=document.getElementById('fwAiState');
+    if(d.ai_enabled){ st.className='fw-badge on'; st.textContent='已启用'; }
+    else { st.className='fw-badge off'; st.textContent='未启用'; }
+    document.getElementById('fwAiLast').textContent = d.ai_last_result ? ('上次：'+d.ai_last_result) : '';
+  });
+  fwAiLoadResults();
+}
+function fwAiForm(){
+  return {
+    ai_enabled: document.getElementById('ai_enabled').checked,
+    ai_protocol: document.getElementById('ai_protocol').value,
+    ai_base_url: document.getElementById('ai_base_url').value,
+    ai_api_key: document.getElementById('ai_api_key').value,
+    ai_model: document.getElementById('ai_model').value,
+    ai_interval: document.getElementById('ai_interval').value,
+    ai_window: document.getElementById('ai_window').value,
+    ai_min_conns: document.getElementById('ai_min_conns').value,
+    ai_max_ips: document.getElementById('ai_max_ips').value,
+    ai_auto_ban: document.getElementById('ai_auto_ban').checked,
+    ai_ban_seconds: document.getElementById('ai_ban_seconds').value,
+    ai_timeout: document.getElementById('ai_timeout').value
+  };
+}
+function fwAiSave(){
+  fwSend('ai_save_config', fwAiForm(), function(r){
+    bt_tools.msg((r&&r.msg)||'完成', (r&&r.status)); fwAiLoad();
+  });
+}
+function fwAiTest(){
+  fwSend('ai_test', fwAiForm(), function(r){
+    bt_tools.msg((r&&r.msg)||'完成', (r&&r.status));
+  });
+}
+function fwAiRun(){
+  var btn=(typeof event!=='undefined' && event && event.target) || null;
+  if(btn){ btn.disabled=true; btn.textContent='审查中…'; }
+  fwSend('ai_run_now', {}, function(r){
+    if(btn){ btn.disabled=false; btn.textContent='立即审查一次'; }
+    bt_tools.msg((r&&r.msg)||'完成', (r&&r.status)); fwAiLoad();
+  });
+}
+function fwAiLoadResults(){
+  fwSend('ai_results', {}, function(r){
+    var rows=(r&&r.data)||[];
+    document.getElementById('fwAiResults').innerHTML = rows.length
+      ? rows.map(function(x){
+          var v=x.verdict||'';
+          var cls = v==='malicious'?'style="color:#d33;font-weight:600"'
+                  : (v==='suspicious'?'style="color:#e6a23c"':'style="color:#1a9c48"');
+          var act = x.action==='banned'?'<span class="fw-badge off">已封禁</span>'
+                  : (x.action==='already_banned'?'<span class="fw-badge off">已在封禁中</span>'
+                  : (x.action==='error'?'<span style="color:#d33">错误</span>':'<span style="color:#999">-</span>'));
+          return '<tr><td>'+fwFmtTime(x.ts)+'</td><td>'+fwEsc(x.ip)+'</td>'
+            +'<td '+cls+'>'+fwEsc(v)+'</td><td>'+fwEsc(x.reason||'')+'</td><td>'+act+'</td></tr>';
+        }).join('')
+      : '<tr><td colspan="5" style="color:#bbb;text-align:center">暂无</td></tr>';
+  });
+}
+
+/* ---- frp 管理（合并自官方 frp管理器） ---- */
+var fwFrpCfg = {};   // 最近一次读取的配置
+function fwFrpKind(){ return document.getElementById('fwFrpKind').value; }
+function fwFrpSwitch(){ fwFrpLoad(); }
+function fwFrpLoad(){
+  var kind=fwFrpKind();
+  fwSend('frp_info', {kind:kind}, function(r){
+    var b=document.getElementById('fwFrpState'), d=(r&&r.data)||{};
+    if(!r||!r.status){ b.className='fw-badge off'; b.textContent='获取失败'; return; }
+    if(!d.installed){ b.className='fw-badge off'; b.textContent='未安装'; }
+    else if(d.running){ b.className='fw-badge on'; b.textContent='运行中'; }
+    else { b.className='fw-badge off'; b.textContent='已停止'; }
+    document.getElementById('fwFrpInfo').innerHTML =
+      '<div class="k">安装状态</div><div>'+(d.installed?'已安装':'未安装')+'</div>'+
+      '<div class="k">当前版本</div><div>'+fwEsc(d.version||'-')+'</div>'+
+      '<div class="k">运行状态</div><div>'+(d.running?'运行中':'已停止')+'</div>'+
+      '<div class="k">配置文件</div><div>'+(d.config_exists?'已就绪 ✓':'<span style="color:#e6a23c">缺失（将自动创建）</span>')+'</div>'+
+      '<div class="k">程序路径</div><div><code>'+fwEsc(d.bin||'')+'</code></div>'+
+      '<div class="k">配置路径</div><div><code>'+fwEsc(d.config_path||'')+'</code></div>';
+    document.getElementById('fwFrpVer').innerHTML =
+      '<div class="k">当前版本</div><div>'+fwEsc(d.version||'-')+'</div>'+
+      '<div class="k">最新版本</div><div id="fwFrpLatest">（点击“检查最新版”）</div>'+
+      '<div class="k">系统架构</div><div>'+fwEsc(d.arch||'-')+'</div>';
+    fwFrpCurVer=d.version||'';
+  });
+  fwFrpLoadConfig();
+  fwFrpLoadLog();
+  // 若有安装任务在进行，恢复进度显示
+  fwSend('frp_install_status', {}, function(r){
+    var d=(r&&r.data)||{};
+    if(d.running){
+      document.getElementById('fwFrpProgress').style.display='block';
+      document.getElementById('fwFrpInstallBtn').disabled=true;
+      fwFrpPoll();
+    }
+  });
+}
+function fwFrpEnsureConfig(){
+  var kind=fwFrpKind();
+  fwSend('frp_ensure_config', {kind:kind}, function(r){
+    bt_tools.msg((r&&r.msg)||'完成', (r&&r.status));
+    if(r&&r.status){ fwFrpLoad(); }
+  });
+}
+function fwFrpLoadConfig(){
+  var kind=fwFrpKind();
+  fwSend('frp_get_config', {kind:kind}, function(r){
+    if(!r||!r.status){ document.getElementById('fwFrpForm').innerHTML='<div class="fw-tip" style="color:#d33">'+fwEsc((r&&r.msg)||'配置不存在')+'</div>'; document.getElementById('fwFrpRaw').value=''; return; }
+    fwFrpCfg=r.data||{};
+    document.getElementById('fwFrpPath').textContent='('+(r.path||'')+')';
+    document.getElementById('fwFrpRaw').value=r.raw||'';
+    fwFrpRenderForm(kind);
+  });
+}
+function fwFrpRenderForm(kind){
+  var c=fwFrpCfg||{};
+  var ws=c.webServer||{}, auth=c.auth||{}, log=c.log||{}, tr=c.transport||{};
+  var fields;
+  if(kind==='frps'){
+    fields=[
+      ['bindPort','服务器端口（客户端连接）','number'],
+      ['vhostHTTPPort','HTTP 协议端口','number'],
+      ['vhostHTTPSPort','HTTPS 协议端口','number'],
+      ['kcpBindPort','KCP 端口','number'],
+      ['tcpmuxHTTPConnectPort','HTTP 代理(tcpmux)端口','number'],
+      ['maxPoolCount','最大连接池数','number', tr.maxPoolCount],
+      ['webServer.port','面板端口','number', ws.port],
+      ['webServer.user','面板用户名','text', ws.user],
+      ['webServer.password','面板密码','text', ws.password],
+      ['auth.token','认证 token','text', auth.token],
+      ['log.to','日志文件路径','text', log.to],
+      ['log.level','日志级别','text', log.level],
+      ['log.maxDays','日志保留天数','number', log.maxDays],
+    ];
+  }else{
+    fields=[
+      ['serverAddr','服务端地址','text', c.serverAddr],
+      ['serverPort','服务端端口','number', c.serverPort],
+      ['auth.token','认证 token','text', auth.token],
+    ];
+  }
+  var html='<div class="fw-kv" style="grid-template-columns:190px 1fr">';
+  fields.forEach(function(f){
+    var key=f[0], label=f[1], type=f[2];
+    var val = (f.length>3 ? f[3] : c[key]);
+    if(val===undefined||val===null) val='';
+    html+='<div class="k">'+label+'</div><div>'
+      +'<input class="bt-input-text fw-frp-f" data-key="'+key+'" type="'+type+'" value="'+fwEsc(String(val))+'" style="width:280px"></div>';
+  });
+  html+='</div>';
+  document.getElementById('fwFrpForm').innerHTML=html;
+}
+function fwFrpSaveForm(){
+  var patch={};
+  document.querySelectorAll('#fwFrpForm .fw-frp-f').forEach(function(inp){
+    var key=inp.getAttribute('data-key');
+    var v=inp.value;
+    if(inp.type==='number'){ if(v!=='') v=parseInt(v,10); else return; }
+    if(key.indexOf('.')>=0){
+      var parts=key.split('.'); var o=patch;
+      for(var i=0;i<parts.length-1;i++){ o[parts[i]]=o[parts[i]]||{}; o=o[parts[i]]; }
+      o[parts[parts.length-1]]=v;
+    }else{ patch[key]=v; }
+  });
+  fwSend('frp_save_config', {kind:fwFrpKind(), data:JSON.stringify(patch)}, function(r){
+    bt_tools.msg((r&&r.msg)||'完成',(r&&r.status)); if(r&&r.status) fwFrpLoad();
+  });
+}
+function fwFrpSaveRaw(){
+  var kind=fwFrpKind(), text=document.getElementById('fwFrpRaw').value;
+  layer.confirm('确认保存配置文件原文？写前会自动备份。',{icon:3,title:'提示'},function(i){
+    layer.close(i);
+    fwSend('frp_save_raw', {kind:kind, content:text}, function(r){
+      bt_tools.msg((r&&r.msg)||'完成',(r&&r.status)); fwFrpLoad();
+    });
+  });
+}
+function fwFrpVerify(){
+  fwSend('frp_verify', {kind:fwFrpKind()}, function(r){ bt_tools.msg((r&&r.msg)||'完成',(r&&r.status)); });
+}
+function fwFrpCtl(act){
+  var kind=fwFrpKind(), name=kind==='frps'?'frps 服务端':'frpc 客户端';
+  var verb={start:'启动',stop:'停止',restart:'重启'}[act];
+  layer.confirm('确认'+verb+name+'？',{icon:3,title:'提示'},function(i){
+    layer.close(i);
+    fwSend('frp_control', {kind:kind, status:act}, function(r){
+      bt_tools.msg((r&&r.msg)||'完成',(r&&r.status)); setTimeout(fwFrpLoad,1500);
+    });
+  });
+}
+function fwFrpInstall(){
+  var kind=fwFrpKind(), ver=(document.getElementById('fwFrpVerInput').value||'').trim();
+  layer.confirm('确认安装 / 升级 '+(kind==='frps'?'frps':'frpc')+(ver?(' 到 '+ver):' 到最新版')+'？升级会保留现有配置。',{icon:3,title:'提示'},function(i){
+    layer.close(i);
+    fwSend('frp_install_start', {kind:kind, version:ver}, function(r){
+      if(!r||!r.status){ bt_tools.msg((r&&r.msg)||'启动失败', false); return; }
+      document.getElementById('fwFrpProgress').style.display='block';
+      document.getElementById('fwFrpBar').style.width='0%';
+      document.getElementById('fwFrpProgMsg').textContent='正在启动…';
+      document.getElementById('fwFrpInstallBtn').disabled=true;
+      fwFrpPoll();
+    });
+  });
+}
+function fwFrpRollback(){
+  var kind=fwFrpKind();
+  layer.confirm('确认回滚 '+(kind==='frps'?'frps':'frpc')+' 到<b>上一次升级前</b>的版本？将还原二进制与配置文件并重启服务。',{icon:3,title:'回滚确认'},function(i){
+    layer.close(i);
+    var btn=document.getElementById('fwFrpRollbackBtn');
+    if(btn) btn.disabled=true;
+    bt_tools.msg('正在回滚…', true);
+    fwSend('frp_rollback', {kind:kind}, function(r){
+      if(btn) btn.disabled=false;
+      bt_tools.msg((r&&r.msg)||'完成', !!(r&&r.status));
+      fwFrpLoad();
+    });
+  });
+}
+var fwFrpPollTimer=null;
+function fwFrpPoll(){
+  if(fwFrpPollTimer) clearTimeout(fwFrpPollTimer);
+  fwSend('frp_install_status', {}, function(r){
+    var d=(r&&r.data)||{};
+    document.getElementById('fwFrpProgress').style.display='block';
+    document.getElementById('fwFrpBar').style.width=(d.percent||0)+'%';
+    document.getElementById('fwFrpProgMsg').textContent=(d.msg||'');
+    if(d.running){
+      fwFrpPollTimer=setTimeout(fwFrpPoll, 1000);
+    }else{
+      document.getElementById('fwFrpInstallBtn').disabled=false;
+      if(d.done){
+        bt_tools.msg(d.msg||'完成', !!d.ok);
+        if(d.ok){ setTimeout(function(){ document.getElementById('fwFrpProgress').style.display='none'; fwFrpLoad(); }, 1200); }
+      }
+    }
+  });
+}
+function fwFrpCheckVer(){
+  bt_tools.msg('正在查询最新版…', true);
+  fwSend('frp_latest', {kind:fwFrpKind()}, function(r){
+    var latest=(r&&r.latest)||'未知';
+    document.getElementById('fwFrpVer').innerHTML =
+      '<div class="k">当前版本</div><div>'+fwEsc(fwFrpCurVer||'-')+'</div>'+
+      '<div class="k">最新版本</div><div>'+fwEsc(latest||'查询失败')+'</div>';
+    bt_tools.msg('最新版：'+(latest||'未知'), true);
+  });
+}
+var fwFrpCurVer='';
+function fwFrpReleasePorts(){
+  fwSend('frp_release_ports', {kind:fwFrpKind()}, function(r){ bt_tools.msg((r&&r.msg)||'完成',(r&&r.status)); });
+}
+function fwFrpUninstall(){
+  var kind=fwFrpKind();
+  layer.confirm('确认卸载 '+(kind==='frps'?'frps':'frpc')+'？将停止服务并删除程序目录，配置文件也会一并删除。',{icon:2,title:'危险操作'},function(i){
+    layer.close(i);
+    fwSend('frp_uninstall', {kind:kind}, function(r){ bt_tools.msg((r&&r.msg)||'完成',(r&&r.status)); fwFrpLoad(); });
+  });
+}
+function fwFrpLoadLog(){
+  fwSend('frp_log', {kind:fwFrpKind(), lines:300}, function(r){
+    document.getElementById('fwFrpLog').textContent=(r&&r.log)||'（暂无日志）';
+  });
+}
+</script>

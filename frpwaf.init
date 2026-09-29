@@ -1,0 +1,84 @@
+#! /bin/bash
+# chkconfig: 2345 55 25
+# Description: FRP WAF manager (bt plugin / standalone)
+### BEGIN INIT INFO
+# Provides:          frpwaf
+# Required-Start:    $all
+# Required-Stop:     $all
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: starts the frpwaf
+### END INIT INFO
+
+NAME=frpwaf
+HOME_DIR=/opt/frpwaf
+PIDFILE=${HOME_DIR}/data/frpwaf.pid
+LOGFILE=${HOME_DIR}/data/frpwaf.log
+PY=/www/server/panel/pyenv/bin/python
+[ -x "$PY" ] || PY=$(command -v python3)
+
+get_pid() {
+    [ -f "$PIDFILE" ] && cat "$PIDFILE" 2>/dev/null
+}
+
+is_running() {
+    pid=$(get_pid)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+start() {
+    if is_running; then
+        echo "${NAME} (pid $(get_pid)) already running."
+        return 0
+    fi
+    echo -n "Starting ${NAME}... "
+    cd "$HOME_DIR" || exit 1
+    nohup "$PY" -m app.daemon >>"$LOGFILE" 2>&1 &
+    sleep 1.5
+    if is_running; then
+        echo "done (pid $(get_pid))."
+        return 0
+    fi
+    echo "failed"
+    return 1
+}
+
+stop() {
+    if ! is_running; then
+        echo "${NAME} is not running."
+        rm -f "$PIDFILE"
+        return 0
+    fi
+    pid=$(get_pid)
+    echo -n "Stopping ${NAME} (pid $pid)... "
+    kill "$pid" 2>/dev/null
+    for i in $(seq 1 20); do
+        is_running || break
+        sleep 0.5
+    done
+    if is_running; then
+        kill -9 "$pid" 2>/dev/null
+        sleep 0.5
+    fi
+    rm -f "$PIDFILE"
+    echo "done."
+    return 0
+}
+
+status() {
+    if is_running; then
+        echo "${NAME} (pid $(get_pid)) is running."
+        return 0
+    fi
+    echo "${NAME} is stopped"
+    return 1
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; start ;;
+    status)  status ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac
+exit $?
