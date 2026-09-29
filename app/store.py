@@ -28,10 +28,13 @@ BANS_TTL = 2.0  # 秒
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ip_list (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    cidr TEXT NOT NULL UNIQUE,
+    cidr TEXT NOT NULL,
     list_type TEXT NOT NULL DEFAULT 'black',   -- black / white
     remark TEXT DEFAULT '',
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    -- 同一 CIDR 允许同时存在于黑、白名单（白名单优先），故用组合唯一，
+    -- 而非对 cidr 全局唯一（否则无法把黑名单项直接改判为白名单）。
+    UNIQUE(cidr, list_type)
 );
 CREATE INDEX IF NOT EXISTS idx_ip_list_type ON ip_list(list_type);
 
@@ -81,6 +84,56 @@ CREATE INDEX IF NOT EXISTS idx_ai_review_ts ON ai_review(ts);
 """
 
 
+_IP_LIST_DDL = """
+CREATE TABLE IF NOT EXISTS ip_list (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cidr TEXT NOT NULL,
+    list_type TEXT NOT NULL DEFAULT 'black',
+    remark TEXT DEFAULT '',
+    created_at INTEGER NOT NULL,
+    UNIQUE(cidr, list_type)
+)
+"""
+
+
+def _migrate_ip_list(c):
+    """迁移旧的 ip_list 表（cidr 全局唯一）到新结构（UNIQUE(cidr,list_type)）。
+
+    旧结构下无法把已在黑名单的 CIDR 直接加入白名单；新结构允许同一 CIDR
+    同时存在于黑白名单（白名单优先）。仅当检测到旧结构时重建，保留数据。
+    """
+    try:
+        row = c.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='ip_list'"
+        ).fetchone()
+    except sqlite3.Error:
+        return
+    ddl = ((row[0] if row else "") or "").upper().replace(" ", "")
+    if "UNIQUE(CIDR,LIST_TYPE)" in ddl:
+        return  # 已是新结构
+    if "CIDRTEXTNOTNULLUNIQUE" not in ddl:
+        return  # 结构未知，保守跳过
+    try:
+        c.execute("ALTER TABLE ip_list RENAME TO ip_list_old")
+        c.execute(_IP_LIST_DDL)
+        c.execute(
+            "INSERT OR IGNORE INTO ip_list(id,cidr,list_type,remark,created_at)"
+            " SELECT id,cidr,list_type,remark,created_at FROM ip_list_old"
+        )
+        c.execute("DROP TABLE ip_list_old")
+        # 旧表被删时其上的 idx_ip_list_type 索引一并消失，这里在新表上重建
+        c.execute("CREATE INDEX IF NOT EXISTS idx_ip_list_type ON ip_list(list_type)")
+        c.commit()
+    except sqlite3.Error:
+        # 迁移失败则还原，避免丢表
+        try:
+            c.execute("DROP TABLE IF EXISTS ip_list")
+            c.execute("ALTER TABLE ip_list_old RENAME TO ip_list")
+            c.commit()
+        except sqlite3.Error:
+            pass
+
+
 def _connect():
     global _conn
     if _conn is not None:
@@ -106,6 +159,7 @@ def _connect():
         _conn.execute("PRAGMA wal_autocheckpoint=512")          # 约 2MB 触发一次合并
         _conn.execute("PRAGMA journal_size_limit=16777216")     # checkpoint 后截断至 ≤16MB
         _conn.executescript(SCHEMA)
+        _migrate_ip_list(_conn)   # 旧库：cidr 全局唯一 -> UNIQUE(cidr,list_type)
         _conn.commit()
     except sqlite3.Error:
         pass

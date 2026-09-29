@@ -200,12 +200,25 @@ def sync(permanent, bans, whitelist=None):
 
 
 def sync_from_store():
-    """从数据库读取黑名单与生效封禁并同步。"""
+    """从数据库读取黑名单与生效封禁并同步。
+
+    必须与引擎决策保持一致：内核层是「应用层拦截」的加速手段，其拦截集合
+    应当等于应用层实际会拒绝的集合，否则会出现：
+      - blacklist_enabled 关闭后，应用层放行、内核却仍下发黑名单 -> 仍被丢包；
+      - whitelist_enabled 关闭后，内核仍按白名单剔除成员 -> 黑名单漏封。
+    故这里按开关裁剪：黑名单开关关闭则不下发永久黑名单；白名单开关关闭则
+    不把白名单作为剔除条件（临时封禁不受名单开关影响，始终下发）。
+    """
     if not available():
         return False
-    from . import store
-    perms = [r["cidr"] for r in store._query("SELECT cidr FROM ip_list WHERE list_type='black'")]
-    whites = [r["cidr"] for r in store._query("SELECT cidr FROM ip_list WHERE list_type='white'")]
+    from . import config, store
+    cfg = config.get()
+    perms = []
+    if cfg.get("blacklist_enabled", True):
+        perms = [r["cidr"] for r in store._query("SELECT cidr FROM ip_list WHERE list_type='black'")]
+    whites = []
+    if cfg.get("whitelist_enabled", False):
+        whites = [r["cidr"] for r in store._query("SELECT cidr FROM ip_list WHERE list_type='white'")]
     bans = store.active_bans()
     return sync(perms, bans, whites)
 
