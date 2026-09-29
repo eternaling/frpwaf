@@ -30,6 +30,10 @@ cp -a "$SRC/install.sh"     "$PKG/"
 cp -a "$SRC/uninstall.sh"   "$PKG/"
 cp -a "$SRC/frpwaf.init"    "$PKG/"
 chmod +x "$PKG/install.sh" "$PKG/uninstall.sh" "$PKG/frpwaf.init"
+# 清理字节码缓存 / 编辑器垃圾，避免打进发布包
+find "$PKG" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+find "$PKG" -name '*.py[co]' -delete 2>/dev/null || true
+find "$PKG" -name '.DS_Store' -delete 2>/dev/null || true
 echo "[*] 包内容:"; ls -la "$PKG"
 
 if [ "$1" == "zip" ]; then
