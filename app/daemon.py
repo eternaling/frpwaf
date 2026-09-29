@@ -115,10 +115,19 @@ def _int(v):
 
 
 def _fw_sync():
-    """按当前配置同步内核封禁（失败静默，不影响主流程）。"""
+    """按当前配置同步内核封禁（失败静默，不影响主流程）。
+
+    注意：关闭开关时必须显式清理内核残留（ipset + iptables）。否则已下发的
+    封禁规则仍在内核层丢包，表现为「已在面板关闭内核封禁，却仍被拦截」。
+    """
     try:
-        if config.get().get("fw_sync_enabled", True):
+        on = bool(config.get().get("fw_sync_enabled", True))
+        if on:
             firewall.sync_from_store()
+        elif _mem.get("fw_on", None) is not False:
+            # 首次（None）或由开转关：清理可能残留的规则；保持关闭时不重复执行
+            firewall.teardown()
+        _mem["fw_on"] = on
     except Exception:
         pass
 
@@ -211,9 +220,13 @@ class Handler(BaseHTTPRequestHandler):
             path = u.path
             qs = parse_qs(u.query)
 
-            # frp 插件回调
+            # frp 插件回调（始终放行：关闭网页端不影响 WAF 防护与 frps 回调）
             if path == "/frp/handler":
                 return self._frp_handler(qs)
+
+            # 网页端开关：关闭时仅屏蔽网页与 /api/*，回调照常运行
+            if not config.get().get("web_enabled", True):
+                return self._send(403, "网页端已关闭", ctype="text/plain; charset=utf-8")
 
             # 静态资源
             if path in ("/", "/index.html"):
@@ -373,6 +386,7 @@ class Handler(BaseHTTPRequestHandler):
             if cfg.get("ai_window", 300) < 30:
                 cfg["ai_window"] = 30
             config.save(cfg)
+            _fw_sync()   # 开关/名单变化立即生效（关闭内核封禁时同步清理残留）
             return self._json({"code": 0, "msg": "保存成功"})
 
         if path == "/api/password":
@@ -511,9 +525,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"code": 0, "data": st})
 
         if path == "/api/kernban/sync" and method == "POST":
-            ok = firewall.sync_from_store()
-            return self._json({"code": 0 if ok else 1,
-                               "msg": "已同步" if ok else "当前环境不支持或未启用",
+            if cfg.get("fw_sync_enabled", True):
+                ok = firewall.sync_from_store()
+                return self._json({"code": 0 if ok else 1,
+                                   "msg": "已同步" if ok else "当前环境不支持（需 root + ipset/iptables）",
+                                   "data": firewall.status()})
+            firewall.teardown()
+            return self._json({"code": 0, "msg": "内核封禁已关闭，已清理内核规则",
                                "data": firewall.status()})
 
         if path == "/api/ai/review":
@@ -561,8 +579,7 @@ def _bg_loop():
             cfg = config.get()
             store.trim_logs(int(cfg.get("log_max_rows") or 50000))
             store.trim_ai_review(5000)
-            if cfg.get("fw_sync_enabled", True):
-                firewall.sync_from_store()
+            _fw_sync()
             # 每约 60 秒做一次 TRUNCATE checkpoint，回收 -wal 文件大小
             tick += 1
             if tick % 6 == 0:

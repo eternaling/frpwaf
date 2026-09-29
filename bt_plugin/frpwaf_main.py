@@ -128,7 +128,11 @@ class frpwaf_main:
         return "127.0.0.1"
 
     def _panel_url(self):
-        return "http://%s:%d/" % (self._server_ip(), WAF_PORT)
+        try:
+            port = int(self._cfg().get("http_port", WAF_PORT) or WAF_PORT)
+        except Exception:
+            port = WAF_PORT
+        return "http://%s:%d/" % (self._server_ip(), port)
 
     def _read(self, path):
         try:
@@ -197,6 +201,7 @@ class frpwaf_main:
             "install_status": 1 if os.path.exists(WAF_INIT) else 0,
             "url": self._panel_url(),
             "port": cfg.get("http_port", WAF_PORT),
+            "web_enabled": bool(cfg.get("web_enabled", True)),
             "frps_toml": FRPS_TOML,
             "plugin_configured": "frpwaf" in self._read(FRPS_TOML),
             "admin_user": cfg.get("admin_user", "admin"),
@@ -224,11 +229,12 @@ class frpwaf_main:
                 public.ExecShell("chkconfig --level 2345 frpwaf on")
             else:
                 public.ExecShell("update-rc.d frpwaf defaults")
-            # 4. 启动
-            public.ExecShell("%s start" % WAF_INIT)
+            # 4) 重启以加载新代码：用 restart 而非 start——服务已在运行时 start 会
+            #    直接返回「already running」而不重启，导致「更新」不生效。
+            public.ExecShell("%s restart" % WAF_INIT)
             # 5. 同步内核封禁
             self._fw_sync()
-            return public.returnMsg(True, "安装成功！管理面板：%s（默认账号 admin / 123456，请及时修改）" % self._panel_url())
+            return public.returnMsg(True, "WAF 网页端安装成功（仅安装网页端，非安装 frp）！管理面板：%s（默认账号 admin / 123456，请及时修改）" % self._panel_url())
         except Exception:
             return public.returnMsg(False, "安装失败：" + traceback.format_exc())
 
@@ -282,6 +288,156 @@ class frpwaf_main:
         if "failed" in (res[0] or ""):
             return public.returnMsg(False, "操作失败，请检查日志")
         return public.returnMsg(True, "操作成功")
+
+    # ---------------- 网页端（WAF 管理面板）开关 / 换端口 ----------------
+    def web_toggle(self, get=None):
+        """开启 / 关闭网页端（WAF 管理面板）。
+
+        仅控制网页访问（/ 与 /api/*）。frps 回调（/frp/handler）与 WAF 防护
+        始终运行，关闭后仍可从宝塔插件端随时重新开启。
+        """
+        try:
+            try:
+                raw = get.enabled
+            except Exception:
+                raw = None
+            if raw is None:
+                return public.returnMsg(False, "参数错误")
+            enabled = str(raw).lower() in ("1", "true", "on", "yes")
+            self._set_cfg({"web_enabled": enabled})
+            return public.returnMsg(
+                True,
+                "网页端已开启" if enabled
+                else "网页端已关闭（WAF 防护与 frps 回调不受影响，可随时重新开启）")
+        except Exception:
+            return public.returnMsg(False, "操作失败：" + traceback.format_exc()[-200:])
+
+    def _port_listening(self, port, host="127.0.0.1"):
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1.0)
+        try:
+            return s.connect_ex((host, int(port))) == 0
+        except Exception:
+            return False
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    def _port_free(self, port):
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("0.0.0.0", int(port)))
+            return True
+        except OSError:
+            return False
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    def _set_frps_plugin_port(self, port):
+        """把 frps.toml 中 name="frpwaf" 的 [[httpPlugins]] 块 addr 改为 127.0.0.1:port。"""
+        content = self._read(FRPS_TOML)
+        if "frpwaf" not in content:
+            return False
+        segments, cur, cur_is_header = [], [], None
+        for ln in content.splitlines():
+            s = ln.strip()
+            if s.startswith("["):
+                segments.append((cur_is_header, cur))
+                cur, cur_is_header = [ln], s
+            else:
+                cur.append(ln)
+        segments.append((cur_is_header, cur))
+        changed = False
+        for i, (header, body) in enumerate(segments):
+            if header and header.startswith("[[httpPlugins]]") and any("frpwaf" in l for l in body):
+                nb = []
+                for l in body:
+                    if re.match(r"\s*addr\s*=", l):
+                        nb.append('addr = "127.0.0.1:%d"' % int(port))
+                        changed = True
+                    else:
+                        nb.append(l)
+                segments[i] = (header, nb)
+        if changed:
+            out = []
+            for _, body in segments:
+                out.extend(body)
+            self._write(FRPS_TOML, "\n".join(out).strip() + "\n")
+        return changed
+
+    def set_web_port(self, get=None):
+        """修改网页端监听端口：同步更新配置与 frps.toml 回调地址并重启 WAF / frps。"""
+        try:
+            import time
+            try:
+                raw = get.port
+            except Exception:
+                raw = None
+            if raw is None or str(raw).strip() == "":
+                return public.returnMsg(False, "参数错误：缺少端口")
+            try:
+                port = int(str(raw).strip())
+            except (TypeError, ValueError):
+                return public.returnMsg(False, "端口必须是数字")
+            if port < 1 or port > 65535:
+                return public.returnMsg(False, "端口范围 1-65535")
+
+            cfg = self._cfg()
+            old = int(cfg.get("http_port", WAF_PORT) or WAF_PORT)
+            if port == old:
+                return public.returnMsg(True, "端口未变化（仍为 %d）" % old)
+
+            if not self._port_free(port):
+                return public.returnMsg(False, "端口 %d 已被占用，请更换" % port)
+
+            had_plugin = "frpwaf" in self._read(FRPS_TOML)
+
+            # 1) 写配置（守护进程重启后绑定新端口）
+            self._set_cfg({"http_port": port})
+            # 2) 同步 frps.toml 回调地址
+            if had_plugin:
+                try:
+                    public.ExecShell("cp -a %s %s.bak.$(date +%%Y%%m%%d-%%H%%M%%S)"
+                                     % (FRPS_TOML, FRPS_TOML))
+                except Exception:
+                    pass
+                self._set_frps_plugin_port(port)
+            # 3) 重启 WAF 以绑定新端口
+            public.ExecShell("%s restart" % WAF_INIT)
+            host = (cfg.get("http_addr") or "127.0.0.1")
+            if host in ("0.0.0.0", "::", ""):
+                host = "127.0.0.1"
+            ok = False
+            for _ in range(12):
+                time.sleep(0.5)
+                if self._port_listening(port, host):
+                    ok = True
+                    break
+            if not ok:
+                # 回滚到原端口，尽量恢复服务
+                self._set_cfg({"http_port": old})
+                if had_plugin:
+                    self._set_frps_plugin_port(old)
+                public.ExecShell("%s restart" % WAF_INIT)
+                if had_plugin:
+                    public.ExecShell("/etc/init.d/frps restart")
+                return public.returnMsg(False, "端口 %d 未能监听，已回滚为 %d（请检查端口占用 / 日志）" % (port, old))
+            # 4) 重启 frps 以重新加载回调地址
+            if had_plugin:
+                fr = public.ExecShell("/etc/init.d/frps status")
+                if "is running" in (fr[0] or ""):
+                    public.ExecShell("/etc/init.d/frps restart")
+            return public.returnMsg(True, "网页端端口已改为 %d，管理面板：%s" % (port, self._panel_url()))
+        except Exception:
+            return public.returnMsg(False, "修改失败：" + traceback.format_exc()[-200:])
 
     # ---------------- frps 集成 ----------------
     def get_frps_status(self, get=None):
@@ -741,10 +897,16 @@ class frpwaf_main:
             return ""
 
     def _fw_sync(self):
-        """把黑名单/封禁同步到内核防火墙（失败静默）。"""
+        """把黑名单/封禁同步到内核防火墙（失败静默）。
+
+        关闭内核封禁开关时显式清理 ipset/iptables，避免「已关闭却仍被内核丢包」。
+        """
         try:
+            fw = _app("firewall")
             if self._cfg().get("fw_sync_enabled", True):
-                _app("firewall").sync_from_store()
+                fw.sync_from_store()
+            else:
+                fw.teardown()
         except Exception:
             pass
 
@@ -759,12 +921,16 @@ class frpwaf_main:
             return {"status": True, "data": {"available": False, "enabled": False}}
 
     def kernban_sync(self, get=None):
-        """手动触发一次内核封禁同步。"""
+        """手动触发一次内核封禁同步（开关关闭时改为清理内核残留）。"""
         try:
-            ok = _app("firewall").sync_from_store()
-            if ok:
-                return public.returnMsg(True, "已同步到内核防火墙")
-            return public.returnMsg(False, "当前环境不支持（需 root + ipset/iptables）或未启用")
+            fw = _app("firewall")
+            if self._cfg().get("fw_sync_enabled", True):
+                ok = fw.sync_from_store()
+                if ok:
+                    return public.returnMsg(True, "已同步到内核防火墙")
+                return public.returnMsg(False, "当前环境不支持（需 root + ipset/iptables）")
+            fw.teardown()
+            return public.returnMsg(True, "内核封禁已关闭，已清理内核规则")
         except Exception:
             return public.returnMsg(False, "同步失败：" + traceback.format_exc()[-200:])
 

@@ -106,11 +106,22 @@
                 <button class="btn btn-default btn-sm" onclick="fwCtl('restart')">重启</button>
                 <button class="btn btn-danger btn-sm" onclick="fwCtl('stop')">停止</button>
                 <span style="flex:1"></span>
-                <button class="btn btn-default btn-sm" onclick="fwInstall()">安装 / 更新</button>
+                <button class="btn btn-default btn-sm" onclick="fwInstall()">安装 / 更新网页端</button>
                 <button class="btn btn-danger btn-sm" onclick="fwUninstall()">卸载</button>
               </div>
               <div class="fw-tip">管理面板：<a id="fwUrl" href="#" target="_blank"></a>（账号 <code id="fwCredUser">admin</code>，密码 <code id="fwCredPwd">••••••</code>
                 <span class="fw-eye" id="fwCredEye" title="显示 / 隐藏密码" onclick="fwToggleCred()">👁</span>）</div>
+            </div>
+            <div class="fw-card">
+              <h3>网页端（WAF 管理面板）<span id="fwWebBadge" class="fw-badge off">检测中…</span></h3>
+              <div class="fw-row">
+                <button id="fwWebBtn" class="btn btn-default btn-sm" onclick="fwWebToggle()">关闭网页端</button>
+                <span style="flex:1"></span>
+                <span class="fw-tip" style="margin:0">监听端口</span>
+                <input id="fwWebPort" class="bt-input-text" type="number" min="1" max="65535" style="width:110px" placeholder="7080">
+                <button class="btn btn-success btn-sm" onclick="fwWebPortSave()">保存端口</button>
+              </div>
+              <div class="fw-tip">网页端仅用于在浏览器打开 WAF 管理面板；关闭后不影响 WAF 防护与 frps 回调，可随时重新开启。修改端口会同步更新 frps 回调地址并重启 WAF 与 frps。</div>
             </div>
           </div>
           <div class="fw-col">
@@ -498,7 +509,7 @@
             </div>
           </div>
           <div class="fw-card fw-span-2">
-            <h3>管理员账号 <span style="color:#999;font-size:12px;font-weight:400">Web 管理面板（7080）</span></h3>
+            <h3>管理员账号 <span style="color:#999;font-size:12px;font-weight:400">Web 管理面板</span></h3>
             <div class="fw-kv" style="grid-template-columns:130px 1fr">
               <div class="k">当前用户名</div>
               <div><code id="fwAdminUser">-</code></div>
@@ -595,8 +606,43 @@ function fwLoadInfo(){
     fwCred.pwd=(r&&r.admin_password)||'';
     var u=document.getElementById('fwCredUser'); if(u) u.textContent=fwCred.user;
     fwRenderCred();
+    fwRenderWeb(r);
   });
   fwLoadOverview();
+}
+function fwRenderWeb(r){
+  var on = !!(r && r.web_enabled);
+  var b=document.getElementById('fwWebBadge');
+  if(b){ b.className='fw-badge '+(on?'on':'off'); b.textContent = on?'已开启':'已关闭'; }
+  var btn=document.getElementById('fwWebBtn');
+  if(btn){ btn.textContent = on?'关闭网页端':'开启网页端'; btn.className='btn btn-sm '+(on?'btn-danger':'btn-success'); }
+  var p=document.getElementById('fwWebPort');
+  if(p && document.activeElement!==p) p.value=(r&&r.port)||7080;
+}
+function fwWebToggle(){
+  fwSend('get_waf_info', {}, function(r){
+    var on = !!(r && r.web_enabled);
+    var want = on ? '关闭' : '开启';
+    layer.confirm('确认'+want+'网页端（WAF 管理面板）？'+(on?'（关闭后不影响 WAF 防护与 frps 回调）':''), {icon:3, title:'提示'}, function(i){
+      layer.close(i);
+      fwSend('web_toggle', {enabled: on?0:1}, function(r2){
+        bt_tools.msg((r2&&r2.msg)||'操作完成', (r2&&r2.status));
+        setTimeout(fwLoadInfo, 800);
+      });
+    });
+  });
+}
+function fwWebPortSave(){
+  var p=document.getElementById('fwWebPort');
+  var port=parseInt((p&&p.value)||'',10);
+  if(!port||port<1||port>65535){ bt_tools.msg('请输入 1-65535 的端口', false); return; }
+  layer.confirm('确认把网页端端口改为 '+port+'？将同步更新 frps 回调地址并重启 WAF 与 frps（期间连接会短暂中断）。', {icon:3, title:'提示'}, function(i){
+    layer.close(i);
+    fwSend('set_web_port', {port:port}, function(r){
+      bt_tools.msg((r&&r.msg)||'操作完成', (r&&r.status));
+      setTimeout(fwLoadInfo, 1500);
+    });
+  });
 }
 var fwCred={user:'',pwd:'',show:false};
 function fwRenderCred(){
@@ -641,7 +687,7 @@ function fwCtl(act){
   });
 }
 function fwInstall(){
-  layer.confirm('确认安装 / 更新 FRP WAF？', {icon:3, title:'提示'}, function(i){
+  layer.confirm('确认安装 / 更新 <b>WAF 网页端</b>？<br><br>说明：此操作<b>仅安装/更新 WAF 的网页端（管理面板）</b>，<b>并非安装 frp</b>。frps/frpc 请到左侧「frp 管理」中安装。', {icon:3, title:'提示'}, function(i){
     layer.close(i);
     fwSend('install_waf', {}, function(r){ bt_tools.msg(r&&r.msg?r.msg:'完成',(r&&r.status)); setTimeout(fwLoadInfo,2000); });
   });

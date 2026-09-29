@@ -443,8 +443,8 @@ RET_VAL=0
 program_version=`${{BIN}} --version`
 
 fun_check_run(){{
-    PID=`ps -ef | grep -v grep | grep -i "${{BIN}}" | awk '{{print $2}}'`
-    [ ! -z $PID ] && return 0 || return 1
+    PID=`ps -ef | grep -v grep | grep -i "${{BIN}}" | awk '{{print $2}}' | head -1`
+    [ -n "$PID" ]
 }}
 
 fun_start(){{

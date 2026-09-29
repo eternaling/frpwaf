@@ -399,7 +399,12 @@ def trim_ai_review(max_rows=5000):
 # ---------------- 汇总 ----------------
 def stats():
     total = _query("SELECT COUNT(*) AS n FROM conn_log")[0]["n"]
-    today0 = int(time.time()) // 86400 * 86400
+    # 「今日」按服务器本地时区零点计算（面板展示的是本地时间）。
+    # 注意：不可用 (ts // 86400 * 86400)，那是 UTC 零点，在东八区 00:00-08:00
+    # 会把昨天的数据算进「今日」，导致统计口径与显示不一致。
+    _lt = time.localtime()
+    today0 = int(time.mktime((_lt.tm_year, _lt.tm_mon, _lt.tm_mday,
+                              0, 0, 0, 0, 0, -1)))
     today = _query("SELECT COUNT(*) AS n FROM conn_log WHERE ts>=?", (today0,))[0]["n"]
     rejected = _query(
         "SELECT COUNT(*) AS n FROM conn_log WHERE ts>=? AND action!='allow'", (today0,)

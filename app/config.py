@@ -21,6 +21,9 @@ DEFAULTS = {
     # 管理/WAF 监听地址（frps httpPlugins 会回调到这里）
     "http_addr": "0.0.0.0",
     "http_port": 7080,
+    # 是否启用「网页端」（WAF 管理面板）。关闭后仅停用网页访问（/ 与 /api/*），
+    # frps 回调（/frp/handler）与 WAF 防护照常运行，可从宝塔插件端随时重新开启。
+    "web_enabled": True,
     # 管理员账号（默认 admin / 123456，安装后请在面板内及时修改）
     "admin_user": "admin",
     "admin_password": "123456",
