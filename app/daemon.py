@@ -329,6 +329,7 @@ class Handler(BaseHTTPRequestHandler):
                 "whitelist_enabled": cfg["whitelist_enabled"],
                 "auto_ban_enabled": cfg["auto_ban_enabled"],
                 "rate_limit_enabled": cfg["rate_limit_enabled"],
+                "admin_user": cfg.get("admin_user", "admin"),
             })
             st["geo_available"] = geo.db_info().get("available", False)
             return self._json({"code": 0, "data": st})
@@ -374,7 +375,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/password":
             body = self._body()
-            ok, msg = auth.change_password(body.get("old", ""), body.get("new", ""))
+            # 支持同时修改用户名与密码（与宝塔插件端保持一致）
+            ok, msg = auth.change_credentials(
+                body.get("old", ""), body.get("new", ""),
+                body.get("new_user", ""), body.get("old_user", ""))
             return self._json({"code": 0 if ok else 1, "msg": msg})
 
         if path == "/api/iplist":

@@ -256,11 +256,18 @@
         <div class="row" style="margin-top:14px"><button onclick="saveSettings()">保存策略</button></div>
       </div>
       <div class="box">
-        <h2>修改管理员密码</h2>
+        <h2>修改管理员账号</h2>
+        <p class="muted" style="margin:0 0 10px">当前账号：<code id="curUser">-</code>（用户名与密码均可修改，留空则保持不变）</p>
         <div class="row">
-          <input id="pwOld" type="password" placeholder="原密码" style="width:180px">
-          <input id="pwNew" type="password" placeholder="新密码" style="width:180px">
-          <button onclick="changePwd()">修改</button>
+          <div class="field"><label>原密码 *</label>
+            <input id="pwOld" type="password" placeholder="原密码" style="width:180px"></div>
+          <div class="field"><label>原用户名（可选）</label>
+            <input id="pwOldUser" placeholder="原用户名" style="width:180px"></div>
+          <div class="field"><label>新用户名（可选）</label>
+            <input id="pwNewUser" placeholder="留空=不改用户名" style="width:180px"></div>
+          <div class="field"><label>新密码（可选）</label>
+            <input id="pwNew" type="password" placeholder="留空=不改密码" style="width:180px"></div>
+          <button onclick="changePwd()" style="margin-top:18px">修改</button>
         </div>
       </div>
     </section>
@@ -322,7 +329,7 @@ function loadTab(tab){
 /* ---- 概览 ---- */
 async function loadDash(){
   const r = await api('/api/overview'); const d=r.data;
-  $('#whoami').textContent = '管理员已登录';
+  $('#whoami').textContent = '管理员：'+(d.admin_user||'已登录');
   $('#statCards').innerHTML = [
     ['今日连接', d.today_conns, 'pri'], ['今日拦截', d.today_rejected, 'err'],
     ['今日独立IP', d.today_uniq_ip, ''], ['生效封禁', d.active_bans, 'err'],
@@ -464,6 +471,11 @@ async function loadSettings(){
   const r = await api('/api/config'); const c=r.data;
   ['blacklist_enabled','whitelist_enabled','auto_ban_enabled','rate_limit_enabled','fw_sync_enabled'].forEach(k=>$('#s_'+k).checked=!!c[k]);
   ['auto_ban_window','auto_ban_threshold','auto_ban_seconds','rate_limit_per_sec','log_max_rows'].forEach(k=>$('#s_'+k).value=c[k]);
+  loadCurUser();
+}
+async function loadCurUser(){
+  try{ const r=await api('/api/overview'); const u=r.data.admin_user||'-';
+    $('#curUser').textContent=u; $('#whoami').textContent='管理员：'+u; }catch(e){}
 }
 async function saveSettings(){
   const b={};
@@ -472,8 +484,16 @@ async function saveSettings(){
   const r=await api('/api/config','POST',b); toast(r.msg, r.code===0?'ok':'err');
 }
 async function changePwd(){
-  const r=await api('/api/password','POST',{old:$('#pwOld').value,new:$('#pwNew').value});
-  toast(r.msg, r.code===0?'ok':'err'); if(r.code===0){$('#pwOld').value='';$('#pwNew').value='';}
+  const old=$('#pwOld').value, nw=$('#pwNew').value;
+  const nu=$('#pwNewUser').value.trim(), ou=$('#pwOldUser').value.trim();
+  if(!old){ return toast('请先填写原密码','err'); }
+  if(!nw && !nu){ return toast('请填写新用户名或新密码','err'); }
+  const r=await api('/api/password','POST',{old,new:nw,new_user:nu,old_user:ou});
+  toast(r.msg, r.code===0?'ok':'err');
+  if(r.code===0){
+    $('#pwOld').value=''; $('#pwNew').value=''; $('#pwNewUser').value=''; $('#pwOldUser').value='';
+    loadCurUser();
+  }
 }
 
 /* ---- 启动 ---- */
