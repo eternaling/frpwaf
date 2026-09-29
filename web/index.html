@@ -167,8 +167,11 @@
             <option value="">全部动作</option><option value="allow">allow</option>
             <option value="reject">reject</option>
           </select>
+          <select id="logProxy" style="width:180px">
+            <option value="">全部代理</option>
+          </select>
           <button class="sm" onclick="loadLogs(0)">查询</button>
-          <button class="ghost sm" onclick="document.getElementById('logIp').value='';document.getElementById('logAction').value='';loadLogs(0)">重置</button>
+          <button class="ghost sm" onclick="document.getElementById('logIp').value='';document.getElementById('logAction').value='';document.getElementById('logProxy').value='';loadLogs(0)">重置</button>
           <span class="grow"></span>
           <button class="danger sm" onclick="purgeLogs()">清空日志</button>
         </div>
@@ -322,7 +325,7 @@ document.querySelectorAll('nav a').forEach(a=>a.onclick=()=>{
 function loadTab(tab){
   document.querySelectorAll('section[id^=tab-]').forEach(s=>s.classList.add('hide'));
   $('#tab-'+tab).classList.remove('hide');
-  ({dash:loadDash, list:()=>loadList(curListType), logs:()=>loadLogs(0),
+  ({dash:loadDash, list:()=>loadList(curListType), logs:()=>{loadLogProxies();loadLogs(0);},
     bans:loadBans, geoq:loadGeo, proxies:loadProxies, settings:loadSettings}[tab]||(()=>{}))();
 }
 
@@ -382,11 +385,21 @@ async function batchImport(){
 
 /* ---- 日志 ---- */
 let logOff=0, logLimit=50;
+async function loadLogProxies(){
+  try{
+    const r = await api('/api/logs/proxies');
+    const sel=$('#logProxy'); if(!sel) return;
+    const cur=sel.value, rows=r.data||[];
+    sel.innerHTML='<option value="">全部代理</option>'+rows.map(n=>`<option value="${esc(n)}">${esc(n)}</option>`).join('');
+    sel.value=cur;
+  }catch(e){}
+}
 async function loadLogs(off){ logOff = off;
-  const ip=$('#logIp').value.trim(), ac=$('#logAction').value;
+  const ip=$('#logIp').value.trim(), ac=$('#logAction').value, px=$('#logProxy').value;
   let q=`?limit=${logLimit}&offset=${logOff}`;
   if(ip) q+='&ip='+encodeURIComponent(ip);
   if(ac) q+='&action='+ac;
+  if(px) q+='&proxy='+encodeURIComponent(px);
   const r = await api('/api/logs'+q);
   $('#logTotal').textContent = '共 '+r.total+' 条';
   $('#logTable tbody').innerHTML = r.data.map(x=>`<tr>

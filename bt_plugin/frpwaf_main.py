@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import threading
 import subprocess
 import traceback
 
@@ -33,33 +34,70 @@ if not os.path.exists(PYTHON):
 
 # 宝塔面板为常驻进程，会缓存已导入的 app 包；插件更新后需自动重载，
 # 否则会继续执行内存中的旧代码（例如旧 store 缺少新方法）。
+#
+# 注意：运行代码的目录名虽然是 app/，但**绝不能用通用包名 "app" 导入**。
+# 面板进程里已有面板自身 / 其它插件的 "app" 包，一旦冲突就会报
+#   ModuleNotFoundError: No module named 'app.frp'
+# 因此统一用私有包名 frpwaf_app 加载，与外部彻底隔离。
+_APP_PKG = "frpwaf_app"
 _APP_SIG = None
+_APP_LOCK = threading.Lock()
+
+
+def _load_app_pkg():
+    """把 /opt/frpwaf/app 目录以私有包名 frpwaf_app 注册到 sys.modules。
+
+    若同名包已存在但 __path__ 不是本插件目录（被顶替），则重建修复。
+    """
+    import importlib.util
+    pkg_dir = os.path.join(WAF_HOME, "app")
+    cur = sys.modules.get(_APP_PKG)
+    if cur is not None and list(getattr(cur, "__path__", []) or []) == [pkg_dir]:
+        return cur
+    # 清除可能残留的旧包与子模块
+    for m in [m for m in list(sys.modules)
+              if m == _APP_PKG or m.startswith(_APP_PKG + ".")]:
+        sys.modules.pop(m, None)
+    spec = importlib.util.spec_from_file_location(
+        _APP_PKG, os.path.join(pkg_dir, "__init__.py"),
+        submodule_search_locations=[pkg_dir])
+    pkg = importlib.util.module_from_spec(spec)
+    sys.modules[_APP_PKG] = pkg
+    try:
+        spec.loader.exec_module(pkg)
+    except Exception:
+        sys.modules.pop(_APP_PKG, None)
+        raise
+    return pkg
 
 
 def _app(modname):
-    """导入 /opt/frpwaf/app 下的子模块，源码有变更时自动重载。"""
+    """导入 /opt/frpwaf/app 下的子模块，源码有变更时自动重载。
+
+    使用私有包名 frpwaf_app，避免与宝塔面板/其它插件的通用 "app" 包冲突。
+    """
     global _APP_SIG
-    if WAF_HOME not in sys.path:
-        sys.path.insert(0, WAF_HOME)
-    import importlib
-    pkg_dir = os.path.join(WAF_HOME, "app")
-    sig = []
-    try:
-        for fn in sorted(os.listdir(pkg_dir)):
-            if fn.endswith(".py"):
-                sig.append((fn, int(os.path.getmtime(os.path.join(pkg_dir, fn)))))
-    except OSError:
-        pass
-    sig = tuple(sig)
-    if sig != _APP_SIG:
-        for m in [m for m in list(sys.modules) if m == "app" or m.startswith("app.")]:
-            mod = sys.modules.get(m)
-            try:
-                importlib.reload(mod)
-            except Exception:
+    with _APP_LOCK:
+        if WAF_HOME not in sys.path:
+            sys.path.insert(0, WAF_HOME)
+        import importlib
+        pkg_dir = os.path.join(WAF_HOME, "app")
+        sig = []
+        try:
+            for fn in sorted(os.listdir(pkg_dir)):
+                if fn.endswith(".py"):
+                    sig.append((fn, int(os.path.getmtime(os.path.join(pkg_dir, fn)))))
+        except OSError:
+            pass
+        sig = tuple(sig)
+        if sig != _APP_SIG:
+            # 源码有变更：丢弃旧的私有包（含子模块），下次重新导入新代码
+            for m in [m for m in list(sys.modules)
+                      if m == _APP_PKG or m.startswith(_APP_PKG + ".")]:
                 sys.modules.pop(m, None)
-        _APP_SIG = sig
-    return importlib.import_module("app." + modname)
+            _APP_SIG = sig
+        _load_app_pkg()   # 确保私有包存在且指向本插件目录（防被顶替）
+        return importlib.import_module(_APP_PKG + "." + modname)
 
 
 class frpwaf_main:
@@ -915,12 +953,13 @@ class frpwaf_main:
 
     # ---------------- 连接日志 ----------------
     def conn_logs(self, get=None):
-        """连接审计日志（支持 ip/action 过滤 + 分页）。"""
+        """连接审计日志（支持 ip/action/proxy 过滤 + 分页）。"""
         try:
             limit = 50
             offset = 0
             ip = None
             action = None
+            proxy = None
             try:
                 limit = max(1, min(500, int(get.limit or 50)))
             except Exception:
@@ -931,6 +970,11 @@ class frpwaf_main:
                 pass
             try:
                 ip = (get.ip or "").strip() or None
+            except Exception:
+                pass
+            try:
+                # 代理名筛选：精确匹配（下拉框值来自 log_proxy_names）
+                proxy = (getattr(get, "log_proxy", "") or "").strip() or None
             except Exception:
                 pass
             try:
@@ -945,9 +989,9 @@ class frpwaf_main:
             except Exception:
                 pass
             store = _app("store")
-            rows = store.list_logs(limit, offset, ip, action)
+            rows = store.list_logs(limit, offset, ip, action, proxy)
             try:
-                total = store.count_logs(ip, action)
+                total = store.count_logs(ip, action, proxy)
             except Exception:
                 total = len(rows)
             # 归属地查询失败不应导致整表为空：逐条兜底
@@ -961,6 +1005,13 @@ class frpwaf_main:
         except Exception:
             return {"status": True, "data": [], "total": 0,
                     "error": traceback.format_exc()[-200:]}
+
+    def log_proxy_list(self, get=None):
+        """连接日志中出现过的代理名（供筛选下拉框）。"""
+        try:
+            return {"status": True, "data": _app("store").log_proxy_names()}
+        except Exception:
+            return {"status": True, "data": []}
 
     def purge_conn_logs(self, get=None):
         try:

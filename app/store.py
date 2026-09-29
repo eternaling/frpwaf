@@ -203,7 +203,7 @@ def add_log(ip, port, proxy_name, proxy_type, user, action, reason=""):
     )
 
 
-def list_logs(limit=200, offset=0, ip=None, action=None):
+def list_logs(limit=200, offset=0, ip=None, action=None, proxy=None):
     sql = "SELECT * FROM conn_log WHERE 1=1"
     args = []
     if ip:
@@ -212,12 +212,15 @@ def list_logs(limit=200, offset=0, ip=None, action=None):
     if action:
         sql += " AND action=?"
         args.append(action)
+    if proxy:
+        sql += " AND proxy_name=?"
+        args.append(proxy)
     sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
     args += [int(limit), int(offset)]
     return _query(sql, args)
 
 
-def count_logs(ip=None, action=None):
+def count_logs(ip=None, action=None, proxy=None):
     sql = "SELECT COUNT(*) AS n FROM conn_log WHERE 1=1"
     args = []
     if ip:
@@ -226,7 +229,16 @@ def count_logs(ip=None, action=None):
     if action:
         sql += " AND action=?"
         args.append(action)
+    if proxy:
+        sql += " AND proxy_name=?"
+        args.append(proxy)
     return _query(sql, args)[0]["n"]
+
+
+def log_proxy_names():
+    """连接日志中出现过的代理名（用于筛选下拉框）。"""
+    return [r["proxy_name"] for r in _query(
+        "SELECT DISTINCT proxy_name FROM conn_log WHERE proxy_name<>'' ORDER BY proxy_name")]
 
 
 def recent_count_by_ip(ip, window_sec):

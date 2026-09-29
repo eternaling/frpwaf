@@ -428,6 +428,9 @@
               <option value="allow">allow</option>
               <option value="reject">reject</option>
             </select>
+            <select id="fwLogProxy" class="bt-input-text" style="width:180px">
+              <option value="">全部代理</option>
+            </select>
             <button class="btn btn-default btn-sm" onclick="fwLogPage(0)">查询</button>
             <button class="btn btn-default btn-sm" onclick="fwLogReset()">重置</button>
             <span style="flex:1"></span>
@@ -569,7 +572,7 @@ document.querySelectorAll('.fw-main .bt-w-menu p').forEach(function(p){
     if(t==='log'){ fwLoadLog(); }
     if(t==='ban'){ fwLoadBans(); fwLoadIpList(); fwLoadBanHistory(); fwLoadKernBan(); }
     if(t==='ai'){ fwAiLoad(); }
-    if(t==='connlog'){ fwLogPage(0); }
+    if(t==='connlog'){ fwLogLoadProxies(); fwLogPage(0); }
     if(t==='proxy'){ fwLoadProxies(); }
     if(t==='settings'){ fwLoadPolicy(); fwLoadAdmin(); }
     if(t==='frp'){ fwFrpLoad(); }
@@ -809,9 +812,20 @@ function fwLogQuery(){
   var q={limit:fwLogLimit, offset:fwLogOff};
   var ip=(document.getElementById('fwLogIp').value||'').trim();
   var ac=document.getElementById('fwLogAction').value;
+  var px=document.getElementById('fwLogProxy').value;
   if(ip) q.ip=ip;
   if(ac) q.log_action=ac;
+  if(px) q.log_proxy=px;
   return q;
+}
+function fwLogLoadProxies(){
+  fwSend('log_proxy_list', {}, function(r){
+    var sel=document.getElementById('fwLogProxy'); if(!sel) return;
+    var cur=sel.value, rows=(r&&r.data)||[];
+    sel.innerHTML='<option value="">全部代理</option>'+rows.map(function(n){
+      return '<option value="'+fwEsc(n)+'">'+fwEsc(n)+'</option>'; }).join('');
+    sel.value=cur;   // 保留当前选择
+  });
 }
 function fwLogPage(off){
   fwLogOff=Math.max(0, off);
@@ -836,6 +850,7 @@ function fwLogNext(){ fwLogPage(fwLogOff+fwLogLimit); }
 function fwLogReset(){
   document.getElementById('fwLogIp').value='';
   document.getElementById('fwLogAction').value='';
+  document.getElementById('fwLogProxy').value='';
   fwLogPage(0);
 }
 function fwPurgeLogs(){

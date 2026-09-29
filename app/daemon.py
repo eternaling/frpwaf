@@ -20,7 +20,9 @@ from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import __version__, ai, auth, config, engine, firewall, geo, store  # noqa: E402
+# 相对导入：无论本包以 app 还是 frpwaf_app 名字载入都能正确解析，
+# 避免在面板常驻进程里与外部通用 "app" 包冲突。
+from . import __version__, ai, auth, config, engine, firewall, geo, store  # noqa: E402
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
 
@@ -437,8 +439,9 @@ class Handler(BaseHTTPRequestHandler):
                 offset = max(0, _int(qs.get("offset", [0])[0]))
                 ip = qs.get("ip", [None])[0]
                 action = qs.get("action", [None])[0]
-                rows = store.list_logs(limit, offset, ip, action)
-                total = store.count_logs(ip, action)
+                proxy = qs.get("proxy", [None])[0]
+                rows = store.list_logs(limit, offset, ip, action, proxy)
+                total = store.count_logs(ip, action, proxy)
                 geo.enrich(rows)
                 return self._json({"code": 0, "data": rows, "total": total})
             if method == "POST":
@@ -446,6 +449,10 @@ class Handler(BaseHTTPRequestHandler):
                 if body.get("action") == "purge":
                     store.purge_logs()
                     return self._json({"code": 0, "msg": "日志已清空"})
+
+        if path == "/api/logs/proxies":
+            # 连接日志中出现过的代理名（供筛选下拉框）
+            return self._json({"code": 0, "data": store.log_proxy_names()})
 
         if path == "/api/bans":
             if method == "GET":
