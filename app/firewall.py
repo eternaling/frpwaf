@@ -131,16 +131,45 @@ def _reconcile(setname, want):
             _run(["ipset", "del", setname, m, "-exist"])
 
 
-def _member_in(member, net):
-    """member（单地址或 CIDR）是否落在 net 内。"""
-    try:
-        return ipaddress.ip_address(member) in net
-    except ValueError:
-        pass
-    try:
-        return ipaddress.ip_network(member, strict=False).subnet_of(net)
-    except (ValueError, AttributeError):
-        return False
+def _member(net):
+    """网络 -> ipset 成员字符串（/32、/128 用裸地址）。"""
+    if net.prefixlen == net.max_prefixlen:
+        return str(net.network_address)
+    return str(net)
+
+
+def _apply_whitelist(bucket, wnets):
+    """从 bucket({member: timeout}) 中剔除白名单覆盖的地址段。
+
+    仅「成员落在白名单内」直接删除是不够的：若成员是 CIDR（如 10.0.0.0/8）
+    而白名单只放了其中某个 IP/子网（如 10.0.0.5），整段仍会下发到内核，
+    导致白名单地址在内核层被 DROP（应用层放行、内核拦截）。故这里做 CIDR
+    差集：把命中白名单的成员拆成「原段 - 白名单段」后重新放入。
+    """
+    for m in list(bucket):
+        try:
+            net = ipaddress.ip_network(m, strict=False)
+        except ValueError:
+            continue
+        t = bucket[m]
+        remaining = [net]
+        for w in wnets:
+            if w.version != net.version:
+                continue
+            newr = []
+            for n in remaining:
+                if not n.overlaps(w):
+                    newr.append(n)
+                elif n.subnet_of(w):
+                    pass                      # 整段都在白名单内 -> 丢弃
+                else:
+                    newr.extend(n.address_exclude(w))   # w 在 n 内 -> 取差集
+            remaining = newr
+        if len(remaining) == 1 and _member(remaining[0]) == m:
+            continue                          # 未变化
+        bucket.pop(m, None)
+        for n in remaining:
+            bucket[_member(n)] = t
 
 
 def sync(permanent, bans, whitelist=None):
@@ -166,11 +195,7 @@ def sync(permanent, bans, whitelist=None):
         t = int(b.get("expire_at") or 0) - now
         if t <= 0:
             continue  # 已到期，交给集合自身超时移除
-        if net.prefixlen == net.max_prefixlen:
-            member = str(net.network_address)
-        else:
-            member = str(net)
-        (want6 if net.version == 6 else want4)[member] = t
+        (want6 if net.version == 6 else want4)[_member(net)] = t
     # 永久黑名单最后写入，始终为永久（timeout 0），不被临时封禁覆盖
     for cidr in (permanent or []):
         n = _norm(cidr)
@@ -179,17 +204,17 @@ def sync(permanent, bans, whitelist=None):
         member, ver = n
         (want6 if ver == 6 else want4)[member] = 0
 
-    # 白名单优先：剔除落在白名单内的成员
+    # 白名单优先：把落在白名单内的成员按 CIDR 差集剔除
     if whitelist:
+        wnets = []
         for cidr in whitelist:
             try:
-                net = ipaddress.ip_network(cidr, strict=False)
+                wnets.append(ipaddress.ip_network(cidr, strict=False))
             except ValueError:
                 continue
-            for bucket in (want4, want6):
-                for m in list(bucket):
-                    if _member_in(m, net):
-                        bucket.pop(m, None)
+        if wnets:
+            _apply_whitelist(want4, wnets)
+            _apply_whitelist(want6, wnets)
 
     with _lock:
         _ensure()

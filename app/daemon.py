@@ -486,7 +486,10 @@ class Handler(BaseHTTPRequestHandler):
                 ip = (body.get("ip") or "").strip()
                 if not ip:
                     return self._json({"code": 1, "msg": "请输入 IP"})
-                store.add_ban(ip, "manual", int(body.get("seconds") or 3600))
+                try:
+                    store.add_ban(ip, "manual", int(body.get("seconds") or 3600))
+                except ValueError as e:
+                    return self._json({"code": 1, "msg": str(e)})
                 _fw_sync()
                 return self._json({"code": 0, "msg": "已封禁"})
 

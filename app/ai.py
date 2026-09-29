@@ -224,6 +224,10 @@ def review(force=False):
         reason = str(v.get("reason", "")).strip()[:300]
         if not ip:
             continue
+        # 只处理本次真正送审过的 IP。模型可能因幻觉 / 提示注入返回集合外的
+        # IP（例如被审查内容里诱导出的无关地址），若对其自动封禁可被滥用。
+        if ip not in stat:
+            continue
         it = stat.get(ip, {})
         action = "none"
         if verdict == "malicious" and cfg.get("ai_auto_ban"):
