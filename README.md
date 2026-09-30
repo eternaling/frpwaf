@@ -17,6 +17,7 @@
 │   ├── engine.py               准入决策引擎
 │   ├── firewall.py             内核级封禁同步（ipset + iptables）
 │   ├── frp.py                  frp 服务端/客户端管理（合并官方 frp管理器）
+│   ├── toml_lite.py            TOML 解析/生成（纯标准库，供 frp 配置读写）
 │   ├── ai.py                   AI 自动 IP 审查
 │   ├── geo.py                  IP 归属地查询
 │   ├── auth.py                 登录/会话（HMAC 签名 Cookie）
@@ -164,7 +165,7 @@ frp 的 `httpPlugins` 是**应用层**准入：被拒绝的连接，其 **TCP �
 | 重装会 `rm -rf /usr/local/frps` 并**重新随机生成配置**（破坏性） | 升级只替换二进制，**保留配置**；写前自动备份 |
 | 端口占用检查用 `netstat\|awk` 脆弱正则 | 改用 `ss` 解析 |
 | 版本写死 0.53.2 / 0.52.3，无法升级、无 arm 支持 | 支持 amd64/arm64/arm/386，动态查最新版 |
-| 写配置用 `toml.dumps` 可能丢未知字段 | 读改写整表，**保留 `[[httpPlugins]]` 等** |
+| 写配置用 `toml.dumps` 可能丢未知字段 | 读改写整表，**保留 `[[httpPlugins]]` 等**（自带纯标准库 `toml_lite`，无第三方依赖） |
 | 无配置校验、无备份 | 写前备份、写后 `frps verify`，失败自动回滚 |
 | 下载源 `download.bt.cn` 已 403 | 改用 GitHub Releases（含镜像回退） |
 

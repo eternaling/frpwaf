@@ -673,11 +673,9 @@ class frpwaf_main:
             if not text.strip():
                 return public.returnMsg(False, "内容为空")
             path = frp._toml_path(kind)
-            try:
-                import toml
-                toml.loads(text)  # 语法校验
-            except Exception as e:
-                return public.returnMsg(False, "TOML 语法错误：%s" % str(e)[:200])
+            terr = frp.check_toml(text)   # 语法校验（纯标准库，不依赖第三方 toml）
+            if terr:
+                return public.returnMsg(False, "TOML 语法错误：%s" % terr)
             public.ExecShell("cp -a %s %s.bak.$(date +%%Y%%m%%d-%%H%%M%%S)" % (path, path))
             self._write(path, text)
             verr = frp.verify(kind)

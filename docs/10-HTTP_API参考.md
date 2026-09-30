@@ -177,7 +177,7 @@ ai_ban_seconds, ai_timeout`。
 {"code":0,"data":{
   "total_conns":1234,"today_conns":56,"today_rejected":7,"today_uniq_ip":12,
   "black_count":4,"white_count":0,"active_bans":1,
-  "version":"1.3.8","uptime":3600,"http_addr":"0.0.0.0","http_port":7080,
+  "version":"1.3.9","uptime":3600,"http_addr":"0.0.0.0","http_port":7080,
   "blacklist_enabled":true,"whitelist_enabled":false,"auto_ban_enabled":false,
   "rate_limit_enabled":false,"admin_user":"admin","geo_available":true}}
 

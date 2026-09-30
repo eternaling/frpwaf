@@ -9,7 +9,7 @@
   2. 重装会清空 /usr/local/frps 并重新随机生成配置（破坏性）-> 升级只换二进制，保留配置
   3. 端口占用检查用 netstat|awk 脆弱正则 -> 改用 ss 解析
   4. 版本写死 0.53.2/0.52.3，无法升级、无 arm 支持 -> 支持多架构 + 动态查最新版
-  5. 写配置用 toml.dumps 但可能丢未知字段 -> 读改写整表，保留 httpPlugins 等
+  5. 写配置可能丢未知字段 -> 读改写整表，保留 httpPlugins 等（自带 toml_lite）
   6. 无配置校验、无备份 -> 写前备份、写后 `frps verify`
 
 仅标准库；外部命令 curl/wget/tar/ss。
@@ -25,6 +25,7 @@ import time
 import urllib.request
 
 from . import config
+from . import toml_lite
 
 FRPS_DIR = "/usr/local/frps"
 FRPC_DIR = "/usr/local/frpc"
@@ -764,18 +765,26 @@ def control(kind, action):
 
 
 # ---------------- 配置读写 ----------------
+def check_toml(text):
+    """校验 TOML 文本语法，返回错误字符串（合法则返回空串）。
+
+    供插件端「保存原文」复用，避免各自 import 第三方 toml。
+    """
+    try:
+        toml_lite.loads(text)
+        return ""
+    except Exception as e:
+        return str(e)[:200]
+
+
 def load_config(kind):
     """返回 (ok, dict_or_msg)。"""
-    try:
-        import toml
-    except ImportError:
-        return False, "缺少 toml 模块"
     path = _toml_path(kind)
     if not os.path.exists(path):
         return False, "配置文件不存在"
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return True, toml.load(f)
+            return True, toml_lite.load(f)
     except Exception as e:
         return False, "解析失败：%s" % e
 
@@ -815,10 +824,6 @@ def save_config(kind, patch):
 
     写前备份，写后做语法/合法性校验；校验失败则回滚。
     """
-    try:
-        import toml
-    except ImportError:
-        return False, "缺少 toml 模块"
     path = _toml_path(kind)
     ok, cfg = load_config(kind)
     if not ok:
@@ -844,7 +849,7 @@ def save_config(kind, patch):
         else:
             cfg[k] = v
 
-    new_text = toml.dumps(cfg)
+    new_text = toml_lite.dumps(cfg)
     # 校验
     bak = path + ".bak.%s" % time.strftime("%Y%m%d-%H%M%S")
     try:

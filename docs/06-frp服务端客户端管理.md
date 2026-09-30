@@ -28,7 +28,7 @@
 | 2 | 重装会**清空** `/usr/local/frps` 并**重新随机生成配置**（破坏性） | 升级只替换二进制；`_backup()` 先备份；配置已存在则不覆盖 |
 | 3 | 端口占用检查用 `netstat\|awk` 脆弱正则 | 改用 `ss -H -lntu` 解析 |
 | 4 | 版本写死（0.53.2/0.52.3），无法升级、无 arm 支持 | 多架构（`arch()`）+ 动态查最新版（`latest_version()`） |
-| 5 | 写配置用 `toml.dumps` 可能丢未知字段 | 读改写**整表**，保留 `httpPlugins` 等 |
+| 5 | 写配置用 `toml.dumps` 可能丢未知字段 | 读改写**整表**，保留 `httpPlugins` 等（自带 `toml_lite`） |
 | 6 | 无配置校验、无备份 | 写前备份、写后 `frps verify`，失败回滚 |
 
 ## 3. 安装 / 升级（异步）
@@ -79,16 +79,32 @@ GitHub 直连在国内多数服务器极慢或不可达，故优先用加速镜�
 
 ## 5. 配置读写（安全）
 
-- `load_config(kind)`：`toml.load` 返回结构化字典。
+- `load_config(kind)`：`toml_lite.load` 返回结构化字典（自带解析器，见 §5.1）。
 - `ensure_config(kind)`：文件缺失时**预创建**（不覆盖已有）。
 - `save_config(kind, patch)`：
   1. `maxPoolCount` 归位到 `[transport]`；
   2. 深度合并 `patch`（字典递归 `update`）；
-  3. `toml.dumps` 输出整表（保留未提及字段如 `httpPlugins`）；
+  3. `toml_lite.dumps` 输出整表（保留未提及字段如 `httpPlugins`）；
   4. 写前 `cp` 备份 → 写 → `verify()`；
   5. **校验失败自动回滚**并返回错误。
+- `check_toml(text)`：语法校验，返回错误串（合法为空）；供插件端「保存原文」复用。
 - `verify(kind)`：`<bin> verify -c <toml>`，合法返回空串。
 - `tail_log(kind)`：优先用配置里 `log.to`，否则 `/var/log/frps.log`。
+
+### 5.1 自带 TOML 解析器（`app/toml_lite.py`）
+
+**为什么**：原先 `import toml`（第三方包）依赖宝塔 pyenv 恰好自带；环境缺失即报
+「缺少 toml 模块」，且违反项目「纯标准库、无 requirements.txt」红线。
+
+**实现**：纯标准库的 TOML 子集解析 / 生成，解析语义与标准库 `tomllib` 对齐
+（同样的命名空间状态机 `EXPLICIT_NEST` / `FROZEN`，同样拒绝重复表声明、
+内联表冻结后再展开、点分键与表头冲突等非法文档），生成格式与 `tomllib`
+标准写法一致（先标量后子表、`[[name]]` 一行）。支持：表 / 数组表 / 点分键 /
+引号键、基本 / 字面量 / 多行字符串、整数（含 `0x`/`0o`/`0b`）、浮点、布尔、
+数组、内联表、注释、CRLF、BOM。不支持日期 / 时间（frp 配置不会出现，遇到明确报错）。
+
+**兼容**：Python 3.6+（无 `tomllib` 也可用）；验证方式见
+`docs/tests/`（与 `tomllib` 交叉比对 + 随机差异测试）。
 
 ## 6. 配置迁移（新版严格 schema）
 

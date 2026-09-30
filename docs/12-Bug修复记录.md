@@ -1,7 +1,7 @@
 # 12 · Bug 修复记录
 
 本文记录本项目**历次发现并修复的全部功能 Bug**，含现象、根因、修复与验证。
-共 5 个（Bug A–E），均在隔离环境复现、修复、验证后应用到生产。
+共 6 个（Bug A–F），均在隔离环境复现、修复、验证后应用到生产。
 
 > 编号顺序为**发现顺序**，与修复提交顺序略有交叉（Bug B 与 A 同批提交）。
 
@@ -14,6 +14,7 @@
 | C | `firewall.py` | `v1.3.8` | v1.3.8 | 已提交发布 |
 | D | `ai.py` | `v1.3.8` | v1.3.8 | 已提交发布 |
 | E | `daemon.py` | `v1.3.8` | v1.3.8 | 已提交发布 |
+| F | `frp.py` / `toml_lite.py` | `v1.3.9` | v1.3.9 | 已提交发布 |
 
 > A、B 随 `cedf595` 一起提交并打 Tag `v1.3.7`；C、D、E 随后修复，随 Tag
 > `v1.3.8` 一起提交（见 [13-变更历史与版本.md](13-变更历史与版本.md) §2/§4）。
@@ -220,6 +221,49 @@ except ValueError as e:
 
 ---
 
+## Bug F：frp 管理页报「缺少 toml 模块」（配置读写全部失效）
+
+**文件**：`app/frp.py` · `load_config()` / `save_config()`；`frpwaf_main.py` · `frp_save_raw()`
+
+### 现象
+
+打开插件端「frp 管理」页时弹出「缺少 toml 模块」，且：
+
+- 配置文件（结构化）读取失败 → 表单为空、原文区为空；
+- 「保存配置」「保存原文」「预创建配置文件」全部不可用；
+- 版本管理、一键放行端口（依赖 `load_config` 读端口）等连带失效。
+
+### 根因
+
+`load_config()` / `save_config()` / `frp_save_raw()` 直接 `import toml`（第三方包）。
+该包**并非 Python 标准库**，原实现依赖「宝塔 pyenv 恰好自带 0.10.2」——
+运行环境未安装该包时即报错。这违反项目红线「纯标准库、无 requirements.txt」，
+属于「环境恰好可用」掩盖的依赖缺陷（同类问题：宝塔面板版本 / 系统 Python 差异都会触发）。
+
+### 修复
+
+新增 `app/toml_lite.py`：**纯标准库** TOML 子集解析 / 生成器，
+解析语义与标准库 `tomllib` 对齐（同样的 `EXPLICIT_NEST` / `FROZEN` 命名空间状态机，
+同样拒绝重复表声明、内联表冻结后再展开、点分键与表头冲突等非法文档），
+生成格式与 `tomllib` 标准写法一致（先标量后子表、`[[name]]` 一行）。
+
+- `app/frp.py`：`load_config` / `save_config` 改用 `toml_lite`；
+  新增 `check_toml(text)` 供插件端复用。
+- `frpwaf_main.py`：`frp_save_raw` 改调 `frp.check_toml()`，不再 `import toml`。
+- 全仓 `grep "import toml"` 清零（生产代码），Python 3.6+ 兼容。
+
+### 验证
+
+- 与官方 `tomllib` 交叉比对：生成侧（我方 `dumps` → 官方解析）与解析侧
+  （同一文本两边结果一致），含 frps/frpc 模板 + `[[httpPlugins]]` 注入块。
+- 表命名空间边界差异测试 52 项（重复表、点分键/表头冲突、内联表冻结、数组表等）全一致。
+- 随机差异测试：3000 份随机文档（接受/拒绝 + 值比对）零差异；
+  2000 份随机 dict 生成往返零差异。
+- 链路验证：模拟「无 `toml` 包」环境 + `frpwaf_app` 私有包加载机制，
+  `load_config` / `save_config`（含 `maxPoolCount` 归位、备份、回滚）/ `check_toml` 全通过。
+
+---
+
 ## 附：历史遗留的其它修复（早期版本，非本轮）
 
 这些在更早的提交中已修复，一并记录：
@@ -241,3 +285,4 @@ except ValueError as e:
 | C | `firewall.py` | 白名单差集错误 | 高（误封白名单） |
 | D | `ai.py` | 安全边界缺失 | 高（可被封任意 IP） |
 | E | `daemon.py` | 未捕获异常 | 低（体验） |
+| F | `frp.py` | 第三方依赖（环境缺失即崩） | 高（frp 配置管理整体不可用） |
