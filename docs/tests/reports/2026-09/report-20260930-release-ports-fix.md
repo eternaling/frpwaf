@@ -45,8 +45,11 @@
 | 20 | 解包后 `bash -n` 三个脚本 + `py_compile` 12 个 Python 文件 | 通过 | ✅ |
 | 21 | Release 附件替换后鉴权下载校验（字节数与 SHA-256 一致） | 一致 | ✅ |
 
-- 成品包：`frpwaf-1.3.10.zip`（重建后字节数与 SHA-256 见下）
+- 成品包：`frpwaf-1.3.10.zip`（重建后），**91,282 字节**，
+  SHA-256 `d25bedcde34f81f696189b7554b0df19c42aa77f8875c93df359d42a13a01c7a`
+  （重建前 90,115 字节 / `7364773d…68281c`）
 - Release：`https://gitea.nightsoil.cn/night/frpwaf/releases/tag/v1.3.10`
+  （附件已替换为新包，正文已补充 Bug H 说明）
 
 ## 回归范围
 
