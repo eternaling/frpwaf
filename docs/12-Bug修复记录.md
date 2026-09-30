@@ -1,7 +1,7 @@
 # 12 · Bug 修复记录
 
 本文记录本项目**历次发现并修复的全部功能 Bug**，含现象、根因、修复与验证。
-共 7 个（Bug A–G），均在隔离环境复现、修复、验证后应用到生产。
+共 8 个（Bug A–H），均在隔离环境复现、修复、验证后应用到生产。
 
 > 编号顺序为**发现顺序**，与修复提交顺序略有交叉（Bug B 与 A 同批提交）。
 
@@ -15,7 +15,8 @@
 | D | `ai.py` | `v1.3.8` | v1.3.8 | 已提交发布 |
 | E | `daemon.py` | `v1.3.8` | v1.3.8 | 已提交发布 |
 | F | `frp.py` / `toml_lite.py` | `v1.3.9` | v1.3.9 | 已提交发布 |
-| G | `ai.py` | 本次提交 / `v1.3.10` | v1.3.10 | 待提交 |
+| G | `ai.py` | `a2bab91` / `v1.3.10` | v1.3.10 | 已提交发布 |
+| H | `frpwaf_main.py` | 本次提交 / `v1.3.10`（tag 重指） | v1.3.10 | 待提交 |
 
 > A、B 随 `cedf595` 一起提交并打 Tag `v1.3.7`；C、D、E 随后修复，随 Tag
 > `v1.3.8` 一起提交（见 [13-变更历史与版本.md](13-变更历史与版本.md) §2/§4）。
@@ -311,6 +312,52 @@ AI 判定为确凿攻击/扫描/爆破（`malicious`）的 IP，此前一律按 
 
 ---
 
+## Bug H：一键放行端口永远显示「无」（调用不存在的面板 API）
+
+**文件**：`frpwaf_main.py` · `frp_release_ports()`
+
+### 现象
+
+frp 管理页点击「一键放行端口」，无论 frps 配置里有多少端口，弹窗**恒为**
+「已放行端口：无」；防火墙里实际**没有添加任何规则**，也没有任何报错。
+
+### 根因
+
+实现调用了 `public.add_firewall_rule(p, "tcp", "accept", "0.0.0.0/0", "frp管理器")`
+——该函数**在宝塔面板 `class/public.py` 公共库中并不存在**（宝塔从未提供此 API）。
+每次调用抛 `AttributeError`，但被内层 `except Exception: pass` **静默吞掉**，
+`done` 列表恒为空 → 恒显示「无」。属「API 想当然 + 异常静默」双重缺陷。
+
+### 修复
+
+不再依赖任何面板私有 API，直接调用系统防火墙命令（与宝塔面板自身放行逻辑一致），
+按 frp 语义区分协议：
+
+| 端口配置项 | 协议 | 说明 |
+|---|---|---|
+| `bindPort` / `vhostHTTPPort` / `vhostHTTPSPort` / `tcpmuxHTTPConnectPort` / `webServer.port` | TCP | 原实现按 TCP 放行，本轮保持不变 |
+| `kcpBindPort` / `quicBindPort` | **UDP** | 原实现把 kcp 当 TCP，且完全遗漏 quic |
+
+- **后端探测**（`_firewall_backend`）：`firewall-cmd --state` 为 running → firewalld
+  （CentOS 7+）；否则 `ufw status` 为 active → ufw（Debian/Ubuntu）；
+  两者皆无 → 明确提示「未检测到运行中的系统防火墙」，而非假装成功。
+- **firewalld**：`firewall-cmd --zone=public --add-port=P/协议 --permanent`，
+  全部成功后统一 `firewall-cmd --reload`（reload 失败会附带提示）。
+- **ufw**：`ufw allow P/协议`（无需 reload）。
+- **结果如实回报**：已放行（firewalld `ALREADY_ENABLED`、ufw `Skipping`）视为成功；
+  成功/失败**分端口列出**；部分失败返回失败状态并列出原因（不再静默）。
+- **frpc**：明确提示「客户端无需放行入站端口」（原实现静默返回「无」）。
+- **参数校验**：端口须为 1–65535 的整数，非法值忽略；`webServer.port` 兼容字符串数字。
+- 去重键改为 `(端口, 协议)`——同一端口可同时需要 TCP 与 UDP 放行（如 `bindPort` = `kcpBindPort`）。
+
+### 验证
+
+桩测试（`scratchpad/release_ports_test.py`，不入库）以假 `public` 模块 + 假 frp 配置
+覆盖 12 组场景、**22 项断言全部通过**：firewalld 正常/已放行/reload 失败、ufw
+正常/已存在、无防火墙、frpc、端口收集（UDP 归类/去重/非法值/布尔值）、部分失败、空配置。
+
+---
+
 ## 附：历史遗留的其它修复（早期版本，非本轮）
 
 这些在更早的提交中已修复，一并记录：
@@ -334,3 +381,4 @@ AI 判定为确凿攻击/扫描/爆破（`malicious`）的 IP，此前一律按 
 | E | `daemon.py` | 未捕获异常 | 低（体验） |
 | F | `frp.py` | 第三方依赖（环境缺失即崩） | 高（frp 配置管理整体不可用） |
 | G | `ai.py` | 处置分级缺失（确凿未永久） | 中（持续攻击到期即恢复） |
+| H | `frpwaf_main.py` | 调用不存在的面板 API + 异常静默 | 中（功能恒失败且无提示） |

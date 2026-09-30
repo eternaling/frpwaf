@@ -154,7 +154,8 @@ frp 的 `httpPlugins` 是**应用层**准入：被拒绝的连接，其 **TCP �
   保存后自动 `verify` 校验。
 - **配置文件（原文）**：直接编辑 `frps.toml` / `frpc.toml`，保存前 TOML 语法校验。
 - **运行日志**：读取并展示 `frps` / `frpc` 日志。
-- **一键放行端口**：调用宝塔防火墙放行 frps 关键端口。
+- **一键放行端口**：探测系统防火墙（firewalld / ufw）自动放行 frps 关键端口
+  （KCP/QUIC 按 UDP 放行，支持 quicBindPort）。
 - **卸载**：停止服务并删除程序目录。
 
 **相对官方插件修复的问题**

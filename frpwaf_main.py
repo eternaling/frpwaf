@@ -710,31 +710,124 @@ class frpwaf_main:
         except Exception:
             return {"status": True, "log": ""}
 
+    # ---------------- 系统防火墙放行 ----------------
+    @staticmethod
+    def _port_num(v):
+        """配置值规范为合法端口号（1–65535）；非法值（含布尔）返回 0。"""
+        if isinstance(v, bool):
+            return 0
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return 0
+        return n if 0 < n < 65536 else 0
+
+    def _firewall_backend(self):
+        """探测系统防火墙后端：firewalld / ufw / 未检测到。
+
+        宝塔面板自身按系统选择防火墙：CentOS 7+ 为 firewalld（面板可读到
+        命令行添加的规则），Debian/Ubuntu 为 ufw（规则同步至系统）。
+        返回 (后端名, 未检测到时的原因)。
+        """
+        out, _ = public.ExecShell("command -v firewall-cmd 2>/dev/null")
+        if (out or "").strip():
+            st, _ = public.ExecShell("firewall-cmd --state 2>&1")
+            if (st or "").strip().lower() == "running":
+                return "firewalld", ""
+        out, _ = public.ExecShell("command -v ufw 2>/dev/null")
+        if (out or "").strip():
+            st, _ = public.ExecShell("ufw status 2>&1")
+            first = ((st or "").strip().splitlines() or [""])[0].strip().lower()
+            if first.startswith("status: active"):
+                return "ufw", ""
+        return "", ("未检测到运行中的系统防火墙（firewalld/ufw）。"
+                    "若防火墙本就未启用则无需放行；启用后请重试。")
+
+    def _fw_add_port(self, backend, port, proto):
+        """放行单个端口（backend 为 firewalld / ufw），已放行视为成功。
+
+        返回 (是否成功, 失败说明)；成功后说明为空字符串。
+        """
+        spec = "%d/%s" % (port, proto)
+        if backend == "firewalld":
+            out, err = public.ExecShell(
+                "firewall-cmd --zone=public --add-port=%s --permanent" % spec)
+            msg = ((out or "") + " " + (err or "")).strip()
+            low = msg.lower()
+            if "success" in low or "already_enabled" in low:
+                return True, ""
+            return False, msg[-160:] or "未知错误"
+        out, err = public.ExecShell("ufw allow %s" % spec)
+        msg = ((out or "") + " " + (err or "")).strip()
+        low = msg.lower()
+        if "rule added" in low or "skipping" in low or "rules updated" in low:
+            return True, ""
+        return False, msg[-160:] or "未知错误"
+
     def frp_release_ports(self, get=None):
-        """一键放行 frps 关键端口（调用宝塔防火墙）。"""
+        """一键放行 frps 关键端口（firewalld / ufw）。
+
+        端口协议按 frp 语义区分：kcp/quic 为 UDP，其余为 TCP。
+        """
         try:
             frp = _app("frp")
             kind = self._kind(get)
+            if kind != "frps":
+                return public.returnMsg(
+                    True, "frpc 为客户端，无需放行入站端口；"
+                          "请在 frps 服务器放行对应 remotePort。")
             ok, cfg = frp.load_config(kind)
             if not ok:
                 return public.returnMsg(False, cfg)
-            ports = []
-            if kind == "frps":
-                for key in ("bindPort", "vhostHTTPPort", "vhostHTTPSPort",
-                            "kcpBindPort", "tcpmuxHTTPConnectPort"):
-                    if isinstance(cfg.get(key), int):
-                        ports.append(cfg[key])
-                ws = cfg.get("webServer") or {}
-                if isinstance(ws, dict) and ws.get("port"):
-                    ports.append(int(ws["port"]))
-            done = []
-            for p in sorted(set(ports)):
-                try:
-                    public.add_firewall_rule(p, "tcp", "accept", "0.0.0.0/0", "frp管理器")
-                    done.append(str(p))
-                except Exception:
-                    pass
-            return public.returnMsg(True, "已放行端口：%s" % (", ".join(done) or "无"))
+
+            # 汇总待放行端口（按 端口/协议 去重；kcp/quic 走 UDP）
+            wanted = set()
+            for key in ("bindPort", "vhostHTTPPort", "vhostHTTPSPort",
+                        "tcpmuxHTTPConnectPort"):
+                p = self._port_num(cfg.get(key))
+                if p:
+                    wanted.add((p, "tcp"))
+            for key in ("kcpBindPort", "quicBindPort"):
+                p = self._port_num(cfg.get(key))
+                if p:
+                    wanted.add((p, "udp"))
+            ws = cfg.get("webServer") or {}
+            if isinstance(ws, dict):
+                p = self._port_num(ws.get("port"))
+                if p:
+                    wanted.add((p, "tcp"))
+            if not wanted:
+                return public.returnMsg(False, "未从配置中读到可放行的端口，请先保存 frps 配置。")
+
+            backend, why = self._firewall_backend()
+            if not backend:
+                return public.returnMsg(False, why)
+
+            done, failed = [], []
+            for port, proto in sorted(wanted):
+                good, detail = self._fw_add_port(backend, port, proto)
+                if good:
+                    done.append("%d/%s" % (port, proto))
+                else:
+                    failed.append("%d/%s（%s）" % (port, proto, detail))
+
+            warn = ""
+            if backend == "firewalld" and done:
+                out, err = public.ExecShell("firewall-cmd --reload 2>&1")
+                rmsg = ((out or "") + " " + (err or "")).strip()
+                if rmsg and "success" not in rmsg.lower():
+                    warn = ("；注意：reload 失败，请手动执行 firewall-cmd --reload"
+                            "（%s）" % rmsg[-120:])
+
+            if not failed:
+                return public.returnMsg(
+                    True, "已放行端口（%s）：%s%s" % (backend, ", ".join(done), warn))
+            if done:
+                return public.returnMsg(
+                    False, "部分放行（%s）：成功 %s；失败 %s%s"
+                    % (backend, ", ".join(done), "，".join(failed), warn))
+            return public.returnMsg(
+                False, "放行失败（%s）：%s%s" % (backend, "，".join(failed), warn))
         except Exception:
             return public.returnMsg(False, "放行失败：" + traceback.format_exc()[-200:])
 

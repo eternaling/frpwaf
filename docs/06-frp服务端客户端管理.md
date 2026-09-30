@@ -174,9 +174,15 @@ GitHub 直连在国内多数服务器极慢或不可达，故优先用加速镜�
 | `frp_release_ports` | 一键放行 frps 关键端口（调宝塔防火墙） |
 
 > `kind` 参数默认 `frps`，可传 `frpc`。`frp_release_ports` **仅对 frps 生效**
-> （内部 `if kind == "frps"`），会把 `bindPort`、`vhostHTTPPort`、`vhostHTTPSPort`、
-> `kcpBindPort`、`tcpmuxHTTPConnectPort`、`webServer.port` 经
-> `public.add_firewall_rule` 放行。`frp_save_raw` 仅做 **TOML 语法校验**，`verify`
+> （`frpc` 会提示无需放行——客户端没有入站端口）。实现方式：探测系统防火墙后端
+> （CentOS 7+ 的 `firewalld`、Debian/Ubuntu 的 `ufw`，与宝塔面板自身一致），
+> 按 frp 语义区分协议后逐个放行：
+> **TCP**：`bindPort`、`vhostHTTPPort`、`vhostHTTPSPort`、`tcpmuxHTTPConnectPort`、`webServer.port`；
+> **UDP**：`kcpBindPort`、`quicBindPort`（KCP/QUIC 为 UDP 传输）。
+> `firewalld` 用 `firewall-cmd --zone=public --add-port=P/协议 --permanent` 并统一 `--reload`；
+> `ufw` 用 `ufw allow P/协议`。已放行（`ALREADY_ENABLED` / `Skipping`）视为成功，
+> 结果按「成功/失败」分端口回报；未检测到运行中的防火墙时给出明确提示。
+> `frp_save_raw` 仅做 **TOML 语法校验**，`verify`
 > 失败时返回提示但**内容已写入**（结构化保存 `frp_save_config` 才是失败即回滚）。
 
 ## 11. 约束提醒
