@@ -26,3 +26,19 @@ __pycache__/
 *.premigrate.*
 *.migrate
 *.new.*
+
+# ---- Shell 卫生兜底 ----
+# Windows bash 不识别 nul 设备，`> nul` 会创建实体文件（pre-tool-use hook 已拦截，此处兜底）
+nul
+# Claude Code 临时 cwd 标记文件
+tmpclaude-*-cwd
+
+# ---- 智能体会话产物 ----
+# 技能执行中落盘的临时排查脚本/探针（.claude/skills 等仍正常跟踪）
+**/scratchpad/
+# Claude Code 本机级设置（权限允许清单/本机路径），属个人环境配置，不入库；
+# 团队共享规则请写 .claude/settings.json
+.claude/settings.local.json
+# Codex 本机级配置与运行时数据
+.codex/*.local.toml
+.codex/log/

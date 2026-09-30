@@ -1,0 +1,43 @@
+# 统一行尾为 LF：覆盖 Windows 系统默认 core.autocrlf=true。
+# 背景：本仓库有大量 Shell 脚本（install.sh / build.sh / frpwaf.init 等）面向
+# 宝塔面板 Linux 运行；CRLF 化会导致 bash 报 `$'\r': command not found`。
+# 同时双端同步脚本按 LF 归一化比对，行尾漂移会造成无意义的镜像差异。
+
+*               text=auto
+.gitattributes  text eol=lf
+.gitignore      text eol=lf
+
+# 文档与配置
+*.md            text eol=lf
+*.txt           text eol=lf
+*.json          text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.toml          text eol=lf
+
+# 代码与脚本（Shell 面向 Linux，必须 LF）
+*.py            text eol=lf
+*.sh            text eol=lf
+*.init          text eol=lf
+*.cjs           text eol=lf
+*.js            text eol=lf
+*.css           text eol=lf
+*.html          text eol=lf
+
+# Windows 批处理必须 CRLF
+*.bat           text eol=crlf
+
+# 二进制（显式声明，避免 autocrlf 尝试转换）
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.webp          binary
+*.ico           binary
+*.pdf           binary
+*.woff          binary
+*.woff2         binary
+*.ttf           binary
+*.otf           binary
+*.mmdb          binary
+*.db            binary

@@ -26,6 +26,9 @@
 | [12-Bug修复记录.md](12-Bug修复记录.md) | **历次发现并修复的全部功能 Bug**（含现象、根因、修复、验证） |
 | [13-变更历史与版本.md](13-变更历史与版本.md) | Git 提交、Tag、Release、版本演进 |
 | [14-运维注意事项与约束.md](14-运维注意事项与约束.md) | 不可触碰的约束、危险操作清单、fail-closed 处置 |
+| [agent-migration.md](agent-migration.md) | **Claude/Codex 智能体体系迁移与适配报告**（技能/命令/代理/hooks/任务跟踪/同步机制、历批记录与验证结果） |
+| [tasks/README.md](tasks/README.md) | 任务跟踪规范（活跃任务卡与归档目录说明） |
+| [tests/README.md](tests/README.md) | 验证计划与报告规范（`plans/` 与 `reports/YYYY-MM/`） |
 
 ---
 
@@ -97,3 +100,4 @@ FRP WAF 通过 frp 的 `httpPlugins` 钩子（`NewUserConn`）对**访问 frps �
 | 2026-09-29 | 二次复核：02 补 `dist/`、`frp_job.*`、归属地库与 `frpwaf_main.WAF_HOME` 写死项；04 补 `settings` 预留表说明、约束改为「保存+运行时」双段；06 补迁移 `changed` 语义；07/10 补「后端存在但 Web 无 UI」的接口清单；11 补 GeoLite2 三处候选路径；01 修正「注入/移除回调」表述 |
 | 2026-09-29 | 三次复核：02 修正 `install.sh` 默认动作为**卸载**、补 `.gitignore`；04 修正 `cookie_secure`（不在 DEFAULTS）；05/11/14 统一「内核封禁」为插件端「IP 名单/封禁」页内**卡片**而非独立页；06 补 `frp_release_ports` 仅 frps、`frp_save_raw` 校验失败不回滚；07 补插件端菜单各页明细；09 补 `get_waf_info` 回显密码；01 补依赖与无 `requirements.txt` |
 | 2026-09-29 | **发布 v1.3.8**：随 Bug C/D/E 修复与 `docs/` 文档一起提交并打 Tag `v1.3.8` |
+| 2026-09-30 | 索引补全：收录 `agent-migration.md`（智能体体系迁移报告）与 `tasks/`、`tests/` 规范入口 |

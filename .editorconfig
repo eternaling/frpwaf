@@ -1,0 +1,26 @@
+# http://editorconfig.org
+root = true
+
+# frpwaf 统一编辑器规范：空格缩进、UTF-8、LF 行尾
+[*]
+indent_style = space
+indent_size = 4
+charset = utf-8
+end_of_line = lf
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+# JSON / YAML / TOML 用 2 空格（与 .claude、.codex 配置文件一致）
+[*.{json,yml,yaml,toml}]
+indent_size = 2
+
+# 前端单文件 SPA 与文档保持 2 空格
+[*.{html,css,md}]
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false
+
+# Windows 批处理必须 CRLF
+[*.bat]
+end_of_line = crlf
