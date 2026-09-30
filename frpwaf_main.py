@@ -812,7 +812,8 @@ class frpwaf_main:
     # ---------------- AI 自动审查 ----------------
     AI_KEYS = ["ai_enabled", "ai_protocol", "ai_base_url", "ai_api_key", "ai_model",
                "ai_interval", "ai_window", "ai_min_conns", "ai_max_ips",
-               "ai_auto_ban", "ai_ban_seconds", "ai_timeout"]
+               "ai_auto_ban", "ai_ban_seconds", "ai_suspicious_ban",
+               "ai_ssh_strict", "ai_ssh_permanent_suspicious", "ai_timeout"]
 
     def ai_get_config(self, get=None):
         cfg = self._cfg()
@@ -833,7 +834,8 @@ class frpwaf_main:
                 if not hasattr(get, k):
                     continue
                 v = getattr(get, k)
-                if k in ("ai_enabled", "ai_auto_ban"):
+                if k in ("ai_enabled", "ai_auto_ban", "ai_suspicious_ban",
+                         "ai_ssh_strict", "ai_ssh_permanent_suspicious"):
                     patch[k] = str(v).lower() in ("1", "true", "on", "yes")
                 elif k in ("ai_interval", "ai_window", "ai_min_conns", "ai_max_ips",
                            "ai_ban_seconds", "ai_timeout"):

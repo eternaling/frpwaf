@@ -34,7 +34,8 @@ POST 允许的键（类型校验）：
 auto_ban_threshold, auto_ban_seconds, rate_limit_enabled, rate_limit_per_sec,
 log_max_rows, fw_sync_enabled, ai_enabled, ai_protocol, ai_base_url, ai_api_key,
 ai_model, ai_interval, ai_window, ai_min_conns, ai_max_ips, ai_auto_ban,
-ai_ban_seconds, ai_timeout`。
+ai_ban_seconds, ai_suspicious_ban, ai_ssh_strict, ai_ssh_permanent_suspicious,
+ai_timeout`。
 
 > 注意：`http_addr`/`http_port`/`web_enabled`/`admin_*` **不**经此接口改（用宝塔插件端）。
 
@@ -93,8 +94,8 @@ ai_ban_seconds, ai_timeout`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/ai/review` | 最近 200 条审查记录 |
-| POST | `/api/ai/review` | 立即审查（force） |
+| GET | `/api/ai/review` | 最近 200 条审查记录（含 `verdict` / `action` / `reason`） |
+| POST | `/api/ai/review` | 立即审查（force）；返回 `{ok,msg,results,checked,banned,temp_banned}` |
 | GET | `/api/ai/results` | 同 `/api/ai/review` GET |
 | POST | `/api/ai/test` | 测试连接（可用表单覆盖 base/key/model/protocol） |
 
@@ -187,7 +188,9 @@ ai_ban_seconds, ai_timeout`。
   "auto_ban_enabled":false,"auto_ban_window":60,"auto_ban_threshold":200,
   "auto_ban_seconds":600,"rate_limit_enabled":false,"rate_limit_per_sec":0,
   "log_max_rows":50000,"ai_enabled":false,"ai_protocol":"openai",
-  "ai_base_url":"","ai_api_key":"","ai_model":"claude-haiku-4.5", /* … */}}
+  "ai_base_url":"","ai_api_key":"","ai_model":"claude-haiku-4.5",
+  "ai_auto_ban":true,"ai_ban_seconds":1800,"ai_suspicious_ban":true,
+  "ai_ssh_strict":true,"ai_ssh_permanent_suspicious":true,"ai_timeout":120, /* … */}}
 
 // POST /api/login 成功
 {"code":0,"msg":"登录成功","user":"admin"}   // 同时 Set-Cookie: frpwaf_sid=…

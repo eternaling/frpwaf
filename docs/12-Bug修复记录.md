@@ -1,7 +1,7 @@
 # 12 · Bug 修复记录
 
 本文记录本项目**历次发现并修复的全部功能 Bug**，含现象、根因、修复与验证。
-共 6 个（Bug A–F），均在隔离环境复现、修复、验证后应用到生产。
+共 7 个（Bug A–G），均在隔离环境复现、修复、验证后应用到生产。
 
 > 编号顺序为**发现顺序**，与修复提交顺序略有交叉（Bug B 与 A 同批提交）。
 
@@ -15,6 +15,7 @@
 | D | `ai.py` | `v1.3.8` | v1.3.8 | 已提交发布 |
 | E | `daemon.py` | `v1.3.8` | v1.3.8 | 已提交发布 |
 | F | `frp.py` / `toml_lite.py` | `v1.3.9` | v1.3.9 | 已提交发布 |
+| G | `ai.py` | 本次提交 / `v1.3.10` | v1.3.10 | 待提交 |
 
 > A、B 随 `cedf595` 一起提交并打 Tag `v1.3.7`；C、D、E 随后修复，随 Tag
 > `v1.3.8` 一起提交（见 [13-变更历史与版本.md](13-变更历史与版本.md) §2/§4）。
@@ -264,6 +265,52 @@ except ValueError as e:
 
 ---
 
+## Bug G：AI 审查处置过轻（确凿攻击只临时封禁）
+
+**文件**：`app/ai.py` · `review()`（分级处置）
+
+### 现象
+
+AI 判定为确凿攻击/扫描/爆破（`malicious`）的 IP，此前一律按 `ai_ban_seconds`
+（默认 1800 秒）**临时封禁**，到期自动释放。对持续扫描、SSH 爆破类攻击，
+攻击者只需等待封禁到期即可继续，防护强度不足；`suspicious` 判定则完全不动作。
+
+### 根因
+
+处置逻辑只有一档（`verdict == "malicious"` → `store.add_ban(..., ai_ban_seconds)`），
+未区分「确凿 / 疑似」，也没有「永久封禁」落点，与用户对暴力破解、扫描行为
+「直接永久拉黑」的预期不符。
+
+### 修复
+
+`review()` 改为分级处置（`_apply_action()`）：
+
+| 判定 | 处置 | 落点 |
+|---|---|---|
+| `malicious`（确凿） | **永久黑名单** | `ip_list` black（内核 `timeout=0`） |
+| `suspicious`（疑似） | 临时封禁 | `ban_log`（`ai_ban_seconds`） |
+| `suspicious` + SSH 相关 | **永久黑名单**（`ai_ssh_strict` + `ai_ssh_permanent_suspicious`） | `ip_list` black |
+| 白名单命中 | `skipped`，不自动处置 | —— |
+
+配套：
+
+- 提示词新增 `category`（攻击类型）字段，`ssh_bruteforce` 是 SSH 从严判定依据；
+  旧格式缺 `category` 时按 `reason`/`proxies` 关键词兜底（`_is_ssh_related`）。
+- 白名单优先（`_is_whitelisted`，含 CIDR 匹配）：模型判恶意也不处置，防连坐。
+- 不重复处置：已在黑名单 → `already_banned`；已在临时封禁 → 疑似场景不再重复
+  `add_ban`（保留原「不重复封禁」语义）；确凿场景升级为永久并释放临时记录。
+- 产生永久黑名单后立即 `engine.invalidate_cache()` + 内核同步，封完即生效。
+- 新增配置 `ai_suspicious_ban` / `ai_ssh_strict` / `ai_ssh_permanent_suspicious`；
+  面板「AI 审查」页可调，结果表新增「类型」列。
+
+### 验证
+
+隔离实例 + 临时集成脚本（`scratchpad/ai_review_test.py`，不入库）覆盖
+首轮分级、二次审查不重复、三个开关、白名单跳过、CIDR 白名单、SSH 兜底等
+30+ 断言全部通过；`python -m py_compile app/*.py frpwaf_main.py` 通过。
+
+---
+
 ## 附：历史遗留的其它修复（早期版本，非本轮）
 
 这些在更早的提交中已修复，一并记录：
@@ -286,3 +333,4 @@ except ValueError as e:
 | D | `ai.py` | 安全边界缺失 | 高（可被封任意 IP） |
 | E | `daemon.py` | 未捕获异常 | 低（体验） |
 | F | `frp.py` | 第三方依赖（环境缺失即崩） | 高（frp 配置管理整体不可用） |
+| G | `ai.py` | 处置分级缺失（确凿未永久） | 中（持续攻击到期即恢复） |

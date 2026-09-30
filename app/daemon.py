@@ -366,7 +366,9 @@ class Handler(BaseHTTPRequestHandler):
                 "ai_enabled": bool, "ai_protocol": str, "ai_base_url": str,
                 "ai_api_key": str, "ai_model": str, "ai_interval": int,
                 "ai_window": int, "ai_min_conns": int, "ai_max_ips": int,
-                "ai_auto_ban": bool, "ai_ban_seconds": int, "ai_timeout": int,
+                "ai_auto_ban": bool, "ai_ban_seconds": int,
+                "ai_suspicious_ban": bool, "ai_ssh_strict": bool,
+                "ai_ssh_permanent_suspicious": bool, "ai_timeout": int,
             }
             for k, typ in allowed.items():
                 if k in body:

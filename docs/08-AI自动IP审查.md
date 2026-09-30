@@ -1,7 +1,14 @@
 # 08 · AI 自动 IP 审查
 
 `app/ai.py` 周期性把**最近一段时间的高频来源 IP**（含归属地、连接数、命中代理）
-汇总后交给大模型判断是否恶意，可选**自动封禁**。
+汇总后交给大模型判断是否恶意，并按判定**分级处置**：
+
+| 判定 | 处置 | 落点 | 时长 |
+|---|---|---|---|
+| `malicious`（确凿） | **永久黑名单** | `ip_list`（black） | 永久（内核 `timeout=0`），需人工解封 |
+| `suspicious`（疑似） | 临时封禁 | `ban_log` | `ai_ban_seconds`（默认 1800 秒，到期自动释放） |
+| `suspicious` + SSH 相关 | **永久黑名单**（从严，可关） | `ip_list`（black） | 永久 |
+| `benign` / 白名单命中 / 已处置 | 仅记录 | —— | —— |
 
 仅用标准库 `urllib`，无第三方依赖。
 
@@ -81,26 +88,57 @@ anthropic-version: 2023-06-01
 **要求输出**：
 
 ```json
-[{"ip":"1.2.3.4","verdict":"malicious|suspicious|benign","reason":"简短中文理由"}]
+[{"ip":"1.2.3.4","verdict":"malicious|suspicious|benign",
+  "category":"ssh_bruteforce|port_scan|web_scan|crawler|rate_abuse|other|none",
+  "reason":"简短中文理由"}]
 ```
 
-判定规则：确凿攻击 → `malicious`；可疑不确定 → `suspicious`；正常 → `benign`。
+- 判定规则：确凿攻击 → `malicious`；可疑不确定 → `suspicious`；正常 → `benign`。
+- `category` 为攻击类型，`ssh_bruteforce` 是 SSH 从严判定依据之一；
+  旧格式（无 `category`）不会导致误判，会退化为理由/代理名关键词兜底。
 
-## 5. 处理与自动封禁（`review`）
+## 5. 处理与分级处置（`review`）
 
 对模型返回的每个条目：
 
-1. 取 `ip` / `verdict` / `reason`；
-2. **只处理本次真正送审过的 IP**（Bug D 修复，见下）；
-3. 若 `verdict == "malicious"` 且 `ai_auto_ban` 开：
-   - 已在封禁中（`store.is_banned`）→ `action="already_banned"`，**不重复封禁**；
-   - 否则 `store.add_ban(ip, "ai: <reason>", ai_ban_seconds)` → `action="banned"`；
+1. 取 `ip` / `verdict` / `category` / `reason`；
+2. **只处理本次真正送审过的 IP**（Bug D 修复，见下）；非法 verdict 归为 `unknown`；
+3. 交给 `_apply_action()` 分级处置：
+   - `verdict == "malicious"` → **永久黑名单**：`store.add_ip(ip, "black", "ai: <reason>")`，
+     并释放该 IP 的同名临时封禁（升级语义）；
+   - `verdict == "suspicious"` 且非 SSH 相关 → **临时封禁**：
+     `store.add_ban(ip, "ai: <reason>", ai_ban_seconds)`；
+   - `verdict == "suspicious"` 且 SSH 相关（`ai_ssh_strict` 开）→ 永久黑名单
+     （`ai_ssh_permanent_suspicious` 控制，可关闭退回临时）；
+   - 白名单命中的 IP → `skipped`，**不做任何自动处置**；
+   - 已在黑名单 → `already_banned`（不重复写入）；
+   - 已在临时封禁 → 疑似场景 `already_banned`；确凿场景直接升级为永久；
 4. 写一条 `ai_review` 记录；
-5. 更新配置 `ai_last_run` / `ai_last_result`。
+5. 若本轮产生了永久黑名单：立即 `engine.invalidate_cache()` 并触发
+   `firewall.sync_from_store()`（内核同步），保证「封完即生效」；
+6. 更新配置 `ai_last_run` / `ai_last_result`
+   （摘要格式：`审查 N 个 IP，永久黑名单 X 个，临时封禁 Y 个`）。
 
-返回 `{ok, msg, results, checked, banned}`。
+返回 `{ok, msg, results, checked, banned, temp_banned}`。
 
-### 5.1 安全边界：只封「送审过的 IP」（Bug D，关键）
+### 5.1 SSH 相关判定（从严）
+
+`_is_ssh_related(category, reason, proxies)` 满足任一即视为 SSH 相关：
+
+- `category` 为 `ssh_bruteforce` / `ssh_attack` / `ssh_login` 等；
+- `category`、`reason`、`proxies` 任一文本包含 `ssh`（大小写不敏感）。
+
+> 为什么用代理名兜底：frp 回调（`NewUserConnContent`）只有
+> `remote_addr` / `proxy_name` / `proxy_type`，**没有目标端口**；
+> 代理名如 `ssh_22` 是「经 frp 暴露 SSH 隧道」的强信号。
+> 注意：AI 只能看到经过 frp 的 SSH 隧道，看不到服务器 22 端口被直连爆破。
+
+### 5.2 白名单优先（防连坐）
+
+自动处置前先 `_is_whitelisted(ip)`（名单含 CIDR 匹配）。即使模型判恶意，
+白名单命中的 IP 也不自动处置（记 `skipped`），避免「封 IP 段连坐白名单」。
+
+### 5.3 安全边界：只封「送审过的 IP」（Bug D，关键）
 
 ```python
 if ip not in stat:
@@ -112,10 +150,13 @@ if ip not in stat:
 攻击者可通过构造输入诱导模型输出某个无辜 IP，从而**借 AI 之手封禁任意地址**。
 故只对「本次实际送审集合」内的 IP 生效，集合外的直接丢弃。
 
-### 5.2 不重复封禁
+### 5.4 不重复处置
 
-已封禁的 IP 不再 `add_ban`。否则每个审查周期都会重新插入一条封禁记录，
-**不断把封禁到期时间往后顺延**（历史故障：同一 IP 被连封 19 次，等于永久封禁）。
+已处置的 IP 不重复写入：
+
+- 已在黑名单 → `already_banned`（`ip_list` 有 `UNIQUE(cidr, list_type)` 约束兜底）；
+- 已在临时封禁 → 疑似场景不再 `add_ban`。否则每个审查周期都会重新插入一条记录，
+  **不断把封禁到期时间往后顺延**（历史故障：同一 IP 被连封 19 次，等于永久封禁）。
 
 ## 6. 配置项
 
@@ -130,8 +171,11 @@ if ip not in stat:
 | `ai_window` | 300 | 分析窗口（≥30） |
 | `ai_min_conns` | 20 | 送审门槛 |
 | `ai_max_ips` | 20 | 单次上限 |
-| `ai_auto_ban` | `true` | 恶意是否自动封禁 |
-| `ai_ban_seconds` | 1800 | 封禁时长 |
+| `ai_auto_ban` | `true` | 是否自动处置（关 = 只记录不动作） |
+| `ai_ban_seconds` | 1800 | **疑似**封禁时长（秒）；确凿判定走永久黑名单 |
+| `ai_suspicious_ban` | `true` | 疑似（`suspicious`）是否自动临时封禁 |
+| `ai_ssh_strict` | `true` | SSH 相关（SSH 爆破 / 代理名含 ssh）是否从严 |
+| `ai_ssh_permanent_suspicious` | `true` | SSH 相关疑似是否也直接永久黑名单（需 `ai_ssh_strict` 开） |
 | `ai_timeout` | 120 | 调用超时（≥15） |
 
 ## 7. 密钥保护
@@ -149,9 +193,20 @@ if ip not in stat:
 
 ## 9. 审查记录（`ai_review` 表）
 
-`action` 取值：`banned` / `already_banned` / `ban_failed` / `none` / `skip` / `error`。
-`verdict` 取值：`malicious` / `suspicious` / `benign` / `error` / `none`。
-面板「AI 审查」页可查看最近 200 条。
+`action` 取值：
+
+| action | 含义 |
+|---|---|
+| `permanent` | 已加入永久黑名单（确凿 / SSH 从严） |
+| `banned` | 已临时封禁（疑似，`ai_ban_seconds`） |
+| `already_banned` | 已在黑名单或临时封禁中，未重复写入 |
+| `skipped` | 白名单命中，跳过自动处置 |
+| `ban_failed` | 写入失败（记录日志，由对账/下轮修复） |
+| `none` | 判定正常 / 未开启自动处置 / 已关闭开关 |
+| `skip` / `error` | 无送审对象 / 调用或解析失败 |
+
+`verdict` 取值：`malicious` / `suspicious` / `benign` / `unknown` / `error` / `none`。
+面板「AI 审查」页可查看最近 200 条（含攻击类型 `category`）。
 
 ## 10. 常见问题
 
@@ -160,5 +215,7 @@ if ip not in stat:
 | 「未配置 AI 接口地址或密钥」 | 先填 `ai_base_url` + `ai_api_key` |
 | 「模型返回无法解析为 JSON」 | 模型未按格式输出；换更强模型或调提示词 |
 | 连接失败 / 超时 | 检查网关连通性、`ai_timeout`；网络类错误会自动重试一次 |
-| 审查到 IP 但不封禁 | `ai_auto_ban` 关闭，或该 IP 已在封禁中 |
-| 同一 IP 反复出现 | 正常：每周期都会审查；已封禁的不重复封 |
+| 审查到 IP 但不封禁 | `ai_auto_ban` 关闭，或该 IP 已在黑名单/临时封禁中（不重复处置） |
+| 疑似被永久封禁 | SSH 相关从严（`ai_ssh_strict` + `ai_ssh_permanent_suspicious`）命中；可在「IP 封禁」页解封 |
+| 同一 IP 反复出现 | 正常：每周期都会审查；已处置的不重复封 |
+| 误封了正常 IP | 到「IP 封禁」页删除对应黑名单条目（永久）或解禁（临时）；必要时调整提示词/阈值 |

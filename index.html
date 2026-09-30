@@ -250,13 +250,20 @@
               <div><input id="ai_min_conns" class="bt-input-text" type="number" style="width:130px" value="20"></div>
               <div class="k">每次最多审查 IP 数</div>
               <div><input id="ai_max_ips" class="bt-input-text" type="number" style="width:130px" value="20"></div>
-              <div class="k">自动封禁恶意 IP</div>
-              <div><input type="checkbox" id="ai_auto_ban" checked></div>
-              <div class="k">AI 封禁时长（秒）</div>
+              <div class="k">自动处置</div>
+              <div><input type="checkbox" id="ai_auto_ban" checked> 开启后按判定分级封禁</div>
+              <div class="k">疑似临时封禁</div>
+              <div><input type="checkbox" id="ai_suspicious_ban" checked> 疑似（suspicious）临时封禁</div>
+              <div class="k">SSH 相关从严</div>
+              <div><input type="checkbox" id="ai_ssh_strict" checked> SSH 爆破 / ssh 代理命中时从严</div>
+              <div class="k">SSH 疑似也永久</div>
+              <div><input type="checkbox" id="ai_ssh_permanent_suspicious" checked> SSH 相关疑似直接永久黑名单</div>
+              <div class="k">疑似封禁时长（秒）</div>
               <div><input id="ai_ban_seconds" class="bt-input-text" type="number" style="width:130px" value="1800"></div>
               <div class="k">接口超时（秒）</div>
               <div><input id="ai_timeout" class="bt-input-text" type="number" style="width:130px" value="120"></div>
             </div>
+            <div class="fw-tip">分级处置：确凿（malicious）→ <b>永久黑名单</b>；疑似（suspicious）→ 临时封禁（时长如上）；SSH 相关疑似按从严设置直接永久；白名单命中的 IP 不自动处置。</div>
             <div class="fw-row" style="margin-top:12px">
               <button class="btn btn-danger btn-sm" onclick="fwAiRun()">立即审查一次</button>
               <button class="btn btn-default btn-sm" onclick="fwAiLoadResults()">刷新结果</button>
@@ -267,8 +274,8 @@
           <div class="fw-card fw-span-2">
             <h3>审查结果 <span style="color:#999;font-size:12px;font-weight:400">最近 100 条</span></h3>
             <div class="fw-table-wrap" style="max-height:340px">
-              <table class="fw-table"><thead><tr><th>时间</th><th>IP</th><th>判定</th><th>理由</th><th>动作</th></tr></thead>
-              <tbody id="fwAiResults"><tr><td colspan="5" style="color:#bbb;text-align:center">暂无</td></tr></tbody></table>
+              <table class="fw-table"><thead><tr><th>时间</th><th>IP</th><th>判定</th><th>类型</th><th>理由</th><th>动作</th></tr></thead>
+              <tbody id="fwAiResults"><tr><td colspan="6" style="color:#bbb;text-align:center">暂无</td></tr></tbody></table>
             </div>
           </div>
         </div>
@@ -1008,6 +1015,9 @@ function fwAiLoad(){
     document.getElementById('ai_min_conns').value = d.ai_min_conns||20;
     document.getElementById('ai_max_ips').value = d.ai_max_ips||20;
     document.getElementById('ai_auto_ban').checked = !!d.ai_auto_ban;
+    document.getElementById('ai_suspicious_ban').checked = (d.ai_suspicious_ban===undefined?true:!!d.ai_suspicious_ban);
+    document.getElementById('ai_ssh_strict').checked = (d.ai_ssh_strict===undefined?true:!!d.ai_ssh_strict);
+    document.getElementById('ai_ssh_permanent_suspicious').checked = (d.ai_ssh_permanent_suspicious===undefined?true:!!d.ai_ssh_permanent_suspicious);
     document.getElementById('ai_ban_seconds').value = d.ai_ban_seconds||1800;
     document.getElementById('ai_timeout').value = d.ai_timeout||120;
     var st=document.getElementById('fwAiState');
@@ -1029,6 +1039,9 @@ function fwAiForm(){
     ai_min_conns: document.getElementById('ai_min_conns').value,
     ai_max_ips: document.getElementById('ai_max_ips').value,
     ai_auto_ban: document.getElementById('ai_auto_ban').checked,
+    ai_suspicious_ban: document.getElementById('ai_suspicious_ban').checked,
+    ai_ssh_strict: document.getElementById('ai_ssh_strict').checked,
+    ai_ssh_permanent_suspicious: document.getElementById('ai_ssh_permanent_suspicious').checked,
     ai_ban_seconds: document.getElementById('ai_ban_seconds').value,
     ai_timeout: document.getElementById('ai_timeout').value
   };
@@ -1059,13 +1072,20 @@ function fwAiLoadResults(){
           var v=x.verdict||'';
           var cls = v==='malicious'?'style="color:#d33;font-weight:600"'
                   : (v==='suspicious'?'style="color:#e6a23c"':'style="color:#1a9c48"');
-          var act = x.action==='banned'?'<span class="fw-badge off">已封禁</span>'
-                  : (x.action==='already_banned'?'<span class="fw-badge off">已在封禁中</span>'
-                  : (x.action==='error'?'<span style="color:#d33">错误</span>':'<span style="color:#999">-</span>'));
+          var catMap={ssh_bruteforce:'SSH 爆破',ssh_brute_force:'SSH 爆破',
+                      port_scan:'端口扫描',web_scan:'Web 扫描',crawler:'爬虫',
+                      rate_abuse:'高频滥用',other:'其他',none:'-'};
+          var cat=catMap[x.category]||x.category||'-';
+          var act = x.action==='permanent'?'<span class="fw-badge off">永久黑名单</span>'
+                  : (x.action==='banned'?'<span class="fw-badge off">临时封禁</span>'
+                  : (x.action==='already_banned'?'<span class="fw-badge off">已处置</span>'
+                  : (x.action==='skipped'?'<span style="color:#e6a23c">白名单跳过</span>'
+                  : (x.action==='error'?'<span style="color:#d33">错误</span>':'<span style="color:#999">-</span>'))));
           return '<tr><td>'+fwFmtTime(x.ts)+'</td><td>'+fwEsc(x.ip)+'</td>'
-            +'<td '+cls+'>'+fwEsc(v)+'</td><td>'+fwEsc(x.reason||'')+'</td><td>'+act+'</td></tr>';
+            +'<td '+cls+'>'+fwEsc(v)+'</td><td>'+fwEsc(cat)+'</td>'
+            +'<td>'+fwEsc(x.reason||'')+'</td><td>'+act+'</td></tr>';
         }).join('')
-      : '<tr><td colspan="5" style="color:#bbb;text-align:center">暂无</td></tr>';
+      : '<tr><td colspan="6" style="color:#bbb;text-align:center">暂无</td></tr>';
   });
 }
 

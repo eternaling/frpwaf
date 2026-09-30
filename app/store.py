@@ -235,6 +235,21 @@ def del_ip(entry_id):
     return True
 
 
+def remove_ip(cidr, list_type="black"):
+    """按 CIDR + 名单类型删除名单条目（返回删除条数）。
+
+    用于测试清理与「AI 升级永久时移除重复条目」等场景；
+    管理端按 id 删除仍走 del_ip()。
+    """
+    with _lock:
+        c = _connect()
+        cur = c.execute("DELETE FROM ip_list WHERE cidr=? AND list_type=?",
+                        ((cidr or "").strip(), list_type))
+        n = cur.rowcount
+        c.commit()
+    return n
+
+
 def load_rules():
     """加载为 (black_networks, white_networks) 两个列表。"""
     blacks, whites = [], []
