@@ -146,7 +146,10 @@
         </details>
       </div>
       <div class="box">
-        <h2>名单列表 <span class="stat-badge" id="listCount"></span></h2>
+        <h2>名单列表 <span class="stat-badge" id="listCount"></span>
+          <span class="grow"></span>
+          <button class="danger sm" onclick="clearBlack()">解封全部黑名单</button>
+        </h2>
         <div class="row">
           <button class="ghost sm" onclick="loadList('black')" id="btnBlack">黑名单</button>
           <button class="ghost sm" onclick="loadList('white')" id="btnWhite">白名单</button>
@@ -223,7 +226,10 @@
         </div>
       </div>
       <div class="box">
-        <h2>当前生效封禁</h2>
+        <h2>当前生效封禁
+          <span class="grow"></span>
+          <button class="danger sm" onclick="unbanAll()">解封全部临时封禁</button>
+        </h2>
         <div class="scroll"><table id="banTable">
           <thead><tr><th>IP</th><th>原因</th><th>封禁时间</th><th>到期时间</th><th>操作</th></tr></thead>
           <tbody></tbody></table></div>
@@ -457,6 +463,11 @@ async function delIp(id){
   try{ const r=await api('/api/iplist','POST',{action:'del',id});
     toast(r.msg,'ok'); loadList(curListType); }catch(e){ toast(e.message,'err'); }
 }
+async function clearBlack(){
+  if(!confirm('确认解封全部黑名单？将清空黑名单所有条目（含手动/AI/爆破写入），并同步内核防火墙。白名单不受影响。')) return;
+  try{ const r=await api('/api/iplist','POST',{action:'clear_black'});
+    toast(r.msg,'ok'); loadList(curListType); }catch(e){ toast(e.message,'err'); }
+}
 async function batchImport(){
   try{
     const r = await api('/api/iplist','POST',{action:'batch',text:$('#ipBatch').value,
@@ -592,6 +603,11 @@ async function loadBans(){
 }
 async function unban(ip){ try{ const r=await api('/api/bans','POST',{action:'unban',ip});
   toast(r.msg,'ok'); loadBans(); }catch(e){ toast(e.message,'err'); } }
+async function unbanAll(){
+  if(!confirm('确认解封全部临时封禁？将释放所有生效中的临时封禁（到期前提前解除），并同步内核防火墙。黑名单不受影响。')) return;
+  try{ const r=await api('/api/bans','POST',{action:'unban_all'});
+    toast(r.msg,'ok'); loadBans(); }catch(e){ toast(e.message,'err'); }
+}
 async function manualBan(){ const ip=$('#banIp').value.trim();
   if(!ip) return toast('请输入 IP','err');
   try{

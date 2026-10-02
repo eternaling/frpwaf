@@ -1,8 +1,8 @@
 # 12 · Bug 修复记录
 
 本文记录本项目**历次发现并修复的全部功能 Bug**，含现象、根因、修复与验证。
-共 12 批（Bug A–I 为历史单点修复；Bug J 为 2026-10-01 全项目审查批次；
-Bug K/L 为 2026-10-02 AI 大批量审查修复批次），
+共 13 批（Bug A–I 为历史单点修复；Bug J 为 2026-10-01 全项目审查批次；
+Bug K/L 为 2026-10-02 AI 大批量审查修复批次；Bug M 为 2026-10-02 CDN 回源误封批次），
 均在隔离环境复现、修复、验证后应用到生产。
 
 > 编号顺序为**发现顺序**，与修复提交顺序略有交叉（Bug B 与 A 同批提交）。
@@ -23,6 +23,7 @@ Bug K/L 为 2026-10-02 AI 大批量审查修复批次），
 | J | `daemon.py` / `engine.py` / `store.py` / `firewall.py` / `frp.py` / `auth.py` / `config.py` / `frpwaf_main.py` / 双端面板 / `install.sh` / `uninstall.sh` | v1.3.11 | v1.3.11 | 已提交发布 |
 | K | `ai.py` / `index.html` | v1.3.11 | v1.3.11 | 已提交发布 |
 | L | `frpwaf_main.py` / `index.html` / `ai.py` | v1.3.11 | v1.3.11 | 已提交发布 |
+| M | `ai.py` / `config.py` / `store.py` / `daemon.py` / `frpwaf_main.py` / 双端面板 | v1.3.12 | v1.3.12 | 待提交 |
 
 > A、B 随 `cedf595` 一起提交并打 Tag `v1.3.7`；C、D、E 随后修复，随 Tag
 > `v1.3.8` 一起提交（见 [13-变更历史与版本.md](13-变更历史与版本.md) §2/§4）。
@@ -570,6 +571,61 @@ ConnectionResetError: [Errno 104] Connection reset by peer
 
 ---
 
+## Bug M：AI 审查误封 CDN 回源边缘 IP，整站 522（2026-10-02）
+
+**文件**：`app/ai.py`（提示词 / `_is_cdn_origin` / `_apply_action` / `_collect`）·
+`app/config.py`（`ai_cdn_guard`）· `app/store.py`（批量解封）· `app/daemon.py` ·
+`frpwaf_main.py` · `index.html` · `web/index.html`
+
+### 现象
+
+用户的 gitea 部署在 CDN（Cloudflare 边缘加速）之后，`ai_min_conns=3`、
+`ai_max_ips=1000`。浏览器控制台大量 **522**（Cloudflare「连接超时」）：
+`site-manifest.json`、`theme-gitea-auto.*.css`、`app.js`、`logo.svg` 等资源全部
+加载失败，整站不可访问；部分请求返回「此网站需要 JavaScript」错误页。
+
+### 根因
+
+源站位于 CDN 之后时，frps 回调拿到的 `remote_addr` 是 **CDN 边缘节点 IP**
+（真实访客 IP 不可见）。边缘节点为全站访客回源，天然满足「单 IP 高频」——
+`ai_min_conns=3` 使其被送审，模型仅凭单 IP 高频 + 无真实用户画像，将边缘节点
+判为 `malicious`（确凿）→ **永久拉黑**；随后 CDN 回源连接被 WAF 拒绝 →
+Cloudflare 回源超时 → **整站 522**。
+
+处置链路本身没有回源豁免：任何按来源 IP 的自动封禁（AI 审查等）在 CDN 场景下
+都可能封掉共享的边缘节点，属于结构性缺陷，而非单次模型误判。
+
+### 修复
+
+1. **提示词识别 CDN 回源**：`SYSTEM_PROMPT` / `_build_user_prompt` 增加
+   `category=cdn_origin` 取值与判定规则（ISP 为 CDN 厂商、对 http/https 代理
+   高频且无被拒 → `benign` + `cdn_origin`，不得判恶意），并明确「误封会导致
+   整站 522」；`_collect` 增加 `ptypes`（代理类型）供模型参考；
+2. **本地兜底 `_is_cdn_origin`**：模型漏判时，`geo` 文本命中已知 CDN 厂商关键字
+   （`_CDN_KEYWORDS`：Cloudflare / CloudFront / Fastly / Sucuri / Imperva /
+   Incapsula / Akamai / 阿里云 CDN / 腾讯云 CDN 等）同样视为回源；
+3. **跳过自动处置**：`_apply_action` 中 `verdict ∈ {malicious, suspicious}` 且
+   判定为 CDN 回源时，写 `ai_review`（`action=skipped`，理由「CDN 回源，跳过自动
+   处置」），**不写黑名单、不写临时封禁**；白名单优先逻辑保持不变；
+4. **开关 `ai_cdn_guard`**（默认 `true`，双端面板 + 配置放行）：关闭后恢复原有
+   分级处置；摘要追加「CDN 回源跳过 N 个」；
+5. **批量恢复工具**：`store.clear_blacklist()` / `store.release_all_bans()` +
+   `unban_all_black` / `unban_all_temp`（插件端）+ `clear_black` / `unban_all`
+   （Web API）+ 双端按钮（二次确认，操作后刷新规则缓存并触发内核同步）。
+
+### 验证
+
+- `scratchpad/verify_cdn_guard_unban.py`（临时脚本，不入库）**33 项断言全过**：
+  `cdn_origin` 跳过 / ISP 关键字兜底 / 关开关恢复处置 / benign 不受影响 /
+  白名单优先 / 端到端假网关（摘要与记录）/ 批量解封条数与状态 /
+  daemon 真实 HTTP 链路（`clear_black`、`unban_all`）；
+- 既有回归全通过：`ai_review_test.py`、`ai_bulk_e2e_test.py`、
+  `verify_followup.py`、`verify_plugin_policy.py`、`verify_plugin_ai_async.py`、
+  `verify_e2e.py`（22/22）、`check_settings_ids.cjs`、`check_html_js.cjs`；
+- `python -m py_compile app/*.py frpwaf_main.py` 通过。
+
+---
+
 ## 附：历史遗留的其它修复（早期版本，非本轮）
 
 这些在更早的提交中已修复，一并记录：
@@ -597,3 +653,4 @@ ConnectionResetError: [Errno 104] Connection reset by peer
 | I | `daemon.py` | 客户端断连异常默认打完整堆栈（stderr 并入日志） | 低（日志噪声，干扰排查） |
 | K | `ai.py` / `index.html` | max_tokens 写死致大批量输出截断、整轮作废 | 高（大批量审查不可用） |
 | L | `frpwaf_main.py` / `index.html` / `ai.py` | 立即审查同步执行致按钮卡死；拆分到单条致送审碎片化 | 高（按钮不可用 + 审查慢） |
+| M | `ai.py` / `config.py` / `store.py` / `daemon.py` / `frpwaf_main.py` / 双端面板 | AI 误封 CDN 回源边缘 IP 致整站 522；缺回源豁免与批量恢复工具 | 高（整站不可访问） |

@@ -986,7 +986,7 @@ class frpwaf_main:
     # ---------------- AI 自动审查 ----------------
     AI_KEYS = ["ai_enabled", "ai_protocol", "ai_base_url", "ai_api_key", "ai_model",
                "ai_interval", "ai_window", "ai_min_conns", "ai_max_ips",
-               "ai_auto_ban", "ai_ban_seconds", "ai_suspicious_ban",
+               "ai_auto_ban", "ai_cdn_guard", "ai_ban_seconds", "ai_suspicious_ban",
                "ai_ssh_strict", "ai_ssh_permanent_suspicious", "ai_timeout"]
 
     def ai_get_config(self, get=None):
@@ -1013,7 +1013,7 @@ class frpwaf_main:
                 if not hasattr(get, k):
                     continue
                 v = getattr(get, k)
-                if k in ("ai_enabled", "ai_auto_ban", "ai_suspicious_ban",
+                if k in ("ai_enabled", "ai_auto_ban", "ai_cdn_guard", "ai_suspicious_ban",
                          "ai_ssh_strict", "ai_ssh_permanent_suspicious"):
                     patch[k] = str(v).lower() in ("1", "true", "on", "yes")
                 elif k in ("ai_interval", "ai_window", "ai_min_conns", "ai_max_ips",
@@ -1253,6 +1253,37 @@ class frpwaf_main:
                 return public.returnMsg(True, "已从黑名单移除")
         except Exception:
             return public.returnMsg(False, "解禁失败：" + traceback.format_exc()[-200:])
+
+    def unban_all_black(self, get=None):
+        """一键解封：清空黑名单全部条目（永久封禁），并同步内核。
+
+        误封恢复手段（如 AI 误封 CDN 边缘 IP 导致 522）。仅清空黑名单，
+        不影响白名单；临时封禁请在「临时封禁」卡片单独使用「解封全部」。
+        """
+        try:
+            store = self._store()
+            n = store.clear_blacklist()
+            try:
+                _app("engine").invalidate_cache()
+            except Exception:
+                pass
+            self._fw_sync()
+            return public.returnMsg(True, "已解封全部黑名单（%d 条）" % n)
+        except Exception:
+            return public.returnMsg(False, "解封失败：" + traceback.format_exc()[-200:])
+
+    def unban_all_temp(self, get=None):
+        """一键解封：释放全部生效中的临时封禁，并同步内核。
+
+        与「解封全部黑名单」独立操作；误封恢复时可按需分别执行。
+        """
+        try:
+            store = self._store()
+            n = store.release_all_bans()
+            self._fw_sync()
+            return public.returnMsg(True, "已解封全部临时封禁（%d 条）" % n)
+        except Exception:
+            return public.returnMsg(False, "解封失败：" + traceback.format_exc()[-200:])
 
     # ---------------- 概览统计 ----------------
     def waf_overview(self, get=None):

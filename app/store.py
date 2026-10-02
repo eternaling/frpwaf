@@ -278,6 +278,17 @@ def del_ip(entry_id):
     return True
 
 
+def clear_blacklist():
+    """清空黑名单全部条目（一键解封永久封禁），返回删除条数。
+
+    供面板「解封全部黑名单」按钮使用；调用方负责刷新规则缓存
+    （engine.invalidate_cache）并触发内核同步（firewall.sync_from_store）。
+    """
+    n = _query("SELECT COUNT(*) AS n FROM ip_list WHERE list_type='black'")[0]["n"]
+    _exec("DELETE FROM ip_list WHERE list_type='black'")
+    return n
+
+
 def load_rules():
     """加载为 (black_networks, white_networks) 两个列表。"""
     blacks, whites = [], []
@@ -559,6 +570,22 @@ def release_ban(ban_id):
 def unban_ip(ip):
     _exec("UPDATE ban_log SET released=1 WHERE ip=? AND released=0", (ip,))
     invalidate_bans()
+
+
+def release_all_bans():
+    """释放全部生效中的临时封禁（一键解封），返回释放条数。
+
+    供面板「解封全部临时封禁」按钮使用；调用方负责触发内核同步
+    （firewall.sync_from_store），把已释放条目从 ipset 移除。
+    """
+    n = _query(
+        "SELECT COUNT(*) AS n FROM ban_log WHERE released=0 AND expire_at>?",
+        (int(time.time()),),
+    )[0]["n"]
+    _exec("UPDATE ban_log SET released=1 WHERE released=0 AND expire_at>?",
+          (int(time.time()),))
+    invalidate_bans()
+    return n
 
 
 def ban_history(limit=200):

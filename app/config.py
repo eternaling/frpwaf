@@ -99,6 +99,7 @@ DEFAULTS = {
     "ai_min_conns": 20,                   # 窗口内连接数低于此值的 IP 不送审
     "ai_max_ips": 20,                     # 每次最多送审的 IP 数
     "ai_auto_ban": True,                  # AI 判定为恶意时是否自动处置
+    "ai_cdn_guard": True,                 # CDN 回源保护：判定为 CDN 回源的 IP 不自动封禁
     "ai_ban_seconds": 1800,               # 疑似封禁时长（秒）；确凿判定走永久黑名单
     "ai_suspicious_ban": True,            # 疑似（suspicious）是否自动临时封禁
     "ai_ssh_strict": True,                # SSH 相关（SSH 爆破 / ssh 代理）是否从严

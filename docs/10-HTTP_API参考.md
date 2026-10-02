@@ -66,6 +66,7 @@ ai_timeout`。
 | GET | `/api/iplist?type=black\|white&limit=N` | 名单列表（附归属地）。返回条数上限 `PANEL_LIST_CAP=5000`，`limit` 缺省或非法时取上限（防大名单全量拉取） |
 | POST | `/api/iplist` | `{action:"add", cidr, list_type, remark}` |
 | POST | `/api/iplist` | `{action:"del", id}` |
+| POST | `/api/iplist` | `{action:"clear_black"}` **一键解封全部黑名单**（只清 black，不动白名单；刷新规则缓存 + 内核同步；返回 `已解封全部黑名单（N 条）`） |
 | POST | `/api/iplist` | `{action:"batch", text, list_type}`（每行 `cidr[,备注]`，`#` 注释） |
 
 ### 6. 连接日志
@@ -84,6 +85,7 @@ ai_timeout`。
 |---|---|---|
 | GET | `/api/bans` | `{data: 生效封禁, history: 历史}`（附归属地） |
 | POST | `/api/bans` | `{action:"unban", ip}` |
+| POST | `/api/bans` | `{action:"unban_all"}` **一键解封全部生效中的临时封禁**（与黑名单解封独立；返回 `已解封全部临时封禁（N 条）`） |
 | POST | `/api/bans` | `{action:"ban", ip, seconds}`（无效 IP 返回 `{code:1,msg}`） |
 
 ### 8. 代理统计
@@ -164,7 +166,8 @@ ai_timeout`。
 
 `list_ips(type)`、`add_ip_entry(cidr,list_type,remark)`、`del_ip_entry(id)`、
 `batch_import_ips(text,list_type)`、`list_bans`、`ban_ip(ip,mode,remark,seconds)`、
-`unban_ip(kind,ip|id)`、`ban_history`。
+`unban_ip(kind,ip|id)`、`unban_all_black`（一键解封全部黑名单）、
+`unban_all_temp`（一键解封全部临时封禁）、`ban_history`。
 
 ### 日志 / 统计 / 归属
 
@@ -225,7 +228,8 @@ ai_timeout`。
   "log_max_rows":200000,"ai_enabled":false,"ai_protocol":"openai",
   "ai_base_url":"","ai_api_key":"","ai_model":"claude-haiku-4.5",
   "ai_auto_ban":true,"ai_ban_seconds":1800,"ai_suspicious_ban":true,
-  "ai_ssh_strict":true,"ai_ssh_permanent_suspicious":true,"ai_timeout":120, /* … */}}
+  "ai_ssh_strict":true,"ai_ssh_permanent_suspicious":true,"ai_cdn_guard":true,
+  "ai_timeout":120, /* … */}}
 
 // POST /api/login 成功
 {"code":0,"msg":"登录成功","user":"admin"}   // 同时 Set-Cookie: frpwaf_sid=…
@@ -237,6 +241,10 @@ ai_timeout`。
 {"code":0,"msg":"添加成功"}
 {"code":0,"msg":"导入完成：成功 3，跳过 1"}
 {"code":1,"msg":"该条目已存在: 1.2.3.4/32"}
+
+// POST /api/iplist（clear_black）/ POST /api/bans（unban_all）
+{"code":0,"msg":"已解封全部黑名单（12 条）"}
+{"code":0,"msg":"已解封全部临时封禁（3 条）"}
 
 // GET /api/bans
 {"code":0,"data":[{"id":1,"ip":"1.2.3.4","reason":"manual","banned_at":…,

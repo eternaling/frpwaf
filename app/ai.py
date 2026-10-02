@@ -9,6 +9,8 @@
   - 疑似（suspicious）       -> 临时封禁（时长 ai_ban_seconds，默认 1800 秒）
   - SSH 相关从严             -> 模型标记 SSH 爆破、或命中代理名含 ssh 时，
                                 疑似也直接永久黑名单（ai_ssh_strict 控制）
+  - CDN 回源                 -> 仅记录，不自动封禁（ai_cdn_guard 控制；
+                                防封 CDN 边缘节点导致整站 522）
   - 白名单命中 / 已处置      -> 跳过（skipped / already_banned）
 
 支持两种协议：
@@ -34,8 +36,14 @@ SYSTEM_PROMPT = (
     "请判断每个 IP 是否属于恶意/可疑行为（例如：端口扫描、SSH 暴力破解、"
     "爬虫抓取、异常高频访问、来自高风险地区的自动化攻击等）。"
     "正常用户访问（如本人手机/公司网络的常规访问、CDN/云服务回源）应判为 benign。"
+    "特别注意 CDN/反向代理回源流量：当某 IP 归属地/ISP 为 CDN 厂商"
+    "（Cloudflare、Amazon CloudFront、Fastly、Sucuri、Imperva、Incapsula、"
+    "Akamai、阿里云 CDN、腾讯云 CDN、百度云加速等），且对 http/https/tcpmux "
+    "类代理有高频连接时，这通常是 CDN 边缘节点在为用户回源（一个边缘节点会"
+    "代表大量真实用户发起连接），必须判为 benign，category 填 cdn_origin，"
+    "绝不能判为恶意——误封 CDN 边缘 IP 会导致整站不可访问。"
     "对每个 IP 还需给出攻击类型 category（英文短语，如 ssh_bruteforce、port_scan、"
-    "web_scan、crawler、rate_abuse、other；正常访问填 none）。"
+    "web_scan、crawler、rate_abuse、cdn_origin、other；正常访问填 none）。"
     "只输出 JSON，不要输出任何多余文字或 markdown 代码块。"
 )
 
@@ -47,10 +55,12 @@ def _build_user_prompt(items):
         "",
         "请对每个 IP 给出判断，严格按如下 JSON 数组格式返回（不要 markdown 代码块）：",
         '[{"ip":"1.2.3.4","verdict":"malicious|suspicious|benign",'
-        '"category":"ssh_bruteforce|port_scan|web_scan|crawler|rate_abuse|other|none",'
+        '"category":"ssh_bruteforce|port_scan|web_scan|crawler|rate_abuse|cdn_origin|other|none",'
         '"reason":"简短中文理由"}]',
         "判定规则：确凿的攻击/扫描/爆破 => malicious；可疑但不确定 => suspicious；正常 => benign。",
-        "category 必须是上述取值之一；无法归类时填 other；正常访问填 none。",
+        "category 必须是上述取值之一；无法归类时填 other；正常访问填 none；"
+        "CDN/反向代理回源（ISP 为 CDN 厂商且高频访问 Web 代理）填 cdn_origin。",
+        "再次强调：CDN 回源 IP 判 benign + cdn_origin，不要判 malicious/suspicious。",
     ]
     return "\n".join(lines)
 
@@ -66,7 +76,8 @@ def _collect():
     rows = store._query(
         "SELECT ip, COUNT(*) AS conns, "
         "  SUM(CASE WHEN action!='allow' THEN 1 ELSE 0 END) AS rejected, "
-        "  GROUP_CONCAT(DISTINCT proxy_name) AS proxies "
+        "  GROUP_CONCAT(DISTINCT proxy_name) AS proxies, "
+        "  GROUP_CONCAT(DISTINCT proxy_type) AS ptypes "
         "FROM conn_log WHERE ts>=? GROUP BY ip HAVING conns>=? "
         "ORDER BY conns DESC LIMIT ?",
         (since, min_conns, max_ips),
@@ -80,6 +91,9 @@ def _collect():
             "conns": r["conns"],
             "rejected": r["rejected"] or 0,
             "proxies": (r["proxies"] or "")[:120],
+            # 命中代理类型：模型据此区分 Web 回源（http/https/tcpmux）与
+            # 敏感服务爆破，辅助 cdn_origin 判定（不参与本地处置决策）。
+            "ptypes": (r["ptypes"] or "")[:80],
         })
     return items
 
@@ -160,10 +174,39 @@ def _is_ssh_related(category, reason, proxies):
     return "ssh" in text
 
 
+# 纯 CDN/反代厂商关键字（归属地/ISP 文本命中即视为 CDN 回源强特征）。
+# 只收录「本身即 CDN 服务商」的名称：共享云厂商通用名（如 Amazon / Google /
+# Microsoft）不收录，避免把云主机上的普通用户/攻击者误判为回源而放行。
+_CDN_KEYWORDS = (
+    "cloudflare", "cloudfront", "fastly", "sucuri", "imperva", "incapsula",
+    "akamai", "阿里云 cdn", "腾讯云 cdn", "百度云加速", "网宿", "chinacache",
+    "keycdn", "bunnycdn", "stackpath", "edgecast", "limelight", "gcore",
+)
+
+
+def _is_cdn_origin(category, it, cfg):
+    """判断某送审 IP 是否应按「CDN 回源」跳过自动封禁（仅记录）。
+
+    两个来源任一命中即视为回源：
+      1. 模型判定 category=cdn_origin（提示词已要求识别，最可靠）；
+      2. 归属地/ISP 文本命中纯 CDN 厂商关键字（模型漏判时的兜底）。
+
+    注意：该判断只影响「自动处置」，不影响送审与审计记录；`ai_cdn_guard`
+    关闭时不做任何跳过（恢复原有分级处置）。
+    """
+    if not cfg.get("ai_cdn_guard", True):
+        return False
+    if (category or "").lower() == "cdn_origin":
+        return True
+    text = (str(it.get("geo") or "")).lower()
+    return any(k in text for k in _CDN_KEYWORDS)
+
+
 def _apply_action(ip, verdict, category, reason, it, cfg):
     """按判定分级处置并写入审查记录，返回展示用结果字典。
 
     分级：
+      - CDN 回源（cdn_origin / CDN 厂商强特征）-> 仅记录，不自动封禁（防 522）
       - 确凿（malicious）或 SSH 相关疑似（ai_ssh_strict）-> 永久黑名单
       - 疑似（suspicious，ai_suspicious_ban）           -> 临时封禁
       - 其余 / 已在处置中                                -> 仅记录
@@ -177,6 +220,16 @@ def _apply_action(ip, verdict, category, reason, it, cfg):
                             cfg.get("ai_model", ""))
         return {"ip": ip, "verdict": verdict, "category": category, "reason": reason,
                 "action": "skipped", "mode": "whitelist", "ssh": ssh,
+                "geo": it.get("geo", ""), "conns": it.get("conns", 0)}
+
+    # CDN 回源保护：边缘节点 IP 被大量真实用户共享，一旦自动封禁会导致
+    # 整站不可访问（CDN 回源被拒 → 522）。仅对「本会触发封禁」的判定生效
+    # （benign/unknown 本就不处置，走常规记录即可），只记录、不写任何封禁。
+    if verdict in ("malicious", "suspicious") and _is_cdn_origin(category, it, cfg):
+        store.add_ai_review(0, ip, verdict, "CDN 回源，跳过自动处置", "skipped",
+                            cfg.get("ai_model", ""))
+        return {"ip": ip, "verdict": verdict, "category": category, "reason": reason,
+                "action": "skipped", "mode": "cdn", "ssh": ssh,
                 "geo": it.get("geo", ""), "conns": it.get("conns", 0)}
 
     if not cfg.get("ai_auto_ban"):
@@ -543,6 +596,7 @@ def _review_run(cfg):
     results = []
     banned = 0        # 永久黑名单数
     temp_banned = 0   # 临时封禁数
+    cdn_skipped = 0   # CDN 回源跳过数
     for v in res:
         if not isinstance(v, dict):
             continue
@@ -563,6 +617,8 @@ def _review_run(cfg):
             banned += 1
         elif r["action"] == "banned" and r["mode"] == "temp":
             temp_banned += 1
+        elif r["action"] == "skipped" and r.get("mode") == "cdn":
+            cdn_skipped += 1
         results.append(r)
 
     # 永久黑名单写入后立即让决策缓存失效（名单缓存 3s TTL，改完即生效）；
@@ -587,11 +643,14 @@ def _review_run(cfg):
     missing = max(0, len(items) - reviewed_ips)
     last_result = "审查 %d 个 IP，永久黑名单 %d 个，临时封禁 %d 个" % (
         reviewed_ips, banned, temp_banned)
+    if cdn_skipped:
+        last_result += "，CDN 回源跳过 %d 个" % cdn_skipped
     if missing:
         last_result += "，%d 个未获判定（不处置）" % missing
     _mark_done(True, last_result)
     return {"ok": True, "msg": last_result, "results": results,
-            "checked": len(items), "banned": banned, "temp_banned": temp_banned}
+            "checked": len(items), "banned": banned, "temp_banned": temp_banned,
+            "cdn_skipped": cdn_skipped}
 
 
 def _mark_done(ok, result):

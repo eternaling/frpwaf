@@ -442,7 +442,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ai_enabled": bool, "ai_protocol": str, "ai_base_url": str,
                 "ai_api_key": str, "ai_model": str, "ai_interval": int,
                 "ai_window": int, "ai_min_conns": int, "ai_max_ips": int,
-                "ai_auto_ban": bool, "ai_ban_seconds": int,
+                "ai_auto_ban": bool, "ai_cdn_guard": bool, "ai_ban_seconds": int,
                 "ai_suspicious_ban": bool, "ai_ssh_strict": bool,
                 "ai_ssh_permanent_suspicious": bool, "ai_timeout": int,
             }
@@ -521,6 +521,12 @@ class Handler(BaseHTTPRequestHandler):
                         engine.invalidate_cache()
                         _fw_sync()
                         return self._json({"code": 0, "msg": "删除成功"})
+                    if action == "clear_black":
+                        # 一键解封全部黑名单（误封恢复；仅黑名单，不动白名单）
+                        n = store.clear_blacklist()
+                        engine.invalidate_cache()
+                        _fw_sync()
+                        return self._json({"code": 0, "msg": "已解封全部黑名单（%d 条）" % n})
                     if action == "batch":
                         # 多行文本批量导入： 每行  cidr[,备注]
                         text = body.get("text", "")
@@ -602,6 +608,11 @@ class Handler(BaseHTTPRequestHandler):
                 firewall.remove(body.get("ip", ""))
                 _fw_sync()
                 return self._json({"code": 0, "msg": "已解封"})
+            if action == "unban_all":
+                # 一键解封全部生效中的临时封禁（与黑名单解封独立）
+                n = store.release_all_bans()
+                _fw_sync()
+                return self._json({"code": 0, "msg": "已解封全部临时封禁（%d 条）" % n})
             if action == "ban":
                 ip = (body.get("ip") or "").strip()
                 if not ip:

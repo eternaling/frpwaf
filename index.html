@@ -202,6 +202,7 @@
               </div>
               <span style="flex:1"></span>
               <button class="btn btn-default btn-sm" onclick="fwLoadIpList()">刷新</button>
+              <button class="btn btn-danger btn-sm" onclick="fwUnbanAllBlack()">解封全部黑名单</button>
             </div>
             <div class="fw-table-wrap" style="max-height:360px">
               <table class="fw-table"><thead><tr><th style="width:170px">条目</th><th style="width:90px" class="c">类型</th><th style="width:190px">归属地</th><th>备注</th><th style="width:160px">添加时间</th><th style="width:80px" class="c">操作</th></tr></thead>
@@ -211,6 +212,10 @@
 
           <div class="fw-card fw-span-2">
             <h3>临时封禁（生效中） <span style="color:#999;font-size:12px;font-weight:400" id="fwTempCount"></span></h3>
+            <div class="fw-row" style="margin-bottom:10px">
+              <span style="flex:1"></span>
+              <button class="btn btn-danger btn-sm" onclick="fwUnbanAllTemp()">解封全部临时封禁</button>
+            </div>
             <div class="fw-table-wrap" style="max-height:320px">
               <table class="fw-table"><thead><tr><th style="width:170px">IP</th><th style="width:190px">归属地</th><th>原因</th><th style="width:160px">到期时间</th><th style="width:80px" class="c">操作</th></tr></thead>
               <tbody id="fwTempList"><tr><td colspan="5" style="color:#bbb;text-align:center">暂无</td></tr></tbody></table>
@@ -268,6 +273,8 @@
               <div><input id="ai_max_ips" class="bt-input-text" type="number" style="width:130px" value="20"></div>
               <div class="k">自动处置</div>
               <div><input type="checkbox" id="ai_auto_ban" checked> 开启后按判定分级封禁</div>
+              <div class="k">CDN 回源保护</div>
+              <div><input type="checkbox" id="ai_cdn_guard" checked> CDN 回源 IP 不自动封禁（防整站 522）</div>
               <div class="k">疑似临时封禁</div>
               <div><input type="checkbox" id="ai_suspicious_ban" checked> 疑似（suspicious）临时封禁</div>
               <div class="k">SSH 相关从严</div>
@@ -279,7 +286,7 @@
               <div class="k">接口超时（秒）</div>
               <div><input id="ai_timeout" class="bt-input-text" type="number" style="width:130px" value="120"></div>
             </div>
-            <div class="fw-tip">分级处置：确凿（malicious）→ <b>永久黑名单</b>；疑似（suspicious）→ 临时封禁（时长如上）；SSH 相关疑似按从严设置直接永久；白名单命中的 IP 不自动处置。</div>
+            <div class="fw-tip">分级处置：确凿（malicious）→ <b>永久黑名单</b>；疑似（suspicious）→ 临时封禁（时长如上）；SSH 相关疑似按从严设置直接永久；CDN 回源与白名单命中的 IP 不自动处置。</div>
             <div class="fw-row" style="margin-top:12px">
               <button class="btn btn-success btn-sm" onclick="fwAiSave()">保存策略</button>
               <button id="fwAiRunBtn" class="btn btn-danger btn-sm" onclick="fwAiRun()">立即审查一次</button>
@@ -979,6 +986,26 @@ function fwUnbanTemp(ip){
     bt_tools.msg((r&&r.msg)||'完成', (r&&r.status)); fwLoadBans(); fwLoadBanHistory();
   });
 }
+function fwUnbanAllBlack(){
+  layer.confirm('确认解封全部黑名单？将清空黑名单所有条目（含手动/AI/爆破写入），并同步内核防火墙。'
+    +'白名单与临时封禁不受影响。', {icon:2, title:'危险操作'}, function(i){
+    layer.close(i);
+    fwSend('unban_all_black', {}, function(r){
+      bt_tools.msg((r&&r.msg)||'完成', (r&&r.status));
+      fwLoadIpList(); fwLoadBans(); fwLoadBanHistory(); fwLoadKernBan();
+    });
+  });
+}
+function fwUnbanAllTemp(){
+  layer.confirm('确认解封全部临时封禁？将释放所有生效中的临时封禁（到期前提前解除），并同步内核防火墙。'
+    +'黑名单不受影响。', {icon:2, title:'危险操作'}, function(i){
+    layer.close(i);
+    fwSend('unban_all_temp', {}, function(r){
+      bt_tools.msg((r&&r.msg)||'完成', (r&&r.status));
+      fwLoadBans(); fwLoadBanHistory(); fwLoadKernBan();
+    });
+  });
+}
 function fwLoadBans(){
   fwSend('list_bans', {}, function(r){
     if(!r || !r.status){ return; }
@@ -1220,6 +1247,7 @@ function fwAiLoad(){
     document.getElementById('ai_min_conns').value = d.ai_min_conns||20;
     document.getElementById('ai_max_ips').value = d.ai_max_ips||20;
     document.getElementById('ai_auto_ban').checked = !!d.ai_auto_ban;
+    document.getElementById('ai_cdn_guard').checked = (d.ai_cdn_guard===undefined?true:!!d.ai_cdn_guard);
     document.getElementById('ai_suspicious_ban').checked = (d.ai_suspicious_ban===undefined?true:!!d.ai_suspicious_ban);
     document.getElementById('ai_ssh_strict').checked = (d.ai_ssh_strict===undefined?true:!!d.ai_ssh_strict);
     document.getElementById('ai_ssh_permanent_suspicious').checked = (d.ai_ssh_permanent_suspicious===undefined?true:!!d.ai_ssh_permanent_suspicious);
@@ -1247,6 +1275,7 @@ function fwAiForm(){
     ai_min_conns: document.getElementById('ai_min_conns').value,
     ai_max_ips: document.getElementById('ai_max_ips').value,
     ai_auto_ban: document.getElementById('ai_auto_ban').checked,
+    ai_cdn_guard: document.getElementById('ai_cdn_guard').checked,
     ai_suspicious_ban: document.getElementById('ai_suspicious_ban').checked,
     ai_ssh_strict: document.getElementById('ai_ssh_strict').checked,
     ai_ssh_permanent_suspicious: document.getElementById('ai_ssh_permanent_suspicious').checked,

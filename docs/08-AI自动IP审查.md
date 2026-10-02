@@ -8,10 +8,16 @@
 | `malicious`（确凿） | **永久黑名单** | `ip_list`（black） | 永久（内核 `timeout=0`），需人工解封 |
 | `suspicious`（疑似） | 临时封禁 | `ban_log` | `ai_ban_seconds`（默认 1800 秒，到期自动释放） |
 | `suspicious` + SSH 相关 | **永久黑名单**（从严，可关） | `ip_list`（black） | 永久 |
+| `cdn_origin`（CDN 回源）/ 强特征命中 | 仅记录，**不自动封禁**（`ai_cdn_guard` 控制） | —— | —— |
 | `benign` / 白名单命中 / 已处置 | 仅记录 | —— | —— |
 
 黑名单开关关闭时，原本需要永久黑名单的判定降级为临时封禁；不释放已有临时封禁，
 避免记录了永久名单却没有应用层拦截。
+
+> **CDN 回源保护（`ai_cdn_guard`，默认开）**：源站部署在 CDN 之后时，frps 看到的
+> 来源 IP 是 CDN 边缘节点，它们被大量真实用户共享。一旦按单 IP 高频将其自动封禁，
+> CDN 回源被拒会导致**整站不可访问（Cloudflare 522）**。故判定为 CDN 回源的 IP
+> 一律跳过自动处置（记 `skipped`），只记录不封禁。
 
 仅用标准库 `urllib`，无第三方依赖。
 
@@ -121,18 +127,22 @@ anthropic-version: 2023-06-01
 
 **系统提示**（`SYSTEM_PROMPT`）：设定模型为服务器安全分析师，审查反向代理入站
 来源 IP，判断是否恶意（端口扫描、SSH 爆破、爬虫、异常高频、高风险地区自动化攻击等），
-正常用户判 benign，**只输出 JSON**。
+正常用户判 benign，**只输出 JSON**。提示词同时要求识别 **CDN 回源**：ISP 为 CDN 厂商
+（Cloudflare / CloudFront / Fastly / Sucuri / Imperva / Incapsula / Akamai / 阿里云 CDN /
+腾讯云 CDN 等）且对 http/https 代理高频、无被拒的单一来源，属共享边缘节点回源，
+判 `benign` + `category=cdn_origin`，**不得判恶意**（误封会导致整站 522）。
 
 **要求输出**：
 
 ```json
 [{"ip":"1.2.3.4","verdict":"malicious|suspicious|benign",
-  "category":"ssh_bruteforce|port_scan|web_scan|crawler|rate_abuse|other|none",
+  "category":"ssh_bruteforce|port_scan|web_scan|crawler|rate_abuse|cdn_origin|other|none",
   "reason":"简短中文理由"}]
 ```
 
-- 判定规则：确凿攻击 → `malicious`；可疑不确定 → `suspicious`；正常 → `benign`。
-- `category` 为攻击类型，`ssh_bruteforce` 是 SSH 从严判定依据之一；
+- 判定规则：确凿攻击 → `malicious`；可疑不确定 → `suspicious`；正常 → `benign`；
+- `category` 为攻击类型，`ssh_bruteforce` 是 SSH 从严判定依据之一，
+  `cdn_origin` 是 CDN 回源保护依据（跳过自动封禁）；
   旧格式（无 `category`）不会导致误判，会退化为理由/代理名关键词兜底。
 
 ## 5. 处理与分级处置（`review`）
@@ -148,6 +158,9 @@ anthropic-version: 2023-06-01
      `store.add_ban(ip, "ai: <reason>", ai_ban_seconds)`；
    - `verdict == "suspicious"` 且 SSH 相关（`ai_ssh_strict` 开）→ 永久黑名单
      （`ai_ssh_permanent_suspicious` 控制，可关闭退回临时）；
+   - `verdict` 为 `malicious` / `suspicious` 且判定为 **CDN 回源**
+     （`category=cdn_origin`，或 `geo` 文本命中 CDN 厂商关键字，`ai_cdn_guard` 开）
+     → `skipped`，**只记录、不写任何封禁**（防整站 522）；
    - 白名单命中的 IP → `skipped`，**不做任何自动处置**；
    - 已在黑名单 → `already_banned`（不重复写入）；
    - 已在临时封禁 → 疑似场景 `already_banned`；确凿场景直接升级为永久；
@@ -157,7 +170,8 @@ anthropic-version: 2023-06-01
    若开启了 `fw_sync_enabled`，同一时刻只跑一个同步任务（事件去重，见
    [05 §4.4](05-内核级封禁.md)），批量处置不会引发同步风暴；
 6. 更新配置 `ai_last_run` / `ai_last_result` / `ai_last_ok`
-   （摘要格式：`审查 N 个 IP，永久黑名单 X 个，临时封禁 Y 个`；
+   （摘要格式：`审查 N 个 IP，永久黑名单 X 个，临时封禁 Y 个`，
+   CDN 回源跳过时追加 `，CDN 回源跳过 Z 个`；
    走 `config.save(patch)` 合并语义，不覆盖并发写入的其它字段）；
    本轮状态 `ai_review_state` 在 finally 中清空（任何出口都不会残留「审查中」）。
 
@@ -179,6 +193,28 @@ anthropic-version: 2023-06-01
 
 自动处置前先 `_is_whitelisted(ip)`（名单含 CIDR 匹配）。即使模型判恶意，
 白名单命中的 IP 也不自动处置（记 `skipped`），避免「封 IP 段连坐白名单」。
+
+### 5.2.1 CDN 回源保护（防 522，`ai_cdn_guard`）
+
+源站部署在 CDN（Cloudflare 等）之后时，frps 回调拿到的 `remote_addr` 是 **CDN 边缘
+节点 IP**（不是真实访客）：单一 IP 承载全站访客的回源连接，天然「高频」。若不豁免，
+AI 会按单 IP 高频判恶意 → 永久拉黑边缘节点 → CDN 回源被拒 → **整站 522**。
+
+双重识别（`ai_cdn_guard` 默认开，仅对 `malicious` / `suspicious` 判定生效）：
+
+1. 模型输出 `category=cdn_origin`；
+2. 兜底：`geo` 归属地/ISP 文本命中已知 CDN 厂商关键字（`_CDN_KEYWORDS`：
+   Cloudflare、CloudFront、Fastly、Sucuri、Imperva、Incapsula、Akamai、
+   阿里云 CDN、腾讯云 CDN、百度云加速、网宿、ChinaCache、KeyCDN、BunnyCDN、
+   StackPath、EdgeCast、Limelight、Gcore）。
+
+命中即 `skipped`（`reason` 标注「CDN 回源，跳过自动处置」），**不写黑名单、
+不写临时封禁**。关键字只含纯 CDN 厂商，不含通用云厂商名（避免把云主机上的
+攻击者也一并豁免）；关闭 `ai_cdn_guard` 可恢复原分级处置。
+
+> 局限：frp 插件回调本身拿不到真实访客 IP（只有 `remote_addr`），因此无法在
+> WAF 层封禁「真实攻击者」；CDN 场景下的 IP 级自动封禁应交给 CDN 自身
+> （Cloudflare WAF 等）。本保护确保误封不会造成整站不可用。
 
 ### 5.3 安全边界：只封「送审过的 IP」（Bug D，关键）
 
@@ -218,6 +254,7 @@ if ip not in stat:
 | `ai_suspicious_ban` | `true` | 疑似（`suspicious`）是否自动临时封禁 |
 | `ai_ssh_strict` | `true` | SSH 相关（SSH 爆破 / 代理名含 ssh）是否从严 |
 | `ai_ssh_permanent_suspicious` | `true` | SSH 相关疑似是否也直接永久黑名单（需 `ai_ssh_strict` 开） |
+| `ai_cdn_guard` | `true` | CDN 回源保护：判定为 CDN 回源（`cdn_origin` / 厂商特征）的 IP 不自动封禁（防整站 522） |
 | `ai_timeout` | 120 | 调用超时（≥15） |
 
 ## 7. 密钥保护
@@ -242,7 +279,7 @@ if ip not in stat:
 | `permanent` | 已加入永久黑名单（确凿 / SSH 从严） |
 | `banned` | 已临时封禁（疑似，`ai_ban_seconds`） |
 | `already_banned` | 已在黑名单或临时封禁中，未重复写入 |
-| `skipped` | 白名单命中，跳过自动处置 |
+| `skipped` | 白名单命中或 CDN 回源保护命中，跳过自动处置 |
 | `ban_failed` | 写入失败（记录日志，由对账/下轮修复） |
 | `none` | 判定正常 / 未开启自动处置 / 已关闭开关 |
 | `skip` / `error` | 无送审对象 / 调用或解析失败 |
@@ -258,6 +295,8 @@ if ip not in stat:
 | 「模型返回无法解析为 JSON」 | 模型未按格式输出；换更强模型或调提示词 |
 | 连接失败 / 超时 | 检查网关连通性、`ai_timeout`；网络类错误会自动重试一次 |
 | 审查到 IP 但不封禁 | `ai_auto_ban` 关闭，或该 IP 已在黑名单/临时封禁中（不重复处置） |
-| 疑似被永久封禁 | SSH 相关从严（`ai_ssh_strict` + `ai_ssh_permanent_suspicious`）命中；可在「IP 封禁」页解封 |
+| 疑似被永久封禁 | SSH 相关从严（`ai_ssh_strict` + `ai_ssh_permanent_suspicious`）命中；可在「IP 封禁」页解封，或用「解封全部黑名单」一键恢复 |
 | 同一 IP 反复出现 | 正常：每周期都会审查；已处置的不重复封 |
-| 误封了正常 IP | 到「IP 封禁」页删除对应黑名单条目（永久）或解禁（临时）；必要时调整提示词/阈值 |
+| 误封了正常 IP | 到「IP 封禁」页删除对应黑名单条目（永久）或解禁（临时）；也可用「解封全部黑名单」/「解封全部临时封禁」批量恢复；必要时调整提示词/阈值 |
+| CDN 边缘 IP 被判恶意 | `ai_cdn_guard` 开启时不会封禁（记 `skipped`）；若曾误封导致 522，用「解封全部黑名单」恢复 |
+| 站点 522（CDN 回源超时） | 多为 CDN 边缘 IP 被误封：面板「解封全部黑名单」+「解封全部临时封禁」，确认 `ai_cdn_guard` 为开 |
