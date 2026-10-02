@@ -1,7 +1,9 @@
 # 12 · Bug 修复记录
 
 本文记录本项目**历次发现并修复的全部功能 Bug**，含现象、根因、修复与验证。
-共 8 个（Bug A–H），均在隔离环境复现、修复、验证后应用到生产。
+共 12 批（Bug A–I 为历史单点修复；Bug J 为 2026-10-01 全项目审查批次；
+Bug K/L 为 2026-10-02 AI 大批量审查修复批次），
+均在隔离环境复现、修复、验证后应用到生产。
 
 > 编号顺序为**发现顺序**，与修复提交顺序略有交叉（Bug B 与 A 同批提交）。
 
@@ -17,6 +19,10 @@
 | F | `frp.py` / `toml_lite.py` | `v1.3.9` | v1.3.9 | 已提交发布 |
 | G | `ai.py` | `a2bab91` / `v1.3.10` | v1.3.10 | 已提交发布 |
 | H | `frpwaf_main.py` | `e16e6fa` / `v1.3.10`（tag 重指） | v1.3.10 | 已提交发布 |
+| I | `daemon.py` | v1.3.11 | v1.3.11 | 已提交发布 |
+| J | `daemon.py` / `engine.py` / `store.py` / `firewall.py` / `frp.py` / `auth.py` / `config.py` / `frpwaf_main.py` / 双端面板 / `install.sh` / `uninstall.sh` | v1.3.11 | v1.3.11 | 已提交发布 |
+| K | `ai.py` / `index.html` | v1.3.11 | v1.3.11 | 已提交发布 |
+| L | `frpwaf_main.py` / `index.html` / `ai.py` | v1.3.11 | v1.3.11 | 已提交发布 |
 
 > A、B 随 `cedf595` 一起提交并打 Tag `v1.3.7`；C、D、E 随后修复，随 Tag
 > `v1.3.8` 一起提交（见 [13-变更历史与版本.md](13-变更历史与版本.md) §2/§4）。
@@ -358,6 +364,212 @@ frp 管理页点击「一键放行端口」，无论 frps 配置里有多少端�
 
 ---
 
+## Bug I：客户端断连刷运行日志（ConnectionResetError 完整堆栈）
+
+**文件**：`app/daemon.py` · 新增 `_QuietHTTPServer.handle_error()`
+
+### 现象
+
+`data/frpwaf.log`（面板「运行日志」页）反复出现完整 traceback：
+
+```
+----------------------------------------
+Exception occurred during processing of request from ('45.79.211.97', 58032)
+Traceback (most recent call last):
+  ...
+  File "/www/server/panel/pyenv/lib/python3.13/socket.py", line 723, in readinto
+    return self._sock.recv_into(b)
+ConnectionResetError: [Errno 104] Connection reset by peer
+----------------------------------------
+```
+
+来源 IP 多为扫描器/爬虫，日志持续增长、干扰真实信息排查。
+
+### 根因
+
+`http.server` 的 `BaseServer.handle_error` 默认把**请求处理线程**中的任何异常
+连同完整堆栈打印到 **stderr**；服务脚本 `frpwaf.init` 以
+`nohup python -m app.daemon >>frpwaf.log 2>&1 &` 启动，stderr 被合并写入运行日志。
+而扫描器连接后**不发完整请求就断开**（RST），请求线程在 `rfile.readline()`
+抛 `ConnectionResetError` —— 属正常网络噪声，却因默认 `handle_error` 变成堆栈刷屏。
+
+### 修复
+
+`ThreadingHTTPServer` 子类 `_QuietHTTPServer`，重写 `handle_error()`：
+
+- `ConnectionResetError` / `ConnectionAbortedError` / `BrokenPipeError` /
+  `TimeoutError` / `socket.timeout`（客户端断连、慢连接超时）→ **静默**，
+  按 10 分钟窗口汇总一条 `已静默 N 条客户端断连异常` 写入运行日志（防刷屏又留痕）；
+- 其余异常 → 原样调用默认实现（保留完整堆栈，真实故障仍可排查）。
+
+`main()` 改用 `_QuietHTTPServer` 启动。仅影响请求线程异常出口，
+不影响路由、回调与业务日志（`_log`）。
+
+### 验证
+
+隔离实例回归（`scratchpad/quiet_server_test.py`，不入库）**11 项断言全部通过**：
+
+- RST 半途断开 x5：console 无 `Exception occurred`/`Traceback`/`ConnectionResetError`，
+  运行日志恰好 1 条「已静默」汇总；
+- 正常 `GET /`（200）、正常回调（`reject:false`）、非法 JSON 回调均正常；
+- 全部用例后 console 仍无堆栈，服务存活。
+
+### 关联说明：frps 日志的 `no route found`
+
+用户同时报告 frps 日志刷
+`[W] [httputil/reverseproxy.go:500] ... no route found: <host> <path>`。
+经查 frp 源码（`pkg/util/vhost/http.go` `CreateConnection` → `ErrNoRouteFound`），
+该日志由 **frp 服务端二进制**产生：请求直连 `vhostHTTPPort` 但 Host 不匹配任何
+已注册 HTTP 代理域名（扫描器扫 IP、探测未知域名），frp 返回 404 并记 Warn，
+属预期防御行为。**不是本插件缺陷**，处置建议见
+[11-开发运维与常见问题.md](11-开发运维与常见问题.md) Q12
+（调 `log.level`、关闭无用 `vhostHTTPPort`、防火墙限制来源）。
+另注：HTTP 代理不触发 `NewUserConn`，此类流量不经过 WAF 决策，需在上游拦截。
+
+---
+
+## Bug J：全项目审查批次（2026-10-01，P0/P1/P2/P3 全量）
+
+**文件**：`app/daemon.py`、`app/engine.py`、`app/store.py`、`app/firewall.py`、
+`app/frp.py`、`app/auth.py`、`app/config.py`、`frpwaf_main.py`、`index.html`、
+`web/index.html`、`install.sh`、`uninstall.sh`
+
+### 现象（摘选）
+
+- 任意可达 7080 的来源可 POST `/frp/handler` 伪造 `remote_addr`，把任意 IP 写入黑名单；
+- 未认证可达的 500 响应回显 traceback（泄露内部结构与路径）；
+- 插件端 `get_admin` / `get_waf_info` 明文回显管理员密码；
+- 基础自动封禁（第 5 步）每连接查 `conn_log`（违反决策路径禁 IO 红线），
+  且并发时多线程可同时达阈值重复写 `ban_log`；
+- 内核同步在批量封禁时线程/子进程风暴；`sync` 快照在锁外构建存在写覆盖竞态；
+- `ban_log` 无索引/无裁剪、登录限速表无界、`banned_ips` 缓存重建在锁外；
+- 插件端与 WAF 进程并发写 `frpwaf.json` 互相覆盖字段；
+- Web 端概览未转义（XSS 面）、封禁历史两态、空态行缺 colspan、`api()` 不统一处理错误；
+- `install.sh` 无参数默认执行**卸载**（误执行即移除 frps 回调）；
+- CC 文案与实际不符（http 类型不触发 NewUserConn 回调）。
+
+### 修复（按模块）
+
+| 模块 | 修复内容 |
+|---|---|
+| daemon | 回调本机校验（非本机 403 + 计数）；500 不回显 detail；登录限速表硬上限；回调路径单事务写库（`add_log_and_bump`）；engine 异常计数与限频日志；`/api/iplist` 返回条数夹取 `PANEL_LIST_CAP` |
+| engine | 第 5 步改纯内存原子认领（与第 6 步统一）；计数改为「阈值封顶 + 只认领一次」（消除并发二次触发竞态）；内核同步合并单工作线程（事件去重） |
+| store | `idx_ban_log_active` / `idx_conn_log_ip_ts` 复合索引；`trim_bans(20000)`；`banned_ips` 锁内双重检查；`list_ips(limit)` + `PANEL_LIST_CAP=5000` 展示上限；删除死代码 `remove_ip` |
+| firewall | 快照构建+下发全程持 `_sync_lock`；`ipset restore` 批量提交（失败退化逐条） |
+| frp | 删除死代码 `install()`；下载 sha256 校验（GitHub digest）；版本号正则白名单 |
+| auth | 非 ASCII 签名/异常输入返回 None（不再 500） |
+| config | `save(patch)` 并发保护：线程锁 + 跨进程文件锁内「读现状→合并→原子替换」；损坏拒写 |
+| frpwaf_main | 密码回显掩码；`_set_cfg` 走 patch 语义（并发合并） |
+| index.html | `fwAiRun` 去全局 event；`fwFrpPoll` beforeunload 清理；CC 文案修正 |
+| web/index.html | 概览全量转义；封禁三态；空态 colspan 补全；`api()` 统一错误抛出 |
+| install/uninstall | 参数显式分派（无参数仅提示用法）；frps.toml 清理缺 python3 / 失败时告警 |
+
+### 验证
+
+- `python3 -m py_compile app/*.py frpwaf_main.py`、`bash -n install.sh uninstall.sh build.sh frpwaf.init` 通过；
+- 并发与索引验证（`scratchpad/verify_fix_round1.py`，不入库）10/10 通过；
+- 配置并发写验证（`scratchpad/verify_config_save.py`，不入库）11/11 通过；
+- 步骤 12–15 验证（`scratchpad/verify_fix_round2.py`，不入库）18/18 通过；
+- 详见 [docs/tests/reports/2026-10/](tests/reports/2026-10/) 验证报告。
+
+---
+
+## Bug K：AI 大批量送审输出截断，整轮审查作废（2026-10-02）
+
+**文件**：`app/ai.py`（`call_model` / `_extract_json`）· `index.html`（审查策略保存按钮）
+
+### 现象
+
+用户将 `ai_min_conns` 调为 1、`ai_max_ips` 调为 1000 后执行「立即审查」，
+面板报「模型返回无法解析为 JSON: [ {...}, ...」，整轮审查失败、无任何处置。
+
+### 根因
+
+`_call_openai` / `_call_anthropic` 的 `max_tokens` **写死 1500**。送审 N 个 IP
+需要模型输出 N 条判定 JSON（每条含 ip/verdict/category/reason，约 100~150 token），
+1000 条需输出约 10 万 token，远超 1500 输出上限 → 模型输出在字符串中途被截断
+（用户报错信息末尾 `"reason": "10次连接命中多个codebuddy代理` 无闭合引号即特征）
+→ `_extract_json` 整体解析失败 → 整轮作废。
+
+### 修复
+
+1. **分批送审**：`call_model` 超过 `_BATCH_SIZE` 自动分批调用
+   （初始 40 条/批；Bug L 已调至 **100 条/批并并行**），单批输出规模可控；
+2. **动态 max_tokens**：`_max_tokens_for(n) = min(16384, max(1024, n*120+512))`，
+   按批内条数计算，小批量不浪费、大批量不截断；
+3. **截断抢救**：`_extract_json` 整体解析失败时用 `_salvage_json` 逐对象
+   `raw_decode` 抢救完整条目（缺失条目不处置，安全方向不变）；
+4. **失败降级**：单批解析失败 / 网关拒绝 max_tokens / 413 → 二分重试
+   （拆分预算 16 次）；解析成功但漏答 → 对缺失 IP 补审一次；鉴权类 HTTP
+   错误直接终止不重复请求；部分批次失败时摘要标注「N 个未获判定（不处置）」；
+5. **面板**：「审查策略」卡片补独立「保存策略」按钮（复用 `ai_save_config`，
+   后端本就覆盖全部策略字段，此前仅缺前端入口）。
+
+### 验证
+
+`scratchpad/ai_truncation_fix_test.py` 10 组 27 项断言 +
+`scratchpad/ai_bulk_e2e_test.py` 端到端 9 项断言全部通过（均不入库）：
+- 90 条送审单批；截断只保住前 45 条 → 自动补审缺失 45 条，最终 90 条全部获得判定；
+- 持续失败场景：25 条获判定、65 条不处置，黑名单恰 25 条，摘要正确标注；
+- 既有 `scratchpad/ai_review_test.py`（分级处置 30+ 断言）回归全通过；
+- `python -m py_compile app/*.py frpwaf_main.py`、`node scratchpad/check_html_js.cjs` 通过。
+
+### 后续修复（同日，Bug L）
+
+用户实测后追加报告两个问题（按钮卡「审查中…」+ 观感「一个一个 IP 送审」），
+根因与修复见 Bug L。
+
+---
+
+## Bug L：立即审查按钮卡死 + 送审碎片化（2026-10-02）
+
+**文件**：`frpwaf_main.py`（`ai_run_now`/`ai_status`）· `index.html`（`fwAiRun` 轮询）
+· `app/ai.py`（并行批次、最小拆分、互斥与状态机）· `app/config.py`（状态键）
+
+### 现象
+
+用户点击「立即审查一次」后：
+1. 按钮**一直停在「审查中…」**，不再恢复；
+2. 观察网关日志，像是**一次只送一个 IP** 去审查（希望一批一起送、一起拿回）。
+
+### 根因
+
+1. **按钮卡死**：插件端 `ai_run_now` 在面板进程内**同步**执行
+   `ai.review(force=True)`——大批量审查（顺序分批 × 每批最长 `ai_timeout` 秒）
+   远超插件请求/网关超时，HTTP 回调永不返回，前端恢复按钮的代码永远不执行；
+2. **碎片化观感**：`_call_batch` 解析失败一路二分拆到 **1 条/批**，网关日志
+   出现大量单条请求；且批次串行执行，整体慢，进一步强化「一个一个」的观感。
+
+### 修复
+
+1. **异步立即审查**：插件端 `ai_run_now` 只写 `ai_run_requested` 时间戳并
+   **立即返回**；daemon `loop_forever` 消费执行（`ai_run_consumed` 游标，
+   `requested > consumed` 才执行）；前端 `fwAiRun` 提交后轮询 `ai_status`，
+   按 `running`/`stale`/`last_result` 恢复按钮并提示结果——即使面板/网关超时
+   也不会卡死，页面刷新后还会自动恢复「审查中…」状态继续轮询；
+2. **批次放大 + 并行**：`_BATCH_SIZE` 40 → **100**（一批 IP 一起送审），
+   批次波内并行（`_MAX_WORKERS=3`）、波间串行（鉴权类错误于波边界提前终止），
+   总耗时约为串行的 1/N；
+3. **最小拆分 5 条**：解析失败不再拆到单条；漏答补齐要求缺失 ≥2 条；
+4. **互斥与状态机**：`review()` 持 `_review_lock`（并发触发只跑一轮），
+   每轮写 `ai_review_state`（finally 清空，任何出口不残留）、`ai_last_ok`，
+   前端轮询据此判断完成/失败；`ai_status` 对 120 秒未被消费的请求报 stale
+   （WAF 服务未运行场景），不会无限转圈。
+
+### 验证
+
+- `scratchpad/ai_async_parallel_test.py`（临时脚本，不入库）**19 项断言全过**：
+  320 条 4 批并发（峰值并发 3、耗时 < 串行理论值）、拆分止步 5 条、状态机
+  （running → 清空 / last_ok 成功失败两态）、loop_forever 消费请求、review 互斥；
+- `scratchpad/verify_plugin_ai_async.py`（临时脚本，不入库）**21 项断言全过**：
+  未配置拒绝、提交立即返回、pending/running/finished/stale 四态、回显字段；
+- 既有回归全通过：`ai_truncation_fix_test.py`、`ai_bulk_e2e_test.py`、
+  `ai_review_test.py`、`ai_http_e2e_test.py`、`verify_plugin_policy.py`、
+  `verify_config_save.py`、`verify_regression.py`；
+- `python -m py_compile app/*.py frpwaf_main.py`、`node scratchpad/check_html_js.cjs` 通过。
+
+---
+
 ## 附：历史遗留的其它修复（早期版本，非本轮）
 
 这些在更早的提交中已修复，一并记录：
@@ -382,3 +594,6 @@ frp 管理页点击「一键放行端口」，无论 frps 配置里有多少端�
 | F | `frp.py` | 第三方依赖（环境缺失即崩） | 高（frp 配置管理整体不可用） |
 | G | `ai.py` | 处置分级缺失（确凿未永久） | 中（持续攻击到期即恢复） |
 | H | `frpwaf_main.py` | 调用不存在的面板 API + 异常静默 | 中（功能恒失败且无提示） |
+| I | `daemon.py` | 客户端断连异常默认打完整堆栈（stderr 并入日志） | 低（日志噪声，干扰排查） |
+| K | `ai.py` / `index.html` | max_tokens 写死致大批量输出截断、整轮作废 | 高（大批量审查不可用） |
+| L | `frpwaf_main.py` / `index.html` / `ai.py` | 立即审查同步执行致按钮卡死；拆分到单条致送审碎片化 | 高（按钮不可用 + 审查慢） |

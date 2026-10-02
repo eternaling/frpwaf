@@ -248,8 +248,15 @@ cp /opt/frpwaf/data/frpwaf.db /root/frpwaf.db.bak
 
 - **自动封禁默认关闭**。frp 代理端口（尤其 HTTP/HTTPS vhost）天然有大量并发连接，
   阈值过低会误封正常用户。如需启用，建议阈值 ≥ 200/60s 并结合业务观察。
+  （攻击类型自动封禁——CC / 端口扫描 / 敏感服务爆破——默认**开启**，
+  参数留 0 视为未设置、保存时自动回退默认值，可在设置页按需关闭。）
+- **回调来源限制**：`/frp/handler` 仅接受本机（127.0.0.1/::1）来源，其它来源一律 403；
+  若 frps 与 WAF 分机部署，本机制会拒绝回调，需改回同机部署或调整校验策略。
+- **CC 检测覆盖范围**：frp 对 **http 类型代理不触发 NewUserConn 回调**，
+  CC 自动封禁仅对 https/tcpmux 等类型生效（纯 http 代理请用限速/名单/前置代理防护）。
 - 管理面板监听 `0.0.0.0:7080`，**请确保云安全组仅对你的 IP 开放该端口**，
   或改用强密码，避免面板暴露在公网。
 - 修改 `frps.toml` 中的 `httpPlugins` 后需重启 frps（会瞬断隧道）。
-- 卸载插件（`build.sh` 生成的 `install.sh uninstall`）会移除 init 脚本，
+- 卸载插件（`bash install.sh uninstall` 或直接运行 `uninstall.sh`；无参数运行
+  `install.sh` 仅提示用法、不执行卸载）会移除 init 脚本，
   但**保留** `/opt/frpwaf/data` 数据；彻底删除需手动 `rm -rf /opt/frpwaf`。

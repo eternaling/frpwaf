@@ -10,13 +10,24 @@
 | `suspicious` + SSH 相关 | **永久黑名单**（从严，可关） | `ip_list`（black） | 永久 |
 | `benign` / 白名单命中 / 已处置 | 仅记录 | —— | —— |
 
+黑名单开关关闭时，原本需要永久黑名单的判定降级为临时封禁；不释放已有临时封禁，
+避免记录了永久名单却没有应用层拦截。
+
 仅用标准库 `urllib`，无第三方依赖。
 
 ## 1. 触发方式
 
-- **后台自动**：`ai.loop_forever()` 线程每 20 秒醒一次，若 `ai_enabled` 且距上次
-  运行超过 `ai_interval`（默认 300 秒，最短 60），执行一次 `review()`。
-- **手动立即**：面板「立即审查」（`ai.review(force=True)`，忽略 `ai_enabled`）。
+- **后台自动**：`ai.loop_forever()` 线程每 20 秒醒一次（有待处理请求时 2 秒），
+  若 `ai_enabled` 且距上次运行超过 `ai_interval`（默认 300 秒，最短 60），
+  执行一次 `review()`。
+- **手动立即（异步）**：面板「立即审查」按钮走插件端 `ai_run_now`——只写
+  `ai_run_requested` 时间戳并**立即返回**（面板进程不执行审查，避免大批量
+  送审耗时超过插件请求超时、按钮一直停在「审查中…」）；daemon 的
+  `loop_forever` 快速轮询消费该请求并执行 `review(force=True)`，
+  前端用 `ai_status` 轮询进度（`running` / `stale` / `last_result`）。
+- **互斥**：`review()` 全程持 `_review_lock`，自动循环与手动触发并发到达时
+  只跑一轮（其余返回「已有审查在进行中」）；每轮开始/结束写
+  `ai_review_state`（running/清空）与 `ai_last_ok`，前端据此判断完成与成败。
 
 ## 2. 采集（`_collect`）
 
@@ -45,7 +56,7 @@ ORDER BY conns DESC LIMIT ?
 POST {base}/v1/chat/completions
 Authorization: Bearer <key>
 {"model":..., "messages":[{"role":"system",...},{"role":"user",...}],
- "temperature":0.1, "max_tokens":1500}
+ "temperature":0.1, "max_tokens":<动态>}
 ```
 
 ### 3.2 `anthropic`
@@ -54,7 +65,7 @@ Authorization: Bearer <key>
 POST {base}/v1/messages
 x-api-key: <key>
 anthropic-version: 2023-06-01
-{"model":..., "max_tokens":1500, "temperature":0.1, "system":..., "messages":[...]}
+{"model":..., "max_tokens":<动态>, "temperature":0.1, "system":..., "messages":[...]}
 ```
 
 ### 3.3 地址智能拼接（`_endpoint`）
@@ -68,16 +79,43 @@ anthropic-version: 2023-06-01
 | `http://host/v1/` | `http://host/v1/chat/completions` |
 | `http://host/v1/chat/completions` | 原样返回 |
 
-### 3.4 重试策略
+### 3.4 分批送审、并行与动态 max_tokens（大批量关键）
+
+送审量超过 **100 条/批**（`_BATCH_SIZE`）时自动分批调用，每批独立计算
+`max_tokens = min(16384, max(1024, 条数×120 + 512))`（`_max_tokens_for`）。
+批次**并行送审**（`_MAX_WORKERS = 3`，波内并行、波间串行）——「一批 IP
+一起送审、一起拿回」，总耗时约为串行的 1/N；每波内的批次相互独立，
+单批失败不影响其它批。
+
+**为什么**：历史故障（1000 条一次送审）——`max_tokens` 写死 1500，模型输出
+被截断成非法 JSON，整轮审查作废。分批后单批输出规模可控；条数越多，所需
+输出 token 越多，动态上限随之提高，从根因上消除截断。
+
+**失败降级**（`_call_batch`）：
+
+- 单批解析失败（截断）或网关拒绝 `max_tokens` / 请求体过大（413）→
+  **二分重试**（递归减半，共享拆分预算 16 次）；拆到 `_MIN_SPLIT = 5` 条
+  仍失败即放弃该批，**不再拆到单条**（避免网关日志被碎片小请求刷屏）；
+- 解析成功但缺条目（截断抢救只保住前半段、或模型漏答）→ 只对缺失 IP 补审
+  一次（缺失 ≥2 条时；只缺 1 条不补，代价大于收益）；
+- 鉴权 / 限流等 HTTP 错误二分无意义：记录后于**波边界**提前终止，
+  不把剩余批次全部发出（同一波已发出的无法收回，最多浪费一波）；
+- 全部批次失败才返回 `ok=False`；部分失败时返回已成功判定，
+  **未获判定的 IP 不处置**（安全方向不受影响），摘要标注「N 个未获判定」。
+
+### 3.5 重试策略
 
 - 网络类 / 超时错误：**重试一次**（间隔 2 秒）；
 - HTTP 层错误（4xx/5xx）：**不重试**，直接返回 `HTTP <code> <reason> <detail>`；
-- 超时 `ai_timeout`（默认 120 秒，最短 15）。
+- 超时 `ai_timeout`（默认 120 秒，最短 15，**按批**生效）。
 
-### 3.5 返回解析（`_extract_json`）
+### 3.6 返回解析（`_extract_json`）
 
 容忍 markdown 代码块与多余文字：先剥 ```` ```json ... ``` ````，再取第一个 `[`
-到最后一个 `]`，`json.loads`。解析失败 / 非数组 → 报错并记一条 `error`。
+到最后一个 `]`，`json.loads`。整体解析失败时（多为输出被 `max_tokens` 截断），
+用 `_salvage_json` 按 `{` 起点逐对象 `raw_decode` **抢救**能完整解析的条目；
+抢救条目仍与送审集合求交集后处置，缺失条目不处置（安全方向不受影响），
+并由 `_call_batch` 触发漏答补齐。全失败 → 报错并记一条 `error`。
 
 ## 4. 提示词与输出格式
 
@@ -105,7 +143,7 @@ anthropic-version: 2023-06-01
 2. **只处理本次真正送审过的 IP**（Bug D 修复，见下）；非法 verdict 归为 `unknown`；
 3. 交给 `_apply_action()` 分级处置：
    - `verdict == "malicious"` → **永久黑名单**：`store.add_ip(ip, "black", "ai: <reason>")`，
-     并释放该 IP 的同名临时封禁（升级语义）；
+     并释放该 IP 的同名临时封禁（升级语义）；若黑名单开关关闭，改为临时封禁；
    - `verdict == "suspicious"` 且非 SSH 相关 → **临时封禁**：
      `store.add_ban(ip, "ai: <reason>", ai_ban_seconds)`；
    - `verdict == "suspicious"` 且 SSH 相关（`ai_ssh_strict` 开）→ 永久黑名单
@@ -116,8 +154,12 @@ anthropic-version: 2023-06-01
 4. 写一条 `ai_review` 记录；
 5. 若本轮产生了永久黑名单：立即 `engine.invalidate_cache()` 并触发
    `firewall.sync_from_store()`（内核同步），保证「封完即生效」；
-6. 更新配置 `ai_last_run` / `ai_last_result`
-   （摘要格式：`审查 N 个 IP，永久黑名单 X 个，临时封禁 Y 个`）。
+   若开启了 `fw_sync_enabled`，同一时刻只跑一个同步任务（事件去重，见
+   [05 §4.4](05-内核级封禁.md)），批量处置不会引发同步风暴；
+6. 更新配置 `ai_last_run` / `ai_last_result` / `ai_last_ok`
+   （摘要格式：`审查 N 个 IP，永久黑名单 X 个，临时封禁 Y 个`；
+   走 `config.save(patch)` 合并语义，不覆盖并发写入的其它字段）；
+   本轮状态 `ai_review_state` 在 finally 中清空（任何出口都不会残留「审查中」）。
 
 返回 `{ok, msg, results, checked, banned, temp_banned}`。
 

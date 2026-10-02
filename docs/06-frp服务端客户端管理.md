@@ -44,17 +44,22 @@
 `job_status()` 带**心跳判断**：`running=true` 但 `ts` 超过 90 秒未更新
 （面板重启导致线程消失）→ 判定为「安装任务已中断」，避免前端一直转圈。
 
-> 注意：`frp.install()`（同步版）已属**死代码**，实际走 `start_install` / `_install_worker`。
+> 注意：早期版本的同步安装函数 `frp.install()` 属死代码，已在全项目审查批次中删除；
+> 安装实际走 `start_install` / `_install_worker`。
 
 ### 3.2 安装流程（`_install_worker`）
 
 1. 解析版本：空或 `latest` → `latest_version()`（GitHub API，10 分钟缓存）；
-   失败兜底 `0.71.0`。
+   失败兜底 `0.71.0`。**版本号白名单校验**（`^\d+\.\d+\.\d+$`，`valid_version()`）——
+   不合法直接拒绝，防止用户输入携带路径分隔符进入 URL / 临时文件路径。
 2. 已是目标版本且二进制存在 → 仅补 `init`（如缺），直接完成。
 3. 若已有安装 → `_backup(kind)` 备份整个目录。
 4. **下载**：`_download()` 依次尝试镜像 `gh-proxy.com` → `ghfast.top` → GitHub 直连，
    用 `curl -fL` 流式下载，带 `--speed-limit 20480 --speed-time 20` 断速保护；
    文件 >100KB 才算成功。进度按 `5 + size/13.9MB*75` 上报（封顶 80%）。
+   下载完成后按 GitHub Release API 提供的 **sha256 digest** 校验完整性
+   （对全部镜像生效；旧版本/接口不可达拿不到 digest 时跳过校验但写日志留痕），
+   校验失败的镜像结果会被删除并尝试下一个镜像。
 5. **解压**：`_extract_binaries()` 解出 `frps`/`frpc` 二进制。
    - **关键**：目标二进制可能正在运行，直接覆盖会 `ETXTBSY`（Text file busy）。
      故先复制到同目录 `*.new.<pid>`，`os.replace()` **原子改名**顶替

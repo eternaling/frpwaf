@@ -3,8 +3,8 @@
 本目录是 **FRP WAF**（宝塔面板插件 + 独立管理面板）的完整项目文档。
 内容涵盖项目全貌、架构、工作原理、数据结构、API、运维，以及**历次功能 Bug 的排查与修复记录**。
 
-> 当前版本：**1.3.10**（`app/__init__.py` 与 `info.json` 一致）
-> 文档更新时间：2026-09-30
+> 当前版本：**1.3.11**（`app/__init__.py` 与 `info.json` 一致）
+> 文档更新时间：2026-10-02
 
 ---
 
@@ -47,6 +47,7 @@ FRP WAF 通过 frp 的 `httpPlugins` 钩子（`NewUserConn`）对**访问 frps �
 | IP 黑/白名单 | 支持单 IP 与 CIDR，白名单优先，黑白可同 CIDR 共存 | 03 / 04 |
 | 手动封禁 / 解封 | 永久黑名单 与 临时封禁（带到期时间，自动解除） | 04 / 07 |
 | 自动封禁 | 按窗口内连接次数阈值自动封禁（默认关闭，防误封） | 03 |
+| 攻击类型自动封禁 | CC / 端口扫描 / 敏感服务爆破三类独立开关（默认开启，CC·扫描临时封禁、爆破永久黑名单） | 03 / 04 |
 | 单 IP 限速 | 每秒新连接数上限（默认关闭） | 03 |
 | 连接审计日志 | 记录每次连接的 IP/端口/代理/动作/原因，含归属地 | 04 / 07 |
 | 内核级封禁 | 同步到 ipset + iptables，内核层丢包（白名单差集） | 05 |
@@ -87,7 +88,7 @@ FRP WAF 通过 frp 的 `httpPlugins` 钩子（`NewUserConn`）对**访问 frps �
 | 管理面板 | `http://<服务器IP>:7080/`（默认 `admin` / `123456`） |
 | frp 回调地址 | `http://127.0.0.1:7080/frp/handler` |
 | 内核集合 | ipset `frpwaf_block` / `frpwaf_block6`；iptables 链 `FRPWAF_BLOCK` |
-| 代码规模 | `app/*.py` + `frpwaf_main.py` + 两个 `index.html` 合计约 **6200 行** |
+| 代码规模 | `app/*.py` + `frpwaf_main.py` + 两个 `index.html` 合计约 **8000 行** |
 
 ---
 
@@ -101,3 +102,4 @@ FRP WAF 通过 frp 的 `httpPlugins` 钩子（`NewUserConn`）对**访问 frps �
 | 2026-09-29 | 三次复核：02 修正 `install.sh` 默认动作为**卸载**、补 `.gitignore`；04 修正 `cookie_secure`（不在 DEFAULTS）；05/11/14 统一「内核封禁」为插件端「IP 名单/封禁」页内**卡片**而非独立页；06 补 `frp_release_ports` 仅 frps、`frp_save_raw` 校验失败不回滚；07 补插件端菜单各页明细；09 补 `get_waf_info` 回显密码；01 补依赖与无 `requirements.txt` |
 | 2026-09-29 | **发布 v1.3.8**：随 Bug C/D/E 修复与 `docs/` 文档一起提交并打 Tag `v1.3.8` |
 | 2026-09-30 | 索引补全：收录 `agent-migration.md`（智能体体系迁移报告）与 `tasks/`、`tests/` 规范入口 |
+| 2026-10-01 | **全项目审查修复批次（Bug J）**：03 修正 CC 文案（http 不触发回调）并补回调来源校验；04 补 `idx_ban_log_active`/`idx_conn_log_ip_ts` 索引与 `trim_bans` 裁剪；09 密码回显改掩码、补配置并发保护与 500 收敛；02 修正 `install.sh` 参数显式分派；12 新增 Bug J 记录；README 修正卸载命令与 CC/回调限制提示；行数更新为约 8000 行 |

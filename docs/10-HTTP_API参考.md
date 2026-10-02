@@ -19,7 +19,7 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/overview` | 统计 + 运行信息（version/uptime/各开关/admin_user/geo_available） |
+| GET | `/api/overview` | 统计 + 运行信息（version/uptime/各开关/admin_user/geo_available/engine_errors/frp_remote_denied） |
 | GET | `/api/version` | `{code:0, version}` |
 
 ### 3. 配置
@@ -31,11 +31,25 @@
 
 POST 允许的键（类型校验）：
 `blacklist_enabled, whitelist_enabled, auto_ban_enabled, auto_ban_window,
-auto_ban_threshold, auto_ban_seconds, rate_limit_enabled, rate_limit_per_sec,
+auto_ban_threshold, auto_ban_seconds,
+auto_ban_cc_enabled, auto_ban_cc_window, auto_ban_cc_threshold, auto_ban_cc_seconds,
+auto_ban_scan_enabled, auto_ban_scan_window, auto_ban_scan_threshold, auto_ban_scan_seconds,
+auto_ban_ssh_enabled, auto_ban_ssh_window, auto_ban_ssh_threshold,
+rate_limit_enabled, rate_limit_per_sec,
+burst_window, proxy_cool_enabled, proxy_cool_min_conns, proxy_cool_uniq_threshold,
+proxy_cool_single_pct, proxy_cool_seconds,
 log_max_rows, fw_sync_enabled, ai_enabled, ai_protocol, ai_base_url, ai_api_key,
 ai_model, ai_interval, ai_window, ai_min_conns, ai_max_ips, ai_auto_ban,
 ai_ban_seconds, ai_suspicious_ban, ai_ssh_strict, ai_ssh_permanent_suspicious,
 ai_timeout`。
+
+> 窗口类参数保存时强制 ≥1：`auto_ban_window`、`auto_ban_cc_window`、
+> `auto_ban_scan_window`、`auto_ban_ssh_window`。
+> 突发观测/冷却：`burst_window` ≥2、`proxy_cool_seconds` ≥10（与运行时一致）、
+> `proxy_cool_single_pct` ≤100。
+> 防呆回退：开关开启时参数为「未设置形态」（阈值/时长 0、窗口 ≤1 秒）会在
+> 加载/保存时自动回退 DEFAULTS 默认值（见 [04 §3.4.1](04-数据模型与配置项.md)），
+> 保证设置页无需手填参数；停用请关闭对应开关而不是把阈值填 0。
 
 > 注意：`http_addr`/`http_port`/`web_enabled`/`admin_*` **不**经此接口改（用宝塔插件端）。
 
@@ -49,7 +63,7 @@ ai_timeout`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/iplist?type=black\|white` | 名单列表（附归属地） |
+| GET | `/api/iplist?type=black\|white&limit=N` | 名单列表（附归属地）。返回条数上限 `PANEL_LIST_CAP=5000`，`limit` 缺省或非法时取上限（防大名单全量拉取） |
 | POST | `/api/iplist` | `{action:"add", cidr, list_type, remark}` |
 | POST | `/api/iplist` | `{action:"del", id}` |
 | POST | `/api/iplist` | `{action:"batch", text, list_type}`（每行 `cidr[,备注]`，`#` 注释） |
@@ -61,6 +75,8 @@ ai_timeout`。
 | GET | `/api/logs?limit&offset&ip&action&proxy` | 日志 + `total`（limit ≤1000） |
 | POST | `/api/logs` | `{action:"purge"}` 清空 |
 | GET | `/api/logs/proxies` | 日志中出现过的代理名 |
+| GET | `/api/logs/summary?window` | 按代理聚合（window 钳制 60~86400，默认 3600）：`conns/uniq_ips/single_ips/single_pct/rejected/last_ts/proxy_type` |
+| GET | `/api/burst` | 突发观测快照（代理级指标 + 定性 `level` + `cool_remain`）与冷却阈值配置 `config`；插件端 `burst_status` 经守护进程每 10s 落盘的 `data/burst_snapshot.json` 读取（附 `ts`/`stale`） |
 
 ### 7. 封禁
 
@@ -95,9 +111,13 @@ ai_timeout`。
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/ai/review` | 最近 200 条审查记录（含 `verdict` / `action` / `reason`） |
-| POST | `/api/ai/review` | 立即审查（force）；返回 `{ok,msg,results,checked,banned,temp_banned}` |
+| POST | `/api/ai/review` | 立即审查（force，**同步执行**）；返回 `{ok,msg,results,checked,banned,temp_banned}` |
 | GET | `/api/ai/results` | 同 `/api/ai/review` GET |
 | POST | `/api/ai/test` | 测试连接（可用表单覆盖 base/key/model/protocol） |
+
+> `POST /api/ai/review` 在 daemon 进程内同步执行审查（与插件端 `ai_run_now`
+> 的异步触发不同）；大批量送审可能耗时较长，独立 Web 端目前未提供入口，
+> 日常请从宝塔插件端操作（见 [07](07-管理面板与插件功能.md)）。
 
 > **后端存在、但独立 Web 端无 UI 的接口**：`/api/kernban`、`/api/kernban/sync`、
 > `/api/ai/*`（以上接口可用 curl 直接调用，但 `web/index.html` 未提供入口，
@@ -149,6 +169,7 @@ ai_timeout`。
 ### 日志 / 统计 / 归属
 
 `conn_logs(limit,offset,ip,log_action,log_proxy)`、`log_proxy_list`、
+`logs_summary(window)`、`burst_status`、
 `purge_conn_logs`、`proxy_stats`、`geo_query(ip)`、`geo_top(limit)`、
 `geo_db_info`、`get_log(lines)`、`clear_log`。
 
@@ -157,9 +178,14 @@ ai_timeout`。
 `waf_overview`、`get_policy`、`save_policy`、`kernban_status`、`kernban_sync`、
 `get_admin`、`change_admin_pwd(old,new,new_user,old_user)`。
 
+> `get_policy` / `save_policy` 的布尔键含 `auto_ban_cc_enabled` / `auto_ban_scan_enabled` /
+> `auto_ban_ssh_enabled` / `proxy_cool_enabled`，整型键含三组窗口/阈值/时长参数与
+> 突发观测/冷却参数（见 [04 §3.4.1 / §3.5.1](04-数据模型与配置项.md)）。
+
 ### AI
 
-`ai_get_config`、`ai_save_config(...)`、`ai_test(...)`、`ai_run_now`、`ai_results`。
+`ai_get_config`、`ai_save_config(...)`、`ai_test(...)`、`ai_run_now`（异步提交，
+只写 `ai_run_requested` 并立即返回）、`ai_status`（轮询进度）、`ai_results`。
 
 ---
 
@@ -180,14 +206,23 @@ ai_timeout`。
   "black_count":4,"white_count":0,"active_bans":1,
   "version":"1.3.9","uptime":3600,"http_addr":"0.0.0.0","http_port":7080,
   "blacklist_enabled":true,"whitelist_enabled":false,"auto_ban_enabled":false,
-  "rate_limit_enabled":false,"admin_user":"admin","geo_available":true}}
+  "rate_limit_enabled":false,"admin_user":"admin","geo_available":true,
+  "auto_ban_cc_enabled":true,"auto_ban_scan_enabled":true,"auto_ban_ssh_enabled":true,
+  "proxy_cool_enabled":false,
+  "engine_errors":0,"frp_remote_denied":0}}
 
 // GET /api/config（机密已过滤/掩码）
 {"code":0,"data":{
   "blacklist_enabled":true,"whitelist_enabled":false,"fw_sync_enabled":true,
   "auto_ban_enabled":false,"auto_ban_window":60,"auto_ban_threshold":200,
-  "auto_ban_seconds":600,"rate_limit_enabled":false,"rate_limit_per_sec":0,
-  "log_max_rows":50000,"ai_enabled":false,"ai_protocol":"openai",
+  "auto_ban_seconds":600,
+  "auto_ban_cc_enabled":true,"auto_ban_cc_window":60,"auto_ban_cc_threshold":300,"auto_ban_cc_seconds":600,
+  "auto_ban_scan_enabled":true,"auto_ban_scan_window":60,"auto_ban_scan_threshold":20,"auto_ban_scan_seconds":600,
+  "auto_ban_ssh_enabled":true,"auto_ban_ssh_window":60,"auto_ban_ssh_threshold":20,
+  "rate_limit_enabled":false,"rate_limit_per_sec":0,
+  "burst_window":60,"proxy_cool_enabled":false,"proxy_cool_min_conns":300,
+  "proxy_cool_uniq_threshold":200,"proxy_cool_single_pct":80,"proxy_cool_seconds":60,
+  "log_max_rows":200000,"ai_enabled":false,"ai_protocol":"openai",
   "ai_base_url":"","ai_api_key":"","ai_model":"claude-haiku-4.5",
   "ai_auto_ban":true,"ai_ban_seconds":1800,"ai_suspicious_ban":true,
   "ai_ssh_strict":true,"ai_ssh_permanent_suspicious":true,"ai_timeout":120, /* … */}}
@@ -209,7 +244,7 @@ ai_timeout`。
 
 // 错误
 {"code":404,"msg":"接口不存在"}
-{"code":500,"msg":"服务器内部错误","detail":"…traceback…"}
+{"code":500,"msg":"服务器内部错误"}   // 不回显 detail（仅写入运行日志）
 
 // POST /frp/handler
 {"reject":false,"unchange":true}
