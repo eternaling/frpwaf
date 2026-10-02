@@ -14,6 +14,7 @@
 
 仅标准库；外部命令 curl/wget/tar/ss。
 """
+import hashlib
 import json
 import os
 import platform
@@ -37,6 +38,7 @@ BACKUP_DIR = os.path.join(config.DATA_DIR, "frp_backup")
 
 GH_RELEASE = "https://github.com/fatedier/frp/releases/download/v{ver}/frp_{ver}_linux_{arch}.tar.gz"
 GH_API_LATEST = "https://api.github.com/repos/fatedier/frp/releases/latest"
+GH_API_TAG = "https://api.github.com/repos/fatedier/frp/releases/tags/v{ver}"
 # 下载源前缀（按速度排序，留空=GitHub 直连，放最后兜底）
 # 说明：GitHub 直连在国内多数服务器上极慢或不可达，优先使用加速镜像。
 MIRRORS = [
@@ -102,7 +104,17 @@ def installed_version(kind):
     return m.group(1) if m else text
 
 
+# 版本号白名单：仅允许 x.y.z 形式进入 URL 与临时文件路径，
+# 防止用户输入的 version 携带路径分隔符等字符（拼 URL / 临时路径的理论穿越）。
+_VER_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def valid_version(ver):
+    return bool(_VER_RE.match(ver or ""))
+
+
 _latest_cache = {"ver": "", "ts": 0}
+_latest_digests = {}   # ver -> {asset_name: "sha256:..."}（GitHub release digest 字段）
 
 
 def latest_version(timeout=15, use_cache=True):
@@ -125,8 +137,47 @@ def latest_version(timeout=15, use_cache=True):
 
 
 # ---------------- 安装 / 升级 ----------------
-def _download(ver, arch_name, dest, progress=None):
-    """下载 frp 发布包到 dest（流式，可上报进度），成功返回 True。"""
+def _sha256_file(path):
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
+def fetch_digest(ver, arch_name, timeout=15):
+    """从 GitHub Release API 获取指定版本资产的 sha256 digest。
+
+    返回 "sha256:..." 或 ""（查询失败/旧版本无 digest 字段）。
+    GitHub 自 2025 起在 release assets 上提供 digest 字段，用于下载完整性校验。
+    """
+    ver = (ver or "").strip().lstrip("v")
+    if not valid_version(ver):
+        return ""
+    try:
+        req = urllib.request.Request(
+            GH_API_TAG.format(ver=ver), headers={"User-Agent": "frpwaf/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        name = "frp_%s_linux_%s.tar.gz" % (ver, arch_name)
+        for asset in data.get("assets", []) or []:
+            if asset.get("name") == name:
+                return str(asset.get("digest") or "")
+        return ""
+    except Exception:
+        return ""
+
+
+def _download(ver, arch_name, dest, progress=None, expect_digest=""):
+    """下载 frp 发布包到 dest（流式，可上报进度），成功返回 True。
+
+    下载完成后做 sha256 校验（expect_digest 形如 "sha256:..."）；
+    镜像源与 GitHub 直连内容一致，校验对全部镜像生效。
+    拿不到官方 digest 时跳过校验并在 stderr 日志（不阻塞安装）。
+    """
     for m in MIRRORS:
         url = (m + GH_RELEASE.format(ver=ver, arch=arch_name)) if m else GH_RELEASE.format(ver=ver, arch=arch_name)
         try:
@@ -148,6 +199,15 @@ def _download(ver, arch_name, dest, progress=None):
                 last = sz
             time.sleep(0.5)
         if p.returncode == 0 and os.path.exists(dest) and os.path.getsize(dest) > 100000:
+            if expect_digest:
+                actual = _sha256_file(dest)
+                want = expect_digest.split(":", 1)[-1].strip().lower()
+                if actual and actual != want:
+                    try:
+                        os.remove(dest)
+                    except OSError:
+                        pass
+                    continue  # 校验失败：换下一个镜像重试
             return True
         try:
             if os.path.exists(dest):
@@ -239,6 +299,10 @@ def _install_worker(kind, version):
         ver = (version or "").strip().lstrip("v")
         if not ver or ver == "latest":
             ver = latest_version() or "0.71.0"
+        if not valid_version(ver):
+            _job_write(running=False, percent=0, msg="版本号格式无效（应形如 0.71.0）",
+                       done=True, ok=False, kind=kind)
+            return
         a = arch()
         cur = installed_version(kind)
         have = os.path.exists(_bin(kind))
@@ -263,10 +327,16 @@ def _install_worker(kind, version):
 
         _job_write(running=True, percent=5, msg="下载中…", done=False, ok=False, kind=kind)
         tmp_tar = os.path.join(tempfile.gettempdir(), "frp_%s_%s.tar.gz" % (ver, a))
-        if not _download(ver, a, tmp_tar, progress=_prog):
+        expect = fetch_digest(ver, a)
+        if not _download(ver, a, tmp_tar, progress=_prog, expect_digest=expect):
             _job_write(running=False, percent=0, msg="下载失败（请检查网络/镜像）",
                        done=True, ok=False, kind=kind)
             return
+        if not expect:
+            # 官方未提供 digest（旧版本/接口不可达）：跳过校验但留痕
+            _job_write(running=True, percent=82,
+                       msg="下载完成（官方未提供校验值，已跳过哈希校验）",
+                       done=False, ok=False, kind=kind)
 
         _job_write(running=True, percent=85, msg="解压并安装…", done=False, ok=False, kind=kind)
         was_running = is_running(kind)
@@ -541,59 +611,6 @@ def _install_init(kind):
     _enable_autostart(kind)
 
 
-def install(kind, version="", keep_config=True):
-    """安装/升级。返回 (ok, msg)。"""
-    if kind not in ("frps", "frpc"):
-        return False, "参数错误"
-    ver = (version or "").strip().lstrip("v")
-    if not ver or ver == "latest":
-        ver = latest_version() or "0.71.0"
-    a = arch()
-
-    cur = installed_version(kind)
-    have = os.path.exists(_bin(kind))
-    if have and cur == ver:
-        # 已是指定版本：仅在缺失时补齐 init / 配置，不覆盖现有文件
-        if not os.path.exists(_init_path(kind)):
-            _install_init(kind)
-        if not os.path.exists(_toml_path(kind)):
-            with open(_toml_path(kind), "w", encoding="utf-8") as f:
-                f.write(generate_config(kind))
-        return True, "%s 已是 %s，无需升级" % (kind, ver)
-
-    # 备份现有
-    if have:
-        _backup(kind)
-
-    tmp_tar = os.path.join(tempfile.gettempdir(), "frp_%s_%s_%s.tar.gz" % (ver, a, kind))
-    if not _download(ver, a, tmp_tar):
-        return False, "下载失败（请检查网络/镜像）：%s" % GH_RELEASE.format(ver=ver, arch=a)
-
-    ok, err = _extract_binaries(tmp_tar, kind, _dir(kind))
-    try:
-        os.remove(tmp_tar)
-    except OSError:
-        pass
-    if not ok:
-        return False, "解压失败：%s" % err
-
-    # 首次安装：若无配置文件则生成
-    if not os.path.exists(_toml_path(kind)):
-        if kind == "frps":
-            with open(_toml_path(kind), "w", encoding="utf-8") as f:
-                f.write(generate_config("frps"))
-        else:
-            # frpc 需要服务端地址，交给用户填写
-            with open(_toml_path(kind), "w", encoding="utf-8") as f:
-                f.write(generate_config("frpc"))
-
-    _install_init(kind)
-    new_ver = installed_version(kind)
-    if not new_ver:
-        return False, "安装后无法执行二进制，请检查系统架构(%s)" % a
-    return True, "%s 已安装：%s" % (kind, new_ver)
-
-
 def uninstall(kind):
     _run(["%s" % _init_path(kind), "stop"], shell=False)
     if "centos" in _os_name():
@@ -756,6 +773,8 @@ def control(kind, action):
     if action not in ("start", "stop", "restart"):
         return False, "参数错误"
     rc, out, err = _run([_init_path(kind), action], timeout=30)
+    if rc != 0:
+        return False, (err or out or "服务操作失败").strip()[:200]
     if err.strip():
         return False, err.strip()
     low = (out or "").lower()

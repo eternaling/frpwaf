@@ -63,39 +63,32 @@ Install_frpwaf()
 Uninstall_frpwaf()
 {
     checkos
-    ${INIT} stop >/dev/null 2>&1
-    # 移除内核级封禁（ipset + iptables）
-    if command -v iptables >/dev/null 2>&1; then
-        iptables -D INPUT -j FRPWAF_BLOCK 2>/dev/null
-        iptables -F FRPWAF_BLOCK 2>/dev/null
-        iptables -X FRPWAF_BLOCK 2>/dev/null
+    # 唯一卸载入口负责先解除 frps 回调；失败时不得停 WAF 或删除插件。
+    if ! bash "${PLUGIN_DIR}/uninstall.sh"; then
+        echo '卸载中止：frps 回调尚未安全解除，WAF 保持运行。'
+        return 1
     fi
-    if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -D INPUT -j FRPWAF_BLOCK 2>/dev/null
-        ip6tables -F FRPWAF_BLOCK 2>/dev/null
-        ip6tables -X FRPWAF_BLOCK 2>/dev/null
-    fi
-    if command -v ipset >/dev/null 2>&1; then
-        ipset destroy frpwaf_block 2>/dev/null
-        ipset destroy frpwaf_block6 2>/dev/null
-    fi
-    # 移除 frps.toml 中的 frpwaf 插件配置并重启 frps（避免 fail-closed 残留）
-    if [ -f /usr/local/frps/frps.toml ] && grep -q "frpwaf" /usr/local/frps/frps.toml; then
-        ${PLUGIN_DIR}/uninstall.sh >/dev/null 2>&1 || true
-    fi
-    if [ "${OS}" == "CentOS" ]; then
-        chkconfig --del frpwaf
-    else
-        update-rc.d -f frpwaf remove >/dev/null 2>&1
-    fi
-    rm -f ${INIT} /usr/bin/frpwaf
-    rm -rf ${PLUGIN_DIR}
+    rm -rf "${PLUGIN_DIR}"
     # 运行数据保留在 /opt/frpwaf，如需彻底删除请手动执行: rm -rf /opt/frpwaf
     echo '卸载完成（运行数据保留在 /opt/frpwaf）'
 }
 
-if [ "${1}" == 'install' ]; then
-    Install_frpwaf
-else
-    Uninstall_frpwaf
-fi
+usage()
+{
+    echo "用法: $0 install    安装 / 更新 frpwaf"
+    echo "      $0 uninstall  卸载 frpwaf"
+    echo "无参数时不执行任何操作（避免误卸载）。"
+}
+
+case "${1}" in
+    install)
+        Install_frpwaf
+        ;;
+    uninstall)
+        Uninstall_frpwaf
+        ;;
+    *)
+        usage
+        exit 1
+        ;;
+esac

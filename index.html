@@ -15,13 +15,30 @@
       border-left:3px solid #2d8cf0;padding-left:17px}
   .fw-wrap{font-size:13px;color:#333}
   .fw-wrap h2{margin:0;font-size:17px;display:flex;align-items:center;gap:10px}
-  .fw-badge{padding:3px 10px;border-radius:20px;font-size:12px;font-weight:600}
+  .fw-badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:12px;
+    font-weight:600;white-space:nowrap;line-height:1.5;vertical-align:middle}
   .fw-badge.on{background:#e7f7ec;color:#1a9c48}
   .fw-badge.off{background:#fdeaea;color:#d33}
-  .fw-tag{padding:2px 8px;border-radius:4px;font-size:11px}
-  .fw-tag.ok{background:#e7f7ec;color:#1a9c48}
-  .fw-tag.no{background:#fdeaea;color:#d33}
-  .fw-tag.gray{background:#f0f0f0;color:#999}
+  /* 标签：胶囊形 + 描边，禁止换行（否则窄列会把「黑名单」「已解封」拆成两行） */
+  .fw-tag{display:inline-block;padding:2px 9px;border-radius:20px;font-size:11px;
+    font-weight:600;line-height:1.55;white-space:nowrap;vertical-align:middle;border:1px solid transparent}
+  .fw-tag.ok{background:#e7f7ec;color:#1a9c48;border-color:#c9ecd6}
+  .fw-tag.no{background:#fdeaea;color:#d33;border-color:#f8cfcf}
+  .fw-tag.gray{background:#f4f5f7;color:#8c8c8c;border-color:#e6e8eb}
+  .fw-tag.warn{background:#fff7e6;color:#d48806;border-color:#ffe3b0}
+  .fw-tag.info{background:#e9f3ff;color:#1677d2;border-color:#cfe4ff}
+  .fw-table td.c,.fw-table th.c{text-align:center}
+  .fw-table td.nw,.fw-table th.nw{white-space:nowrap}
+  .fw-table td.nw{padding-left:9px;padding-right:9px}
+  .fw-table td.mono{font-family:Menlo,Consolas,monospace;font-size:12px}
+  .fw-table td.dim{color:#8c8c8c}
+  /* 归属地不允许被长备注挤压换行 */
+  .fw-table td.geo{white-space:nowrap}
+  /* 长备注最多两行，超出省略；悬停 title 查看全文（避免撑高行、挤扁相邻列）
+     注意：auto 表格布局下 td 的 max-width 不可靠，约束必须加在内部块级元素上 */
+  .fw-table td.remark{color:#737373}
+  .fw-table td.remark .clamp{max-width:420px;display:-webkit-box;-webkit-line-clamp:2;
+    -webkit-box-orient:vertical;overflow:hidden;line-height:1.55;max-height:3.1em;word-break:break-word}
   .fw-card{background:#fff;border:1px solid #e8eaed;border-radius:8px;padding:16px 18px;
     box-shadow:0 1px 2px rgba(16,24,40,.03)}
   .fw-card h3{margin:0 0 12px;font-size:14px;color:#1f2937}
@@ -109,8 +126,7 @@
                 <button class="btn btn-default btn-sm" onclick="fwInstall()">安装 / 更新网页端</button>
                 <button class="btn btn-danger btn-sm" onclick="fwUninstall()">卸载</button>
               </div>
-              <div class="fw-tip">管理面板：<a id="fwUrl" href="#" target="_blank"></a>（账号 <code id="fwCredUser">admin</code>，密码 <code id="fwCredPwd">••••••</code>
-                <span class="fw-eye" id="fwCredEye" title="显示 / 隐藏密码" onclick="fwToggleCred()">👁</span>）</div>
+              <div class="fw-tip">管理面板：<a id="fwUrl" href="#" target="_blank"></a>（账号 <code id="fwCredUser">admin</code>，密码 <code id="fwCredPwd">••••••</code>，不回显；如需修改请到「设置」页）</div>
             </div>
             <div class="fw-card">
               <h3>网页端（WAF 管理面板）<span id="fwWebBadge" class="fw-badge off">检测中…</span></h3>
@@ -176,7 +192,7 @@
             <div class="fw-tip">把黑名单与生效中的封禁同步到 <code>ipset + iptables</code>，被禁 IP 的数据包在<b>内核层直接丢弃</b>，连不到 frps，因此「连接数」不再增长，也节省 frps/CPU 资源。<br>说明：frp 的插件钩子是应用层准入，被拒的连接其 TCP 仍会被内核接受，所以仅靠插件拦截时计数仍会持续上涨——这正是本功能要解决的问题。</div>
           </div>
 
-          <div class="fw-card">
+          <div class="fw-card fw-span-2">
             <h3>名单列表 <span style="color:#999;font-size:12px;font-weight:400" id="fwIpListCount"></span></h3>
             <div class="fw-row" style="margin-bottom:10px">
               <div class="fw-seg" id="fwIpListSeg">
@@ -187,24 +203,24 @@
               <span style="flex:1"></span>
               <button class="btn btn-default btn-sm" onclick="fwLoadIpList()">刷新</button>
             </div>
-            <div class="fw-table-wrap" style="max-height:320px">
-              <table class="fw-table"><thead><tr><th>条目</th><th>类型</th><th>归属地</th><th>备注</th><th>添加时间</th><th style="width:70px">操作</th></tr></thead>
+            <div class="fw-table-wrap" style="max-height:360px">
+              <table class="fw-table"><thead><tr><th style="width:170px">条目</th><th style="width:90px" class="c">类型</th><th style="width:190px">归属地</th><th>备注</th><th style="width:160px">添加时间</th><th style="width:80px" class="c">操作</th></tr></thead>
               <tbody id="fwIpList"><tr><td colspan="6" style="color:#bbb;text-align:center">加载中…</td></tr></tbody></table>
             </div>
           </div>
 
-          <div class="fw-card">
+          <div class="fw-card fw-span-2">
             <h3>临时封禁（生效中） <span style="color:#999;font-size:12px;font-weight:400" id="fwTempCount"></span></h3>
             <div class="fw-table-wrap" style="max-height:320px">
-              <table class="fw-table"><thead><tr><th>IP</th><th>归属地</th><th>原因</th><th>到期时间</th><th style="width:70px">操作</th></tr></thead>
+              <table class="fw-table"><thead><tr><th style="width:170px">IP</th><th style="width:190px">归属地</th><th>原因</th><th style="width:160px">到期时间</th><th style="width:80px" class="c">操作</th></tr></thead>
               <tbody id="fwTempList"><tr><td colspan="5" style="color:#bbb;text-align:center">暂无</td></tr></tbody></table>
             </div>
           </div>
 
           <div class="fw-card fw-span-2">
             <h3>封禁历史 <span style="color:#999;font-size:12px;font-weight:400">最近 100 条</span></h3>
-            <div class="fw-table-wrap" style="max-height:300px">
-              <table class="fw-table"><thead><tr><th>IP</th><th>归属地</th><th>原因</th><th>封禁时间</th><th>到期时间</th><th>状态</th></tr></thead>
+            <div class="fw-table-wrap" style="max-height:320px">
+              <table class="fw-table"><thead><tr><th style="width:170px">IP</th><th style="width:190px">归属地</th><th>原因</th><th style="width:160px">封禁时间</th><th style="width:160px">到期时间</th><th style="width:90px" class="c">状态</th></tr></thead>
               <tbody id="fwBanHis"><tr><td colspan="6" style="color:#bbb;text-align:center">暂无</td></tr></tbody></table>
             </div>
           </div>
@@ -265,7 +281,8 @@
             </div>
             <div class="fw-tip">分级处置：确凿（malicious）→ <b>永久黑名单</b>；疑似（suspicious）→ 临时封禁（时长如上）；SSH 相关疑似按从严设置直接永久；白名单命中的 IP 不自动处置。</div>
             <div class="fw-row" style="margin-top:12px">
-              <button class="btn btn-danger btn-sm" onclick="fwAiRun()">立即审查一次</button>
+              <button class="btn btn-success btn-sm" onclick="fwAiSave()">保存策略</button>
+              <button id="fwAiRunBtn" class="btn btn-danger btn-sm" onclick="fwAiRun()">立即审查一次</button>
               <button class="btn btn-default btn-sm" onclick="fwAiLoadResults()">刷新结果</button>
               <span id="fwAiLast" style="color:#999;font-size:12px"></span>
             </div>
@@ -368,6 +385,7 @@
             <button class="btn btn-default btn-sm" onclick="fwFrpLoadLog()">刷新</button>
           </div>
           <pre id="fwFrpLog" class="fw-fill">加载中…</pre>
+          <div class="fw-tip">日志中若反复出现 <code>do http proxy request ... error: no route found</code>：表示有请求直连 HTTP 代理端口但未匹配任何代理域名（常见于扫描器直连 IP / 探测未配置的域名），frp 已返回 404 拦截，<b>不影响业务</b>。如需减少记录，可在上方「配置修改」把 <code>log.level</code> 调为 <code>error</code>（同时会隐藏其它警告），保存后重启 frps 生效。</div>
         </div>
       </div>
 
@@ -438,8 +456,35 @@
       <!-- 连接日志 -->
       <div class="bt-w-item" data-item="connlog">
         <h2>连接日志 <span style="color:#999;font-size:12px;font-weight:400" id="fwLogTotal"></span></h2>
+
+        <!-- 突发观测（A）：海量不同 IP × 每 IP 仅 1 次的分布式流量按代理聚合，
+             单 IP 维度检测看不到，这里定性（疑似分布式探测/单点高频/正常） -->
+        <div class="fw-card" style="margin-bottom:14px">
+          <div class="fw-row" style="margin-bottom:8px">
+            <h3 style="margin:0">突发观测 <span style="color:#999;font-size:12px;font-weight:400">最近窗口内按代理聚合（实时内存统计）</span></h3>
+            <span style="flex:1"></span>
+            <span id="fwBurstCoolState" class="fw-badge off">冷却未启用</span>
+            <button class="btn btn-default btn-sm" onclick="fwLoadBurst()">刷新</button>
+          </div>
+          <div class="fw-table-wrap" style="max-height:300px">
+            <table class="fw-table"><thead><tr><th>代理</th><th>类型</th><th>连接数</th><th>独立 IP</th><th>仅 1 次占比</th><th>速率(条/秒)</th><th>定性</th><th>冷却剩余</th></tr></thead>
+            <tbody id="fwBurstTable"><tr><td colspan="8" style="color:#bbb;text-align:center">加载中…</td></tr></tbody></table>
+          </div>
+          <div class="fw-tip" id="fwBurstTip">加载中…</div>
+        </div>
+
         <div class="fw-card">
           <div class="fw-row" style="margin-bottom:10px">
+            <select id="fwLogView" class="bt-input-text" style="width:110px" onchange="fwLogSwitchView()">
+              <option value="raw">原始日志</option>
+              <option value="agg">按代理聚合</option>
+            </select>
+            <select id="fwLogWindow" class="bt-input-text" style="width:120px;display:none" onchange="fwLogPage(0)">
+              <option value="3600">最近 1 小时</option>
+              <option value="21600">最近 6 小时</option>
+              <option value="86400">最近 24 小时</option>
+            </select>
+            <span id="fwLogRawFilters" style="display:contents">
             <input id="fwLogIp" class="bt-input-text" placeholder="按 IP 过滤" style="width:180px">
             <select id="fwLogAction" class="bt-input-text" style="width:130px">
               <option value="">全部动作</option>
@@ -449,16 +494,21 @@
             <select id="fwLogProxy" class="bt-input-text" style="width:180px">
               <option value="">全部代理</option>
             </select>
+            </span>
             <button class="btn btn-default btn-sm" onclick="fwLogPage(0)">查询</button>
             <button class="btn btn-default btn-sm" onclick="fwLogReset()">重置</button>
             <span style="flex:1"></span>
             <button class="btn btn-danger btn-sm" onclick="fwPurgeLogs()">清空日志</button>
           </div>
-          <div class="fw-table-wrap" style="max-height:calc(100vh - 320px);min-height:260px">
+          <div class="fw-table-wrap" id="fwLogRawWrap" style="max-height:calc(100vh - 320px);min-height:260px">
             <table class="fw-table"><thead><tr><th>时间</th><th>来源 IP</th><th>归属地</th><th>端口</th><th>代理</th><th>类型</th><th>用户</th><th>动作</th><th>原因</th></tr></thead>
             <tbody id="fwConnLogs"><tr><td colspan="9" style="color:#bbb;text-align:center">加载中…</td></tr></tbody></table>
           </div>
-          <div class="fw-row" style="margin-top:12px">
+          <div class="fw-table-wrap" id="fwLogAggWrap" style="display:none;max-height:calc(100vh - 320px);min-height:260px">
+            <table class="fw-table"><thead><tr><th>代理</th><th>类型</th><th>连接数</th><th>独立 IP</th><th>仅 1 次 IP</th><th>仅 1 次占比</th><th>被拒绝</th><th>最后活动</th></tr></thead>
+            <tbody id="fwConnAgg"><tr><td colspan="8" style="color:#bbb;text-align:center">加载中…</td></tr></tbody></table>
+          </div>
+          <div class="fw-row" style="margin-top:12px" id="fwLogPager">
             <button class="btn btn-default btn-sm" onclick="fwLogPrev()">上一页</button>
             <span style="color:#999;font-size:12px" id="fwLogPageInfo"></span>
             <button class="btn btn-default btn-sm" onclick="fwLogNext()">下一页</button>
@@ -494,7 +544,7 @@
               <label><input type="checkbox" id="s_fw_sync_enabled"> 内核级封禁（ipset+iptables 直接丢包）</label>
               <label><input type="checkbox" id="s_ai_enabled"> 启用 AI 自动审查</label>
             </div>
-            <div class="fw-tip">修改后需点右侧「保存策略」生效；自动封禁默认关闭，请确认阈值合理后再开启。</div>
+            <div class="fw-tip">修改后需点「保存策略」生效。攻击类型封禁（CC/扫描/爆破）默认开启，参数留 0 视为未设置、保存时自动回退默认值；基础自动封禁默认关闭，请确认阈值合理后再开启。</div>
           </div>
           <div class="fw-card">
             <h3>阈值参数</h3>
@@ -509,6 +559,81 @@
               <div><input id="s_rate_limit_per_sec" class="bt-input-text" type="number" style="width:150px"></div>
               <div class="k">日志保留条数</div>
               <div><input id="s_log_max_rows" class="bt-input-text" type="number" style="width:150px"></div>
+            </div>
+            <div class="fw-row" style="margin-top:14px">
+              <button class="btn btn-success btn-sm" onclick="fwSavePolicy()">保存策略</button>
+              <button class="btn btn-default btn-sm" onclick="fwLoadPolicy()">重新加载</button>
+            </div>
+          </div>
+          <div class="fw-card fw-span-2">
+            <h3>攻击类型自动封禁 <span style="color:#999;font-size:12px;font-weight:400">按攻击特征分维度，独立开关，默认全部开启</span></h3>
+            <div class="fw-grid cols-3">
+              <div>
+                <label><input type="checkbox" id="s_auto_ban_cc_enabled"> CC 攻击自动封禁</label>
+                <div class="fw-tip" style="margin-top:6px">同一 IP 在窗口内对 https/tcpmux 代理的高频新建连接（CC 攻击特征）。注意：frp 对 http 类型代理不触发 NewUserConn 回调，该维度对纯 http 代理不生效。</div>
+                <div class="fw-kv" style="grid-template-columns:96px 1fr;margin-top:8px">
+                  <div class="k">窗口（秒）</div>
+                  <div><input id="s_auto_ban_cc_window" class="bt-input-text" type="number" style="width:100px"></div>
+                  <div class="k">连接数阈值</div>
+                  <div><input id="s_auto_ban_cc_threshold" class="bt-input-text" type="number" style="width:100px"></div>
+                  <div class="k">封禁时长（秒）</div>
+                  <div><input id="s_auto_ban_cc_seconds" class="bt-input-text" type="number" style="width:100px"></div>
+                </div>
+                <div class="fw-tip" style="margin-top:6px">处置：<b>临时封禁</b>（到期自动释放）。</div>
+              </div>
+              <div>
+                <label><input type="checkbox" id="s_auto_ban_scan_enabled"> 端口扫描自动封禁</label>
+                <div class="fw-tip" style="margin-top:6px">同一 IP 在窗口内访问大量<b>不同代理</b>（端口扫描特征）。</div>
+                <div class="fw-kv" style="grid-template-columns:96px 1fr;margin-top:8px">
+                  <div class="k">窗口（秒）</div>
+                  <div><input id="s_auto_ban_scan_window" class="bt-input-text" type="number" style="width:100px"></div>
+                  <div class="k">不同代理数</div>
+                  <div><input id="s_auto_ban_scan_threshold" class="bt-input-text" type="number" style="width:100px"></div>
+                  <div class="k">封禁时长（秒）</div>
+                  <div><input id="s_auto_ban_scan_seconds" class="bt-input-text" type="number" style="width:100px"></div>
+                </div>
+                <div class="fw-tip" style="margin-top:6px">处置：<b>临时封禁</b>（到期自动释放）。</div>
+              </div>
+              <div>
+                <label><input type="checkbox" id="s_auto_ban_ssh_enabled"> 敏感服务爆破自动封禁</label>
+                <div class="fw-tip" style="margin-top:6px">同一 IP 高频连接 ssh/mysql/redis/rdp 等敏感服务代理（非 HTTP 类，爆破特征）。</div>
+                <div class="fw-kv" style="grid-template-columns:96px 1fr;margin-top:8px">
+                  <div class="k">窗口（秒）</div>
+                  <div><input id="s_auto_ban_ssh_window" class="bt-input-text" type="number" style="width:100px"></div>
+                  <div class="k">连接数阈值</div>
+                  <div><input id="s_auto_ban_ssh_threshold" class="bt-input-text" type="number" style="width:100px"></div>
+                  <div class="k">处置</div>
+                  <div style="color:#d33;font-weight:600">永久黑名单</div>
+                </div>
+                <div class="fw-tip" style="margin-top:6px">处置：<b>永久黑名单</b>（正常用户不会高频新建此类连接；黑名单开关关闭时自动降级为临时封禁）。</div>
+              </div>
+            </div>
+            <div class="fw-tip">白名单命中的 IP 不受上述自动封禁影响（需已启用白名单开关）；敏感服务检测仅针对非 HTTP 类代理，代理名按分隔符匹配 ssh / mysql / redis / rdp / mongo / postgres / elastic / telnet / smb / vnc / ftp（如 <code>ssh_22</code>、<code>mysql-db</code> 命中，<code>wordpress</code> 这类含子串的普通名不会误判）。</div>
+            <div class="fw-row" style="margin-top:14px">
+              <button class="btn btn-success btn-sm" onclick="fwSavePolicy()">保存策略</button>
+              <button class="btn btn-default btn-sm" onclick="fwLoadPolicy()">重新加载</button>
+            </div>
+          </div>
+          <div class="fw-card fw-span-2">
+            <h3>代理级冷却拦截 <span style="color:#999;font-size:12px;font-weight:400">分布式突发处置，默认关闭</span></h3>
+            <div class="fw-grid cols-2">
+              <div>
+                <label><input type="checkbox" id="s_proxy_cool_enabled"> 启用代理级冷却拦截</label>
+                <div class="fw-tip" style="margin-top:6px">当某代理在窗口内同时满足「连接数 ≥ 下限、独立 IP ≥ 下限、仅 1 次 IP 占比 ≥ 阈值」时进入冷却：<b>冷却期内该代理的新出现 IP 首连被拒</b>（原因 proxy_cool），已见过的 IP 放行。适用于「海量不同 IP × 每 IP 仅 1 次」的分布式爬虫/扫描。</div>
+                <div class="fw-tip" style="margin-top:6px;color:#d33"><b>误伤提示</b>：出口 IP 变化的真实用户（移动网络切换、动态 IP、CDN 回源）可能被拒。建议先观察「突发观测」1-2 天，确认流量性质且可接受偶发误伤后再启用；白名单 IP 不受影响。</div>
+              </div>
+              <div class="fw-kv" style="grid-template-columns:150px 1fr">
+                <div class="k">观测/判定窗口（秒）</div>
+                <div><input id="s_burst_window" class="bt-input-text" type="number" style="width:120px"></div>
+                <div class="k">触发下限：连接数</div>
+                <div><input id="s_proxy_cool_min_conns" class="bt-input-text" type="number" style="width:120px"></div>
+                <div class="k">触发下限：独立 IP 数</div>
+                <div><input id="s_proxy_cool_uniq_threshold" class="bt-input-text" type="number" style="width:120px"></div>
+                <div class="k">仅 1 次占比（%）</div>
+                <div><input id="s_proxy_cool_single_pct" class="bt-input-text" type="number" style="width:120px"></div>
+                <div class="k">冷却时长（秒）</div>
+                <div><input id="s_proxy_cool_seconds" class="bt-input-text" type="number" style="width:120px"></div>
+              </div>
             </div>
             <div class="fw-row" style="margin-top:14px">
               <button class="btn btn-success btn-sm" onclick="fwSavePolicy()">保存策略</button>
@@ -590,7 +715,7 @@ document.querySelectorAll('.fw-main .bt-w-menu p').forEach(function(p){
     if(t==='log'){ fwLoadLog(); }
     if(t==='ban'){ fwLoadBans(); fwLoadIpList(); fwLoadBanHistory(); fwLoadKernBan(); }
     if(t==='ai'){ fwAiLoad(); }
-    if(t==='connlog'){ fwLogLoadProxies(); fwLogPage(0); }
+    if(t==='connlog'){ fwLogLoadProxies(); fwLoadBurst(); fwLogPage(0); }
     if(t==='proxy'){ fwLoadProxies(); }
     if(t==='settings'){ fwLoadPolicy(); fwLoadAdmin(); }
     if(t==='frp'){ fwFrpLoad(); }
@@ -610,7 +735,7 @@ function fwLoadInfo(){
     var a=document.getElementById('fwUrl'); a.textContent=(r&&r.url)||''; a.href=(r&&r.url)||'#';
     // 凭据：账号直接显示，密码默认打码，可点眼睛切换
     fwCred.user=(r&&r.admin_user)||'admin';
-    fwCred.pwd=(r&&r.admin_password)||'';
+    fwCred.pwd=(r&&r.admin_password)||'';   // 后端只回掩码（******），不落明文
     var u=document.getElementById('fwCredUser'); if(u) u.textContent=fwCred.user;
     fwRenderCred();
     fwRenderWeb(r);
@@ -654,10 +779,9 @@ function fwWebPortSave(){
 var fwCred={user:'',pwd:'',show:false};
 function fwRenderCred(){
   var p=document.getElementById('fwCredPwd'); if(!p) return;
-  p.textContent = fwCred.show ? (fwCred.pwd||'(未设置)') : '••••••';
-  var e=document.getElementById('fwCredEye'); if(e) e.textContent = fwCred.show?'🙈':'👁';
+  // 后端仅回掩码，此处固定展示占位（不再提供明文切换）
+  p.textContent = fwCred.pwd ? '••••••' : '(未设置)';
 }
-function fwToggleCred(){ fwCred.show=!fwCred.show; fwRenderCred(); }
 function fwLoadOverview(){
   fwSend('waf_overview', {}, function(r){
     var d=(r&&r.data)||{};
@@ -672,7 +796,10 @@ function fwLoadOverview(){
     ];
     document.getElementById('fwStats').innerHTML = cards.map(function(c){
       return '<div class="st"><div class="k">'+c[0]+'</div><div class="v '+(c[2]||'')+'">'+c[1]+'</div></div>';
-    }).join('');
+    }).join('')
+      +'<div class="fw-tip" style="flex-basis:100%;margin:6px 0 0">攻击类型封禁：CC '+(d.auto_ban_cc_enabled?'已启用':'关闭')
+      +' · 端口扫描 '+(d.auto_ban_scan_enabled?'已启用':'关闭')
+      +' · 敏感服务爆破 '+(d.auto_ban_ssh_enabled?'已启用':'关闭')+'</div>';
   });
 }
 function fwLoadDashLogs(){
@@ -809,11 +936,13 @@ function fwLoadIpList(){
     document.getElementById('fwIpList').innerHTML = rows.length
       ? rows.map(function(x){
           var isBlack = x.list_type==='black';
-          return '<tr><td><code>'+fwEsc(x.cidr)+'</code></td>'
-            +'<td><span class="fw-tag '+(isBlack?'no':'ok')+'">'+(isBlack?'黑名单':'白名单')+'</span></td>'
-            +'<td>'+fwEsc(x.geo||'-')+'</td><td>'+fwEsc(x.remark||'')+'</td>'
-            +'<td>'+fwFmtTime(x.created_at)+'</td>'
-            +'<td><button class="btn btn-danger btn-xs" onclick="fwDelIp('+x.id+')">删除</button></td></tr>';
+          var remark = x.remark||'';
+          return '<tr><td class="mono">'+fwEsc(x.cidr)+'</td>'
+            +'<td class="c"><span class="fw-tag '+(isBlack?'no':'ok')+'">'+(isBlack?'黑名单':'白名单')+'</span></td>'
+            +'<td class="geo">'+fwEsc(x.geo||'-')+'</td>'
+            +'<td class="remark" title="'+fwEsc(remark)+'"><span class="clamp">'+fwEsc(remark||'-')+'</span></td>'
+            +'<td class="nw dim">'+fwFmtTime(x.created_at)+'</td>'
+            +'<td class="c"><button class="btn btn-danger btn-xs" onclick="fwDelIp('+x.id+')">删除</button></td></tr>';
         }).join('')
       : '<tr><td colspan="6" style="color:#bbb;text-align:center">暂无条目</td></tr>';
   });
@@ -831,10 +960,16 @@ function fwLoadBanHistory(){
     var rows=(r&&r.data)||[];
     document.getElementById('fwBanHis').innerHTML = rows.length
       ? rows.map(function(x){
-          var active = !x.released && x.expire_at*1000 > Date.now();
-          return '<tr><td>'+fwEsc(x.ip)+'</td><td>'+fwEsc(x.geo||'-')+'</td><td>'+fwEsc(x.reason||'')+'</td>'
-            +'<td>'+fwFmtTime(x.banned_at)+'</td><td>'+fwFmtTime(x.expire_at)+'</td>'
-            +'<td><span class="fw-tag '+(active?'no':'gray')+'">'+(active?'生效中':'已解封')+'</span></td></tr>';
+          var released = !!x.released;
+          var expired = x.expire_at*1000 <= Date.now();
+          var st = released ? '<span class="fw-tag gray">已解封</span>'
+                 : (expired ? '<span class="fw-tag warn">已过期</span>'
+                            : '<span class="fw-tag no">生效中</span>');
+          var reason = x.reason||'';
+          return '<tr><td class="mono">'+fwEsc(x.ip)+'</td><td class="geo">'+fwEsc(x.geo||'-')+'</td>'
+            +'<td class="remark" title="'+fwEsc(reason)+'"><span class="clamp">'+fwEsc(reason||'-')+'</span></td>'
+            +'<td class="nw dim">'+fwFmtTime(x.banned_at)+'</td><td class="nw dim">'+fwFmtTime(x.expire_at)+'</td>'
+            +'<td class="c">'+st+'</td></tr>';
         }).join('')
       : '<tr><td colspan="6" style="color:#bbb;text-align:center">暂无历史</td></tr>';
   });
@@ -851,9 +986,9 @@ function fwLoadBans(){
     document.getElementById('fwTempCount').textContent = temp.length?('共 '+temp.length+' 条'):'';
     document.getElementById('fwTempList').innerHTML = temp.length
       ? temp.map(function(x){
-          return '<tr><td>'+fwEsc(x.ip)+'</td><td>'+fwEsc(x.geo||'-')+'</td><td>'+fwEsc(x.reason||'')+'</td>'
-            +'<td>'+fwFmtTime(x.expire_at)+'</td>'
-            +'<td><button class="btn btn-default btn-xs" onclick="fwUnbanTemp('+fwEsc(JSON.stringify(x.ip||''))+')">解禁</button></td></tr>';
+          return '<tr><td class="mono">'+fwEsc(x.ip)+'</td><td class="geo">'+fwEsc(x.geo||'-')+'</td><td>'+fwEsc(x.reason||'')+'</td>'
+            +'<td class="nw dim">'+fwFmtTime(x.expire_at)+'</td>'
+            +'<td class="c"><button class="btn btn-default btn-xs" onclick="fwUnbanTemp('+fwEsc(JSON.stringify(x.ip||''))+')">解禁</button></td></tr>';
         }).join('')
       : '<tr><td colspan="5" style="color:#bbb;text-align:center">暂无临时封禁</td></tr>';
   });
@@ -882,6 +1017,7 @@ function fwLogLoadProxies(){
 }
 function fwLogPage(off){
   fwLogOff=Math.max(0, off);
+  if((document.getElementById('fwLogView')||{}).value==='agg'){ fwLoadLogAgg(); return; }
   fwSend('conn_logs', fwLogQuery(), function(r){
     var rows=(r&&r.data)||[], total=(r&&r.total)||0;
     document.getElementById('fwLogTotal').textContent='共 '+total+' 条';
@@ -900,6 +1036,70 @@ function fwLogPage(off){
 }
 function fwLogPrev(){ fwLogPage(Math.max(0, fwLogOff-fwLogLimit)); }
 function fwLogNext(){ fwLogPage(fwLogOff+fwLogLimit); }
+function fwLogSwitchView(){
+  var agg=document.getElementById('fwLogView').value==='agg';
+  document.getElementById('fwLogRawWrap').style.display=agg?'none':'';
+  document.getElementById('fwLogAggWrap').style.display=agg?'':'none';
+  document.getElementById('fwLogPager').style.display=agg?'none':'';
+  // 聚合视图下原始日志的筛选/分页控件不适用，隐藏但保留值；窗口选择仅聚合视图可用
+  var raw=document.getElementById('fwLogRawFilters');
+  if(raw){ raw.style.display=agg?'none':'contents'; }
+  var win=document.getElementById('fwLogWindow');
+  if(win){ win.style.display=agg?'':'none'; }
+  if(agg){ fwLoadLogAgg(); } else { fwLogPage(fwLogOff); }
+}
+function fwLoadLogAgg(){
+  var w=(document.getElementById('fwLogWindow')||{}).value||'3600';
+  fwSend('logs_summary', {window:w}, function(r){
+    var rows=(r&&r.data)||[];
+    var total=(r&&r.total_proxies)||rows.length;
+    var more=total>rows.length?'（显示前 '+rows.length+' 个）':'';
+    document.getElementById('fwLogTotal').textContent='最近 '+(r&&r.window?Math.round(r.window/3600)+' 小时':'窗口')+' · 共 '+total+' 个代理'+more;
+    document.getElementById('fwConnAgg').innerHTML = rows.length
+      ? rows.map(function(x){
+          var cls=x.single_pct>=80&&x.uniq_ips>=50?' style="color:#d33;font-weight:600"':'';
+          return '<tr><td>'+fwEsc(x.proxy_name)+'</td><td>'+fwEsc(x.proxy_type||'-')+'</td>'
+            +'<td>'+fwEsc(x.conns)+'</td><td>'+fwEsc(x.uniq_ips)+'</td>'
+            +'<td>'+fwEsc(x.single_ips)+'</td><td'+cls+'>'+fwEsc(x.single_pct)+'%</td>'
+            +'<td style="color:'+(x.rejected?'#d33':'')+'">'+fwEsc(x.rejected||0)+'</td>'
+            +'<td>'+fwFmtTime(x.last_ts)+'</td></tr>';
+        }).join('')
+      : '<tr><td colspan="8" style="color:#bbb;text-align:center">暂无记录</td></tr>';
+  });
+}
+function fwLoadBurst(){
+  fwSend('burst_status', {}, function(r){
+    var rows=(r&&r.data)||[], cfg=(r&&r.config)||{};
+    var badge=document.getElementById('fwBurstCoolState');
+    if(badge){
+      badge.className='fw-badge '+(cfg.proxy_cool_enabled?'on':'off');
+      badge.textContent=cfg.proxy_cool_enabled
+        ? ('冷却已启用（'+fwEsc(cfg.proxy_cool_seconds||60)+'s）')
+        : '冷却未启用（仅观测）';
+    }
+    var tip=document.getElementById('fwBurstTip');
+    if(tip){
+      /* 跨进程快照：daemon 每 10s 落盘一次，超过 30s 视为过期（守护进程可能未运行） */
+      var stale=r&&r.stale?'<span style="color:#e6a23c">快照已过期（WAF 服务可能未运行或刚启动），以下为最后一次数据；</span>':'';
+      tip.innerHTML=stale+'窗口 '+(cfg.burst_window||60)+' 秒；冷却触发条件：连接数 ≥ '+(cfg.proxy_cool_min_conns||300)
+        +' 且独立 IP ≥ '+(cfg.proxy_cool_uniq_threshold||200)+' 且仅 1 次占比 ≥ '+(cfg.proxy_cool_single_pct||80)
+        +'% → 冷却 '+(cfg.proxy_cool_seconds||60)+' 秒（冷却期内该代理新出现 IP 被拒，老 IP 放行）。'
+        +'定性标签：<b>疑似分布式探测</b>=独立 IP ≥ 50 且仅 1 次占比 ≥ 80%；<b>单点高频</b>=连接数 ≥ 100 且独立 IP ≤ 3。';
+    }
+    var LV={distributed_probe:['疑似分布式探测','#d33'],single_source:['单点高频','#e6a23c'],normal:['正常','']};
+    document.getElementById('fwBurstTable').innerHTML = rows.length
+      ? rows.map(function(x){
+          var lv=LV[x.level]||['正常',''];
+          return '<tr><td>'+fwEsc(x.proxy_name)+'</td><td>'+fwEsc(x.proxy_type||'-')+'</td>'
+            +'<td>'+fwEsc(x.conns)+'</td><td>'+fwEsc(x.uniq_ips)+'</td>'
+            +'<td>'+fwEsc(x.single_pct)+'%</td><td>'+fwEsc(x.rate)+'</td>'
+            +'<td style="color:'+(lv[1]||'')+';'+(lv[1]?'font-weight:600':'')+'">'+lv[0]
+            +(x.truncated?' <span title="独立 IP 超统计上限，仅统计前 2000 个">（截断）</span>':'')+'</td>'
+            +'<td>'+(x.cool_remain>0?'<span class="fw-tag no">'+fwEsc(x.cool_remain)+'s</span>':'-')+'</td></tr>';
+        }).join('')
+      : '<tr><td colspan="8" style="color:#bbb;text-align:center">窗口内暂无连接</td></tr>';
+  });
+}
 function fwLogReset(){
   document.getElementById('fwLogIp').value='';
   document.getElementById('fwLogAction').value='';
@@ -930,8 +1130,13 @@ function fwLoadProxies(){
 }
 
 /* ---- 准入策略 / 密码 ---- */
-var FW_POLICY_BOOL=['blacklist_enabled','whitelist_enabled','auto_ban_enabled','rate_limit_enabled','fw_sync_enabled','ai_enabled'];
-var FW_POLICY_INT=['auto_ban_window','auto_ban_threshold','auto_ban_seconds','rate_limit_per_sec','log_max_rows'];
+var FW_POLICY_BOOL=['blacklist_enabled','whitelist_enabled','auto_ban_enabled','rate_limit_enabled','fw_sync_enabled','ai_enabled',
+  'auto_ban_cc_enabled','auto_ban_scan_enabled','auto_ban_ssh_enabled','proxy_cool_enabled'];
+var FW_POLICY_INT=['auto_ban_window','auto_ban_threshold','auto_ban_seconds','rate_limit_per_sec','log_max_rows',
+  'auto_ban_cc_window','auto_ban_cc_threshold','auto_ban_cc_seconds',
+  'auto_ban_scan_window','auto_ban_scan_threshold','auto_ban_scan_seconds',
+  'auto_ban_ssh_window','auto_ban_ssh_threshold',
+  'burst_window','proxy_cool_min_conns','proxy_cool_uniq_threshold','proxy_cool_single_pct','proxy_cool_seconds'];
 function fwLoadPolicy(){
   fwSend('get_policy', {}, function(r){
     var c=(r&&r.data)||{};
@@ -1024,6 +1229,9 @@ function fwAiLoad(){
     if(d.ai_enabled){ st.className='fw-badge on'; st.textContent='已启用'; }
     else { st.className='fw-badge off'; st.textContent='未启用'; }
     document.getElementById('fwAiLast').textContent = d.ai_last_result ? ('上次：'+d.ai_last_result) : '';
+    // 页面刷新/切换标签后若后台审查仍在进行，恢复「审查中…」状态与轮询
+    var req=+(d.ai_run_requested||0), consumed=+(d.ai_run_consumed||0);
+    if((req>consumed || d.ai_review_state==='running') && !fwAiPollTimer){ fwAiBtn(true); fwAiPoll(0); }
   });
   fwAiLoadResults();
 }
@@ -1056,13 +1264,38 @@ function fwAiTest(){
     bt_tools.msg((r&&r.msg)||'完成', (r&&r.status));
   });
 }
+var fwAiPollTimer=null;
+function fwAiBtn(running){
+  // 不用全局 event（Chrome 外不可靠）：按钮显式定位，避免依赖隐式事件对象
+  var btn=document.getElementById('fwAiRunBtn');
+  if(!btn) return;
+  btn.disabled=!!running;
+  btn.textContent=running?'审查中…':'立即审查一次';
+}
 function fwAiRun(){
-  var btn=(typeof event!=='undefined' && event && event.target) || null;
-  if(btn){ btn.disabled=true; btn.textContent='审查中…'; }
+  if(fwAiPollTimer) return;   // 已在轮询：忽略重复点击
+  fwAiBtn(true);
+  // 只提交请求（后端立即返回），实际审查在 WAF 服务后台执行，轮询进度：
+  // 避免大批量送审耗时超过面板请求超时导致按钮一直停在「审查中…」。
   fwSend('ai_run_now', {}, function(r){
-    if(btn){ btn.disabled=false; btn.textContent='立即审查一次'; }
-    bt_tools.msg((r&&r.msg)||'完成', (r&&r.status)); fwAiLoad();
+    bt_tools.msg((r&&r.msg)||'完成', !!(r&&r.status));
+    if(r&&r.status){ fwAiPoll(0); } else { fwAiBtn(false); }
   });
+}
+function fwAiPoll(n){
+  if(fwAiPollTimer){ clearTimeout(fwAiPollTimer); fwAiPollTimer=null; }
+  n=n||0;
+  if(n>450){ fwAiBtn(false); bt_tools.msg('审查超时未返回，请查看运行日志', false); fwAiLoad(); return; }
+  fwAiPollTimer=setTimeout(function(){
+    fwSend('ai_status', {}, function(r){
+      var d=(r&&r.data)||{};
+      if(d.running){ fwAiBtn(true); fwAiPoll(n+1); return; }
+      fwAiPollTimer=null; fwAiBtn(false);
+      if(d.stale){ bt_tools.msg(d.last_result||'审查请求未被处理，请检查 WAF 服务', false); }
+      else if(d.last_result){ bt_tools.msg(d.last_result, !!d.last_ok); }
+      fwAiLoad();
+    });
+  }, 2000);
 }
 function fwAiLoadResults(){
   fwSend('ai_results', {}, function(r){
@@ -1249,7 +1482,7 @@ function fwFrpRollback(){
 }
 var fwFrpPollTimer=null;
 function fwFrpPoll(){
-  if(fwFrpPollTimer) clearTimeout(fwFrpPollTimer);
+  if(fwFrpPollTimer){ clearTimeout(fwFrpPollTimer); fwFrpPollTimer=null; }
   fwSend('frp_install_status', {}, function(r){
     var d=(r&&r.data)||{};
     document.getElementById('fwFrpProgress').style.display='block';
@@ -1258,6 +1491,7 @@ function fwFrpPoll(){
     if(d.running){
       fwFrpPollTimer=setTimeout(fwFrpPoll, 1000);
     }else{
+      fwFrpPollTimer=null;
       document.getElementById('fwFrpInstallBtn').disabled=false;
       if(d.done){
         bt_tools.msg(d.msg||'完成', !!d.ok);
@@ -1266,6 +1500,11 @@ function fwFrpPoll(){
     }
   });
 }
+// 页面卸载时停止轮询，避免面板长时间停留后遗留定时器持续请求
+window.addEventListener('beforeunload', function(){
+  if(fwFrpPollTimer){ clearTimeout(fwFrpPollTimer); fwFrpPollTimer=null; }
+  if(fwAiPollTimer){ clearTimeout(fwAiPollTimer); fwAiPollTimer=null; }
+});
 function fwFrpCheckVer(){
   bt_tools.msg('正在查询最新版…', true);
   fwSend('frp_latest', {kind:fwFrpKind()}, function(r){

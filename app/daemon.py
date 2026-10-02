@@ -10,6 +10,7 @@
 """
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -27,7 +28,7 @@ from . import __version__, ai, auth, config, engine, firewall, geo, store  # noq
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
 
 # 内存中的当日计数器（用于概览，不落库）
-_mem = {"started": int(time.time())}
+_mem = {"started": int(time.time()), "engine_errors": 0, "frp_remote_denied": 0}
 _mem_lock = threading.Lock()
 
 # 运行日志（写入 data/frpwaf.log，供插件「运行日志」页查看）
@@ -87,9 +88,14 @@ def _login_record(ip, ok):
             cnt = 0
             start = now
         _login_fail[ip] = (start, cnt, lock)
-        # 有界增长
+        # 有界增长：先清过期项；仍超硬上限时按窗口起点淘汰最旧的一半，
+        # 防止「持续换 IP 攻击」时字典无界膨胀（旧实现仅清过期，不设硬上限）。
         if len(_login_fail) > 5000:
             for k in [k for k, v in _login_fail.items() if now - v[0] > _LOGIN_WINDOW]:
+                _login_fail.pop(k, None)
+        if len(_login_fail) > 5000:
+            oldest = sorted(_login_fail.items(), key=lambda kv: kv[1][0])
+            for k, _ in oldest[:len(oldest) // 2]:
                 _login_fail.pop(k, None)
 
 
@@ -130,6 +136,36 @@ def _fw_sync():
         _mem["fw_on"] = on
     except Exception:
         pass
+
+
+class _QuietHTTPServer(ThreadingHTTPServer):
+    """请求线程异常处理：抑制「客户端断连」类噪声。
+
+    http.server 默认的 handle_error 会把请求线程中的任何异常打印完整 traceback
+    到 stderr；服务脚本以 `2>&1` 追加日志，扫描器/客户端半途断开连接
+    （ConnectionResetError 等）就会刷满运行日志。此类异常与业务无关，这里静默并
+    按窗口汇总一条计数日志；其余异常仍按默认方式打印，保证真实故障可排查。
+    """
+    _NET_ERR_TYPES = (ConnectionResetError, ConnectionAbortedError,
+                      BrokenPipeError, TimeoutError, socket.timeout)
+    _QUIET_WINDOW = 600          # 汇总记录窗口（秒）
+    _quiet_lock = threading.Lock()
+    _quiet_count = 0
+    _quiet_last = 0.0
+
+    def handle_error(self, request, client_address):
+        etype = sys.exc_info()[0]
+        if etype is not None and issubclass(etype, self._NET_ERR_TYPES):
+            now = time.time()
+            with _QuietHTTPServer._quiet_lock:
+                _QuietHTTPServer._quiet_count += 1
+                if now - _QuietHTTPServer._quiet_last >= self._QUIET_WINDOW:
+                    _QuietHTTPServer._quiet_last = now
+                    n = _QuietHTTPServer._quiet_count
+                    _QuietHTTPServer._quiet_count = 0
+                    _log("已静默 %d 条客户端断连异常（扫描器/连接提前关闭，不影响防护）" % n)
+            return
+        ThreadingHTTPServer.handle_error(self, request, client_address)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -190,6 +226,11 @@ class Handler(BaseHTTPRequestHandler):
     def _client_ip(self):
         return self.client_address[0] if self.client_address else ""
 
+    def _is_local(self):
+        """回调来源是否为本机（frps 回调固定走 127.0.0.1/::1）。"""
+        ip = self._client_ip()
+        return ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
     def _cookie_secure(self):
         """是否给会话 Cookie 加 Secure 标记。
 
@@ -221,7 +262,13 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(u.query)
 
             # frp 插件回调（始终放行：关闭网页端不影响 WAF 防护与 frps 回调）
+            # 仅接受本机来源：frps 回调固定走 127.0.0.1；否则任何可达 7080 的
+            # 来源都能伪造 remote_addr 触发封禁（可把任意 IP 打入黑名单）。
             if path == "/frp/handler":
+                if not self._is_local():
+                    with _mem_lock:
+                        _mem["frp_remote_denied"] += 1
+                    return self._send(403, "forbidden", ctype="text/plain; charset=utf-8")
                 return self._frp_handler(qs)
 
             # 网页端开关：关闭时仅屏蔽网页与 /api/*，回调照常运行
@@ -252,9 +299,10 @@ class Handler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass
         except Exception:
+            # 细节只进日志，不回显给请求方（未认证可达，traceback 会泄露内部结构）
+            _log("请求处理异常：" + traceback.format_exc()[-500:])
             try:
-                self._json({"code": 500, "msg": "服务器内部错误",
-                            "detail": traceback.format_exc()[-800:]}, 500)
+                self._json({"code": 500, "msg": "服务器内部错误"}, 500)
             except Exception:
                 pass
 
@@ -274,16 +322,26 @@ class Handler(BaseHTTPRequestHandler):
             ip, port = _split_addr(remote_addr)
             proxy_name = content.get("proxy_name", "")
             proxy_type = content.get("proxy_type", "")
+            if not ip:
+                # 字段缺失/格式异常：无法决策时放行，但必须留痕（协议变更排查线索）
+                _log("回调字段异常：remote_addr=%r，已放行" % (remote_addr,))
             try:
                 allow, reason = engine.decide(ip, port, proxy_name, proxy_type, user)
             except Exception:
-                # 决策异常时放行（避免 WAF 逻辑错误导致 frp 全线拒绝）
+                # 决策异常时放行（避免 WAF 逻辑错误导致 frp 全线拒绝）；
+                # 计数 + 限频日志：连续出现说明防护在静默失效，便于从概览/日志发现。
+                with _mem_lock:
+                    _mem["engine_errors"] += 1
+                    n = _mem["engine_errors"]
+                if n <= 3 or n % 100 == 0:
+                    _log("决策异常（fail-open，累计 %d 次）：%s"
+                         % (n, traceback.format_exc()[-300:]))
                 allow, reason = True, "engine-error"
-                traceback.print_exc()
             try:
-                store.add_log(ip, port, proxy_name, proxy_type, user,
-                              "allow" if allow else "reject", reason)
-                store.bump_proxy(proxy_name, proxy_type, rejected=not allow)
+                # 日志 + 代理统计合并为单事务（原为两次独立写库，高并发下写放大）
+                store.add_log_and_bump(ip, port, proxy_name, proxy_type, user,
+                                       "allow" if allow else "reject", reason,
+                                       rejected=not allow)
             except Exception:
                 pass
             if allow:
@@ -343,9 +401,16 @@ class Handler(BaseHTTPRequestHandler):
                 "blacklist_enabled": cfg["blacklist_enabled"],
                 "whitelist_enabled": cfg["whitelist_enabled"],
                 "auto_ban_enabled": cfg["auto_ban_enabled"],
+                "auto_ban_cc_enabled": bool(cfg.get("auto_ban_cc_enabled", False)),
+                "auto_ban_scan_enabled": bool(cfg.get("auto_ban_scan_enabled", False)),
+                "auto_ban_ssh_enabled": bool(cfg.get("auto_ban_ssh_enabled", False)),
                 "rate_limit_enabled": cfg["rate_limit_enabled"],
+                "proxy_cool_enabled": bool(cfg.get("proxy_cool_enabled", False)),
                 "admin_user": cfg.get("admin_user", "admin"),
             })
+            with _mem_lock:
+                st["engine_errors"] = _mem["engine_errors"]
+                st["frp_remote_denied"] = _mem["frp_remote_denied"]
             st["geo_available"] = geo.db_info().get("available", False)
             return self._json({"code": 0, "data": st})
 
@@ -357,12 +422,23 @@ class Handler(BaseHTTPRequestHandler):
                 safe["ai_api_key"] = "******" if cfg.get("ai_api_key") else ""
                 return self._json({"code": 0, "data": safe})
             body = self._body()
+            patch = {}
             allowed = {
                 "blacklist_enabled": bool, "whitelist_enabled": bool,
                 "auto_ban_enabled": bool, "auto_ban_window": int,
                 "auto_ban_threshold": int, "auto_ban_seconds": int,
+                "auto_ban_cc_enabled": bool, "auto_ban_cc_window": int,
+                "auto_ban_cc_threshold": int, "auto_ban_cc_seconds": int,
+                "auto_ban_scan_enabled": bool, "auto_ban_scan_window": int,
+                "auto_ban_scan_threshold": int, "auto_ban_scan_seconds": int,
+                "auto_ban_ssh_enabled": bool, "auto_ban_ssh_window": int,
+                "auto_ban_ssh_threshold": int,
                 "rate_limit_enabled": bool, "rate_limit_per_sec": int,
                 "log_max_rows": int, "fw_sync_enabled": bool,
+                # 分布式突发观测与代理级冷却
+                "burst_window": int, "proxy_cool_enabled": bool,
+                "proxy_cool_min_conns": int, "proxy_cool_uniq_threshold": int,
+                "proxy_cool_single_pct": int, "proxy_cool_seconds": int,
                 "ai_enabled": bool, "ai_protocol": str, "ai_base_url": str,
                 "ai_api_key": str, "ai_model": str, "ai_interval": int,
                 "ai_window": int, "ai_min_conns": int, "ai_max_ips": int,
@@ -374,20 +450,35 @@ class Handler(BaseHTTPRequestHandler):
                 if k in body:
                     try:
                         if typ is bool:
-                            cfg[k] = bool(body[k])
+                            patch[k] = bool(body[k])
                         elif typ is int:
-                            cfg[k] = max(0, int(body[k]))
+                            patch[k] = max(0, int(body[k]))
                         else:
-                            cfg[k] = str(body[k]).strip()
+                            patch[k] = str(body[k]).strip()
                     except (TypeError, ValueError):
                         pass
-            if cfg.get("auto_ban_window", 0) < 1:
-                cfg["auto_ban_window"] = 1
-            if cfg.get("ai_interval", 300) < 60:
-                cfg["ai_interval"] = 60
-            if cfg.get("ai_window", 300) < 30:
-                cfg["ai_window"] = 30
-            config.save(cfg)
+            if patch.get("auto_ban_window", 60) < 1:
+                patch["auto_ban_window"] = 1
+            # 攻击类型封禁：窗口参数与既有 auto_ban 同样强制 ≥1 秒；
+            # 开关开启时参数为「未设置形态」（阈值/时长 0、窗口 ≤1）的回退默认值，
+            # 由 config.save() 内统一的 normalize_auto_ban() 完成（对所有写入路径生效）。
+            for _w in ("auto_ban_cc_window", "auto_ban_scan_window", "auto_ban_ssh_window"):
+                if patch.get(_w, 60) < 1:
+                    patch[_w] = 1
+            # 突发观测/冷却：窗口与时长参数钳制；开关开启时参数为「未设置形态」
+            # 的回退默认值由 config.save() 内统一的 normalize_burst_cool() 完成。
+            # 冷却时长下限 10s 与引擎运行时（max(10, ...)）一致，避免显示/行为不符。
+            if patch.get("burst_window", 60) < 2:
+                patch["burst_window"] = 2
+            if patch.get("proxy_cool_seconds", 60) < 10:
+                patch["proxy_cool_seconds"] = 10
+            if patch.get("proxy_cool_single_pct", 80) > 100:
+                patch["proxy_cool_single_pct"] = 100
+            if patch.get("ai_interval", 300) < 60:
+                patch["ai_interval"] = 60
+            if patch.get("ai_window", 300) < 30:
+                patch["ai_window"] = 30
+            config.save(patch)   # patch 语义：锁内合并磁盘现状，避免覆盖并发写入方字段
             _fw_sync()   # 开关/名单变化立即生效（关闭内核封禁时同步清理残留）
             return self._json({"code": 0, "msg": "保存成功"})
 
@@ -402,7 +493,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/iplist":
             if method == "GET":
                 lt = qs.get("type", [None])[0]
-                rows = store.list_ips(lt)
+                # 面板展示接口：限制返回条数（缺省/非法 = 默认上限 5000，
+                # 显式传入也不超过硬上限）。名单正常为几百条，此上限仅防异常增长。
+                lim = _int(qs.get("limit", [0])[0])
+                if lim <= 0 or lim > store.PANEL_LIST_CAP:
+                    lim = store.PANEL_LIST_CAP
+                rows = store.list_ips(lt, limit=lim)
                 for r in rows:
                     # 名单条目可能是 CIDR，取网络地址做归属地查询
                     base = (r.get("cidr") or "").split("/")[0]
@@ -469,6 +565,28 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/logs/proxies":
             # 连接日志中出现过的代理名（供筛选下拉框）
             return self._json({"code": 0, "data": store.log_proxy_names()})
+
+        if path == "/api/logs/summary":
+            # 按代理聚合视图（窗口钳制 60s ~ 24h；非法值回退默认 1 小时）
+            window = _int(qs.get("window", [3600])[0])
+            if window <= 0:
+                window = 3600
+            window = max(60, min(86400, window))
+            res = store.summary_by_proxy(window)
+            return self._json({"code": 0, "data": res["rows"], "window": window,
+                               "total_proxies": res["total_proxies"]})
+
+        if path == "/api/burst":
+            # 代理级突发观测快照（纯内存）+ 冷却阈值与状态（供面板展示）
+            cfg = config.get()
+            return self._json({"code": 0, "data": engine.burst_snapshot(), "config": {
+                "burst_window": int(cfg.get("burst_window") or 60),
+                "proxy_cool_enabled": bool(cfg.get("proxy_cool_enabled", False)),
+                "proxy_cool_min_conns": int(cfg.get("proxy_cool_min_conns") or 300),
+                "proxy_cool_uniq_threshold": int(cfg.get("proxy_cool_uniq_threshold") or 200),
+                "proxy_cool_single_pct": int(cfg.get("proxy_cool_single_pct") or 80),
+                "proxy_cool_seconds": int(cfg.get("proxy_cool_seconds") or 60),
+            }})
 
         if path == "/api/bans":
             if method == "GET":
@@ -574,6 +692,50 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({"code": 404, "msg": "接口不存在"}, 404)
 
 
+def _write_burst_snapshot(cfg):
+    """把突发观测/冷却快照写入 data/burst_snapshot.json（供插件端面板进程读取）。
+
+    观测与冷却状态都在本进程内存中，宝塔插件端运行在另一个进程，
+    无法直接访问；由后台每 10s 周期落盘一次（原子替换），
+    插件端 burst_status 读该文件。写失败不中断主流程，但按窗口记一次
+    运行日志（磁盘满/权限问题可排查）；文件权限与配置/DB 一致收紧为 0600。
+    """
+    try:
+        data = {
+            "ts": int(time.time()),
+            "data": engine.burst_snapshot(),
+            "config": {
+                "burst_window": int(cfg.get("burst_window") or 60),
+                "proxy_cool_enabled": bool(cfg.get("proxy_cool_enabled", False)),
+                "proxy_cool_min_conns": int(cfg.get("proxy_cool_min_conns") or 300),
+                "proxy_cool_uniq_threshold": int(cfg.get("proxy_cool_uniq_threshold") or 200),
+                "proxy_cool_single_pct": int(cfg.get("proxy_cool_single_pct") or 80),
+                "proxy_cool_seconds": int(cfg.get("proxy_cool_seconds") or 60),
+            },
+        }
+        tmp = "%s.tmp.%d" % (config.BURST_SNAPSHOT_PATH, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, config.BURST_SNAPSHOT_PATH)
+        try:
+            os.chmod(config.BURST_SNAPSHOT_PATH, 0o600)   # 含代理名/观测指标，收紧权限
+        except OSError:
+            pass
+    except Exception:
+        # 写失败按窗口限流记日志（避免每 10s 刷屏）
+        now = time.time()
+        if now - _snap_fail_log["at"] >= 600:
+            _snap_fail_log["at"] = now
+            try:
+                _log("突发观测快照写入失败（插件端将看到过期数据）：%s"
+                     % traceback.format_exc()[-200:])
+            except Exception:
+                pass
+
+
+_snap_fail_log = {"at": 0.0}
+
+
 def _bg_loop():
     """后台：释放到期封禁、裁剪日志、同步内核封禁、WAL checkpoint、写心跳日志。"""
     tick = 0
@@ -581,8 +743,13 @@ def _bg_loop():
         try:
             for b in engine.auto_release():
                 _log("自动解封 %s（封禁到期）" % b["ip"])
+            # 代理级冷却判定（默认关闭；开关开启时进入/续期/清理）
+            for name in engine.cool_check():
+                _log("代理级冷却：%s 触发分布式突发阈值，冷却期内新 IP 将被拒绝" % name)
             cfg = config.get()
+            _write_burst_snapshot(cfg)   # 观测/冷却快照落盘（插件端面板进程读取）
             store.trim_logs(int(cfg.get("log_max_rows") or 50000))
+            store.trim_bans(20000)
             store.trim_ai_review(5000)
             _fw_sync()
             # 每约 60 秒做一次 TRUNCATE checkpoint，回收 -wal 文件大小
@@ -621,7 +788,7 @@ def main():
     t = threading.Thread(target=_bg_loop, daemon=True)
     t.start()
     threading.Thread(target=ai.loop_forever, daemon=True).start()
-    httpd = ThreadingHTTPServer((addr, port), Handler)
+    httpd = _QuietHTTPServer((addr, port), Handler)
     httpd.daemon_threads = True
     httpd.timeout = 30
     print("[frpwaf] listening on %s:%d  (pid=%d)" % (addr, port, os.getpid()), flush=True)

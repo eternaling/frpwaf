@@ -10,9 +10,12 @@ import hmac
 import json
 import os
 import re
+import secrets
+import shutil
 import sys
 import threading
 import subprocess
+import time
 import traceback
 
 BASE_PATH = "/www/server/panel"
@@ -178,21 +181,81 @@ class frpwaf_main:
         except Exception:
             return {}
 
+    def _cfg_effective(self):
+        """读取「实际生效」配置：DEFAULTS 打底 + 旧版哨兵迁移 + 参数防呆。
+
+        仅用于展示/回显（设置页、概览）：旧配置缺新键时展示的默认值与
+        运行时（config.load()）完全一致，避免设置页把 0/False 显示出来，
+        用户一保存就把坏值写回配置（历史 bug 的根因）。
+        """
+        try:
+            cfg = dict(_app("config").DEFAULTS)
+        except Exception:
+            cfg = {}
+        cfg.update(self._cfg())
+        try:
+            _app("config").migrate_legacy_attack(cfg)
+        except Exception:
+            pass
+        try:
+            _app("config").normalize_auto_ban(cfg)
+        except Exception:
+            pass
+        try:
+            _app("config").normalize_burst_cool(cfg)
+        except Exception:
+            pass
+        return cfg
+
     def _set_cfg(self, patch):
-        """合并写入配置。
+        """合并写入配置（patch 语义）。
 
         注意：读取失败（文件损坏 / 被并发写坏）时**拒绝保存**，绝不覆盖，
         避免把 secret / admin_password / ai_api_key 一并抹除。
+
+        并发保护：优先走 app.config.save(patch)——它在「进程内线程锁 + 跨进程
+        文件锁」内读磁盘现状并合并本次修改，与 WAF 守护进程（面板保存 / AI 审查）
+        并发写不同字段时互不覆盖。仅当环境变量异常导致两边配置路径不一致时，
+        才回退为本地读改写（保持旧行为）。
+
+        防呆顺序很重要：先在**磁盘现状**上做一次性哨兵迁移（见
+        config.migrate_legacy_attack），再合并本次 patch——否则用户本次
+        显式关闭的开关会被迁移逻辑重新打开。
         """
         p = os.path.join(WAF_HOME, "data", "frpwaf.json")
+        cfg_mod = None
+        try:
+            cfg_mod = _app("config")
+        except Exception:
+            cfg_mod = None
+        same_path = (cfg_mod is not None
+                     and os.path.abspath(cfg_mod.CONF_PATH) == os.path.abspath(p))
+        if same_path:
+            try:
+                raw = cfg_mod._read_disk()
+            except Exception:
+                raise ValueError("配置文件损坏或不可读，已阻止保存以防数据丢失：%s" % p)
+            if not raw.get("secret"):
+                # 文件缺失 / 缺密钥：按默认值补齐（会生成新 secret 并落盘）
+                try:
+                    cfg_mod.load()
+                except Exception:
+                    raise ValueError("无法获取 secret，已阻止保存")
+            cfg_mod.save(patch)   # 锁内：读磁盘现状 -> 迁移 -> 合并 patch -> 原子替换
+            return True
+        # ---- 回退路径：配置路径不一致（异常环境），保持本地读改写 ----
         try:
             cfg = self._cfg_raw()
         except Exception:
             raise ValueError("配置文件损坏或不可读，已阻止保存以防数据丢失：%s" % p)
         if not cfg.get("secret"):
-            # 文件缺失 / 缺密钥：用应用默认值补齐（会生成新 secret）
             try:
                 cfg = dict(_app("config").load())
+            except Exception:
+                pass
+        else:
+            try:
+                _app("config").migrate_legacy_attack(cfg)
             except Exception:
                 pass
         cfg.update(patch)
@@ -218,7 +281,9 @@ class frpwaf_main:
             "frps_toml": FRPS_TOML,
             "plugin_configured": "frpwaf" in self._read(FRPS_TOML),
             "admin_user": cfg.get("admin_user", "admin"),
-            "admin_password": cfg.get("admin_password", ""),
+            # 密码不回显明文：仅返回掩码，展示端据此提示「已设置」；
+            # 修改密码走 change_admin_pwd（需校验原密码）。
+            "admin_password": "******" if cfg.get("admin_password") else "",
         }
 
     def install_waf(self, get=None):
@@ -254,7 +319,9 @@ class frpwaf_main:
     def reinstall_waf(self, get=None):
         """重装：卸载后重新安装。注意 uninstall 会移除 frps.toml 中的插件块，
         故重装后需重新注入，否则 frps 集成会丢失（回调不再生效）。"""
-        self.uninstall_waf()
+        removed = self.uninstall_waf()
+        if not removed.get("status"):
+            return removed
         res = self.install_waf()
         try:
             if os.path.exists(FRPS_TOML):
@@ -265,25 +332,56 @@ class frpwaf_main:
 
     def uninstall_waf(self, get=None):
         try:
+            # frps 持有回调时必须先摘除并成功重启，才能停止 WAF。
+            frp = _app("frp")
+            frps_running = False
+            backup = self._remove_frps_plugin()
+            if backup:
+                try:
+                    if not os.access(frp._bin("frps"), os.X_OK):
+                        raise RuntimeError("frps 二进制不可用")
+                    err = frp.verify("frps")
+                    if err:
+                        raise RuntimeError("frps 配置校验失败：" + err)
+                    if os.path.exists(frp._init_path("frps")):
+                        status = public.ExecShell("/etc/init.d/frps status")[0] or ""
+                        if "is running" in status:
+                            frps_running = True
+                            ok, msg = frp.control("frps", "restart")
+                            if not ok or not frp.is_running("frps"):
+                                raise RuntimeError("frps 重启失败：" + msg)
+                        elif "is stopped" not in status:
+                            raise RuntimeError("无法确认 frps 状态")
+                    else:
+                        raise RuntimeError("frps 服务脚本不可用")
+                except Exception:
+                    shutil.copy2(backup, FRPS_TOML)
+                    if frps_running:
+                        frp.control("frps", "restart")
+                    raise
             public.ExecShell("%s stop" % WAF_INIT)
+            if self._waf_running():
+                if backup:
+                    shutil.copy2(backup, FRPS_TOML)
+                    if frps_running:
+                        frp.control("frps", "restart")
+                raise RuntimeError("WAF 停止失败")
             # 移除内核级封禁规则（ipset + iptables）
             try:
                 _app("firewall").teardown()
             except Exception:
                 pass
-            # 移除 frps.toml 中的 httpPlugins 配置并（仅当 frps 在运行时）重启 frps
-            # （否则 frps 仍会回调已停止的 WAF，fail-closed 会导致连接被拒）
-            had_plugin = "frpwaf" in self._read(FRPS_TOML)
-            self._remove_frps_plugin()
-            if had_plugin:
-                res = public.ExecShell("/etc/init.d/frps status")
-                if "is running" in (res[0] or ""):
-                    public.ExecShell("/etc/init.d/frps restart")
             if "CentOS" in public.get_os_version() or "Red" in public.get_os_version():
                 public.ExecShell("chkconfig --del frpwaf")
             else:
                 public.ExecShell("update-rc.d -f frpwaf remove")
             public.ExecShell("rm -f %s /usr/bin/frpwaf" % WAF_INIT)
+            # 清理突发观测运行时快照（daemon 内存状态，重启/重装后自动重建；
+            # 避免卸载后残留过期数据被插件端误读）
+            try:
+                os.remove(os.path.join(WAF_HOME, "data", "burst_snapshot.json"))
+            except OSError:
+                pass
             return public.returnMsg(True, "已卸载（数据保留在 %s/data）" % WAF_HOME)
         except Exception:
             return public.returnMsg(False, "卸载失败：" + traceback.format_exc())
@@ -292,7 +390,7 @@ class frpwaf_main:
     def waf_admin(self, get):
         if not hasattr(get, "status") or not get.status:
             return public.returnMsg(False, "参数错误")
-        act = get["status"]
+        act = get.status
         if act not in ("start", "stop", "restart"):
             return public.returnMsg(False, "参数错误")
         res = public.ExecShell("%s %s" % (WAF_INIT, act))
@@ -490,34 +588,17 @@ class frpwaf_main:
 
         仅当 frps 正在运行时才重启（未运行时重启会失败，但不影响下次启动）。
         """
-        content = self._read(FRPS_TOML)
+        if not os.path.exists(FRPS_TOML):
+            return None
+        with open(FRPS_TOML, "r", encoding="utf-8") as f:
+            content = f.read()
         if "frpwaf" not in content:
-            return
-        lines = content.splitlines()
-        # 切分为：前导段 + 各 section 块
-        segments, cur, cur_is_header = [], [], None
-        for ln in lines:
-            s = ln.strip()
-            is_header = s.startswith("[")
-            if is_header:
-                segments.append((cur_is_header, cur))
-                cur, cur_is_header = [ln], s
-            else:
-                cur.append(ln)
-        segments.append((cur_is_header, cur))
-
-        out = []
-        for header, body in segments:
-            if header and header.startswith("[[httpPlugins]]") and any("frpwaf" in l for l in body):
-                continue  # 丢弃 frpwaf 插件块
-            out.extend(body)
-
-        text = "\n".join(out)
-        if "frpwaf" in text:
-            # 兜底：逐行过滤残留
-            text = "\n".join(l for l in text.splitlines() if "frpwaf" not in l)
-        self._write(FRPS_TOML, text.strip() + "\n")
-        return True
+            return None
+        backup = "%s.bak.%s.%d" % (
+            FRPS_TOML, time.strftime("%Y%m%d-%H%M%S"), os.getpid())
+        shutil.copy2(FRPS_TOML, backup)
+        _app("frp_uninstall").remove_plugin_block(FRPS_TOML)
+        return backup
 
     # ---------------- frp 服务端 / 客户端管理 ----------------
     # 合并自宝塔官方「frp管理器」插件，并修复其已知问题。
@@ -918,6 +999,11 @@ class frpwaf_main:
             data[k] = v
         data["ai_last_run"] = cfg.get("ai_last_run", 0)
         data["ai_last_result"] = cfg.get("ai_last_result", "")
+        # 异步审查状态：供面板按钮在页面刷新后仍能正确显示「审查中…」并恢复轮询
+        data["ai_last_ok"] = cfg.get("ai_last_ok", True)
+        data["ai_review_state"] = cfg.get("ai_review_state", "")
+        data["ai_run_requested"] = cfg.get("ai_run_requested", 0)
+        data["ai_run_consumed"] = cfg.get("ai_run_consumed", 0)
         return {"status": True, "data": data}
 
     def ai_save_config(self, get=None):
@@ -974,15 +1060,59 @@ class frpwaf_main:
             return public.returnMsg(False, "测试失败：" + traceback.format_exc()[-200:])
 
     def ai_run_now(self, get=None):
-        """立即执行一次审查。"""
+        """立即执行一次审查（异步触发，立即返回）。
+
+        面板进程**不**直接执行审查：大批量送审可能耗时数分钟，会把插件请求
+        拖到超时（历史故障：按钮一直停在「审查中…」）。这里只写
+        `ai_run_requested` 时间戳，由 daemon 的 AI 循环消费执行；
+        前端拿 ai_status 轮询进度。
+        """
         try:
-            ai = _app("ai")
-            res = ai.review(force=True)
-            if res.get("ok"):
-                return public.returnMsg(True, res.get("msg", "完成"))
-            return public.returnMsg(False, res.get("msg", "失败"))
+            cfg = self._cfg()
+            if not cfg.get("ai_base_url") or not cfg.get("ai_api_key"):
+                return public.returnMsg(False, "未配置 AI 接口地址或密钥")
+            # 严格递增：同一秒内重复点击也必须产生新请求（消费游标按 > 比较）
+            now = int(time.time())
+            req = max(int(cfg.get("ai_run_requested") or 0) + 1, now)
+            self._set_cfg({"ai_run_requested": req})
+            return public.returnMsg(True, "已提交，正在后台审查（完成后自动显示结果）")
         except Exception:
-            return public.returnMsg(False, "审查失败：" + traceback.format_exc()[-300:])
+            return public.returnMsg(False, "提交失败：" + traceback.format_exc()[-300:])
+
+    def ai_status(self, get=None):
+        """查询异步审查状态（前端轮询用）。
+
+        running：daemon 正在执行本轮审查（ai_review_state=running 且心跳新鲜）；
+        pending：请求已提交但 daemon 尚未开始（AI 循环快速轮询，正常几秒内开始）；
+        请求超过 120 秒仍未被消费 → stale（WAF 服务未运行/已停止），
+        前端据此恢复按钮并给出提示，不会无限转圈。
+        """
+        try:
+            cfg = self._cfg()
+            now = time.time()
+            state = str(cfg.get("ai_review_state") or "")
+            started = int(cfg.get("ai_review_started") or 0)
+            last = int(cfg.get("ai_last_run") or 0)
+            req = int(cfg.get("ai_run_requested") or 0)
+            consumed = int(cfg.get("ai_run_consumed") or 0)
+            running = (state == "running" and 0 <= now - started < 900)
+            pending = (req > consumed and 0 <= now - req < 120)
+            stale = (req > consumed and now - req >= 120)
+            msg = str(cfg.get("ai_last_result") or "")
+            if stale:
+                msg = "审查请求长时间未被处理（WAF 服务可能未运行），请检查服务状态"
+            return {"status": True, "data": {
+                "running": bool(running or pending),
+                "pending": bool(pending),
+                "stale": bool(stale),
+                "last_run": last,
+                "last_ok": bool(cfg.get("ai_last_ok", True)),
+                "last_result": msg,
+                "requested": req,
+            }}
+        except Exception:
+            return {"status": True, "data": {"running": False, "last_run": 0,
+                                             "last_ok": True, "last_result": ""}}
 
     def ai_results(self, get=None):
         try:
@@ -1044,7 +1174,8 @@ class frpwaf_main:
         """返回：黑名单永久封禁 + 临时封禁（生效中）。"""
         try:
             store = self._store()
-            ips = store.list_ips("black")
+            # 面板展示接口：限制返回条数（store.PANEL_LIST_CAP，防大名单全量拉取）
+            ips = store.list_ips("black", limit=store.PANEL_LIST_CAP)
             for r in ips:
                 r["geo"] = self._geo_text((r.get("cidr") or "").split("/")[0])
                 r["mode"] = "permanent"
@@ -1128,7 +1259,9 @@ class frpwaf_main:
         """概览：今日连接/拦截/独立IP/生效封禁/黑白名单数 + 运行信息。"""
         try:
             store = _app("store")
-            cfg = self._cfg()
+            # 实际生效值（DEFAULTS 打底 + 防呆）：升级场景下旧配置缺新键时，
+            # 概览展示的开关状态与实际生效值一致（否则会误显示为关闭）。
+            cfg = self._cfg_effective()
             st = store.stats()
             st.update({
                 "http_addr": cfg.get("http_addr", "0.0.0.0"),
@@ -1136,7 +1269,11 @@ class frpwaf_main:
                 "blacklist_enabled": bool(cfg.get("blacklist_enabled", True)),
                 "whitelist_enabled": bool(cfg.get("whitelist_enabled", False)),
                 "auto_ban_enabled": bool(cfg.get("auto_ban_enabled", False)),
+                "auto_ban_cc_enabled": bool(cfg.get("auto_ban_cc_enabled", False)),
+                "auto_ban_scan_enabled": bool(cfg.get("auto_ban_scan_enabled", False)),
+                "auto_ban_ssh_enabled": bool(cfg.get("auto_ban_ssh_enabled", False)),
                 "rate_limit_enabled": bool(cfg.get("rate_limit_enabled", False)),
+                "proxy_cool_enabled": bool(cfg.get("proxy_cool_enabled", False)),
                 "ai_enabled": bool(cfg.get("ai_enabled", False)),
             })
             return {"status": True, "data": st}
@@ -1145,7 +1282,12 @@ class frpwaf_main:
 
     # ---------------- IP 名单（黑/白） ----------------
     def list_ips(self, get=None):
-        """名单列表：type=black/white，留空=全部。附归属地。"""
+        """名单列表：type=black/white，留空=全部。附归属地。
+
+        面板展示接口，返回条数上限 store.PANEL_LIST_CAP（5000）：防大名单
+        场景全量返回 + 逐条归属地查询拖垮面板；内部逻辑（AI/内核同步）
+        直接查库，不受该上限影响。
+        """
         lt = None
         try:
             lt = (get.type or "").strip() or None
@@ -1153,7 +1295,7 @@ class frpwaf_main:
             pass
         try:
             store = _app("store")
-            rows = store.list_ips(lt)
+            rows = store.list_ips(lt, limit=store.PANEL_LIST_CAP)
             for r in rows:
                 base = (r.get("cidr") or "").split("/")[0]
                 r["geo"] = self._geo_text(base)
@@ -1300,6 +1442,61 @@ class frpwaf_main:
         except Exception:
             return {"status": True, "data": []}
 
+    def logs_summary(self, get=None):
+        """按代理聚合最近窗口的连接日志（面板「聚合」视图）。
+
+        window：秒（默认 3600，钳制 60 ~ 86400）。
+        """
+        try:
+            window = 3600
+            try:
+                if hasattr(get, "window") and get.window:
+                    window = max(60, min(86400, int(get.window)))
+            except Exception:
+                pass
+            res = _app("store").summary_by_proxy(window)
+            return {"status": True, "data": res["rows"], "window": window,
+                    "total_proxies": res["total_proxies"]}
+        except Exception:
+            return {"status": True, "data": [], "window": 3600}
+
+    def burst_status(self, get=None):
+        """代理级突发观测快照 + 冷却状态（供面板展示）。
+
+        观测与冷却状态在 WAF 守护进程内存中，插件端是另一个进程，无法直接
+        访问 engine 内存；读取 daemon 后台周期落盘的 data/burst_snapshot.json。
+        文件缺失（守护进程未运行/尚未写入）时返回空数据并带 stale 标记。
+        """
+        try:
+            cfg = self._cfg_effective()
+            conf = {
+                "burst_window": int(cfg.get("burst_window") or 60),
+                "proxy_cool_enabled": bool(cfg.get("proxy_cool_enabled", False)),
+                "proxy_cool_min_conns": int(cfg.get("proxy_cool_min_conns") or 300),
+                "proxy_cool_uniq_threshold": int(cfg.get("proxy_cool_uniq_threshold") or 200),
+                "proxy_cool_single_pct": int(cfg.get("proxy_cool_single_pct") or 80),
+                "proxy_cool_seconds": int(cfg.get("proxy_cool_seconds") or 60),
+            }
+            try:
+                with open(os.path.join(WAF_HOME, "data", "burst_snapshot.json"),
+                          "r", encoding="utf-8") as f:
+                    snap = json.load(f)
+            except Exception:
+                snap = {}
+            data = snap.get("data") or []
+            ts = int(snap.get("ts") or 0)
+            if snap.get("config"):
+                # 以快照内配置为准（daemon 运行时生效值），避免两进程缓存不一致
+                conf.update(snap["config"])
+            # 过期判定：>30s 未更新视为陈旧；额外检查守护进程状态——
+            # 进程未运行（或刚启动尚未写快照）时即使 ts 较新也应提示（如卸载后残留）。
+            running = self._waf_running()
+            stale = (not running) or (not ts) or (time.time() - ts) > 30
+            return {"status": True, "data": data, "config": conf,
+                    "ts": ts, "stale": stale}
+        except Exception:
+            return {"status": True, "data": [], "config": {}, "ts": 0, "stale": True}
+
     def purge_conn_logs(self, get=None):
         try:
             _app("store").purge_logs()
@@ -1327,12 +1524,20 @@ class frpwaf_main:
 
     # ---------------- 准入策略 ----------------
     POLICY_BOOL = ["blacklist_enabled", "whitelist_enabled", "auto_ban_enabled",
-                   "rate_limit_enabled", "fw_sync_enabled", "ai_enabled"]
+                   "rate_limit_enabled", "fw_sync_enabled", "ai_enabled",
+                   "auto_ban_cc_enabled", "auto_ban_scan_enabled", "auto_ban_ssh_enabled",
+                   "proxy_cool_enabled"]
     POLICY_INT = ["auto_ban_window", "auto_ban_threshold", "auto_ban_seconds",
-                  "rate_limit_per_sec", "log_max_rows"]
+                  "rate_limit_per_sec", "log_max_rows",
+                  "auto_ban_cc_window", "auto_ban_cc_threshold", "auto_ban_cc_seconds",
+                  "auto_ban_scan_window", "auto_ban_scan_threshold", "auto_ban_scan_seconds",
+                  "auto_ban_ssh_window", "auto_ban_ssh_threshold",
+                  "burst_window", "proxy_cool_min_conns", "proxy_cool_uniq_threshold",
+                  "proxy_cool_single_pct", "proxy_cool_seconds"]
 
     def get_policy(self, get=None):
-        cfg = self._cfg()
+        """读取准入策略（实际生效值，供设置页回显）。"""
+        cfg = self._cfg_effective()
         data = {}
         for k in self.POLICY_BOOL:
             data[k] = bool(cfg.get(k, False))
@@ -1354,6 +1559,21 @@ class frpwaf_main:
                         pass
             if "auto_ban_window" in patch and patch["auto_ban_window"] < 1:
                 patch["auto_ban_window"] = 1
+            # 攻击类型封禁：窗口参数同样强制 ≥1 秒；
+            # 开关开启时参数为「未设置形态」（阈值/时长 0、窗口 ≤1）的回退默认值，
+            # 由 _app("config").save() 内统一的 normalize_auto_ban() 完成。
+            for _w in ("auto_ban_cc_window", "auto_ban_scan_window", "auto_ban_ssh_window"):
+                if _w in patch and patch[_w] < 1:
+                    patch[_w] = 1
+            # 突发观测/冷却：窗口 ≥2s、时长 ≥10s（与引擎运行时 max(10,...) 一致）、
+            # 占比 ≤100；开关开启时「未设置形态」参数的回退默认由 config.save()
+            # 内的 normalize_burst_cool() 统一完成（与攻击类型封禁同一机制）。
+            if "burst_window" in patch and patch["burst_window"] < 2:
+                patch["burst_window"] = 2
+            if "proxy_cool_seconds" in patch and patch["proxy_cool_seconds"] < 10:
+                patch["proxy_cool_seconds"] = 10
+            if "proxy_cool_single_pct" in patch and patch["proxy_cool_single_pct"] > 100:
+                patch["proxy_cool_single_pct"] = 100
             self._set_cfg(patch)
             try:
                 _app("engine").invalidate_cache()
@@ -1366,11 +1586,15 @@ class frpwaf_main:
 
     # ---------------- 管理员账号 ----------------
     def get_admin(self, get=None):
-        """读取当前管理面板账号（用户名 + 密码），供设置页回显。"""
+        """读取当前管理面板账号（用户名 + 密码掩码），供设置页回显。
+
+        不回显明文密码：避免插件请求日志 / 浏览器网络面板 / 截图泄露；
+        修改密码走 change_admin_pwd（需校验原密码）。
+        """
         cfg = self._cfg()
         return {"status": True, "data": {
             "user": cfg.get("admin_user", "admin"),
-            "password": cfg.get("admin_password", ""),
+            "password": "******" if cfg.get("admin_password") else "",
         }}
 
     def change_admin_pwd(self, get=None):
@@ -1417,6 +1641,7 @@ class frpwaf_main:
                 patch["admin_password"] = str(new)
             if not patch:
                 return public.returnMsg(False, "未修改任何内容")
+            patch["secret"] = secrets.token_hex(32)
             self._set_cfg(patch)
             return public.returnMsg(True, "账号已更新")
         except Exception:

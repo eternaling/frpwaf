@@ -56,7 +56,8 @@
   .box h2{font-size:14px;margin:0 0 12px;display:flex;align-items:center;gap:10px}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
   .grow{flex:1}
-  .tag{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600}
+  .tag{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600;
+       white-space:nowrap;vertical-align:middle}
   .tag.allow{background:rgba(34,197,94,.15);color:var(--ok)}
   .tag.reject{background:rgba(239,68,68,.15);color:var(--err)}
   .tag.black{background:rgba(239,68,68,.15);color:var(--err)}
@@ -160,25 +161,50 @@
     <!-- 日志 -->
     <section id="tab-logs" class="hide">
       <div class="box">
+        <h2>突发观测 <span class="stat-badge">最近窗口内按代理聚合（实时内存统计）</span>
+          <span class="grow"></span>
+          <span class="tag gray" id="burstCoolState">冷却未启用</span>
+          <button class="ghost sm" onclick="loadBurst()">刷新</button>
+        </h2>
+        <div class="scroll" style="max-height:320px"><table id="burstTable">
+          <thead><tr><th>代理</th><th>类型</th><th>连接数</th><th>独立 IP</th><th>仅 1 次占比</th><th>速率(条/秒)</th><th>定性</th><th>冷却剩余</th></tr></thead>
+          <tbody></tbody></table></div>
+        <p class="muted" id="burstTip" style="margin:10px 0 0;font-size:12px"></p>
+      </div>
+      <div class="box">
         <h2>连接日志 <span class="stat-badge" id="logTotal"></span></h2>
         <div class="row">
-          <input id="logIp" placeholder="按 IP 过滤" style="width:180px">
-          <select id="logAction">
-            <option value="">全部动作</option><option value="allow">allow</option>
-            <option value="reject">reject</option>
+          <select id="logView" onchange="switchLogView()" style="width:110px">
+            <option value="raw">原始日志</option>
+            <option value="agg">按代理聚合</option>
           </select>
-          <select id="logProxy" style="width:180px">
-            <option value="">全部代理</option>
+          <select id="logWindow" onchange="loadLogs(0)" style="width:120px;display:none">
+            <option value="3600">最近 1 小时</option>
+            <option value="21600">最近 6 小时</option>
+            <option value="86400">最近 24 小时</option>
           </select>
+          <span id="logRawFilters" style="display:contents">
+            <input id="logIp" placeholder="按 IP 过滤" style="width:180px">
+            <select id="logAction">
+              <option value="">全部动作</option><option value="allow">allow</option>
+              <option value="reject">reject</option>
+            </select>
+            <select id="logProxy" style="width:180px">
+              <option value="">全部代理</option>
+            </select>
+          </span>
           <button class="sm" onclick="loadLogs(0)">查询</button>
           <button class="ghost sm" onclick="document.getElementById('logIp').value='';document.getElementById('logAction').value='';document.getElementById('logProxy').value='';loadLogs(0)">重置</button>
           <span class="grow"></span>
           <button class="danger sm" onclick="purgeLogs()">清空日志</button>
         </div>
-        <div class="scroll"><table id="logTable">
+        <div class="scroll" id="logRawWrap"><table id="logTable">
           <thead><tr><th>时间</th><th>来源 IP</th><th>归属地</th><th>端口</th><th>代理</th><th>类型</th><th>用户</th><th>动作</th><th>原因</th></tr></thead>
           <tbody></tbody></table></div>
-        <div class="row" style="margin-top:12px">
+        <div class="scroll" id="logAggWrap" style="display:none"><table id="logAggTable">
+          <thead><tr><th>代理</th><th>类型</th><th>连接数</th><th>独立 IP</th><th>仅 1 次 IP</th><th>仅 1 次占比</th><th>被拒绝</th><th>最后活动</th></tr></thead>
+          <tbody></tbody></table></div>
+        <div class="row" style="margin-top:12px" id="logPager">
           <button class="ghost sm" onclick="logPage(-1)">上一页</button>
           <span class="muted" id="logPageInfo"></span>
           <button class="ghost sm" onclick="logPage(1)">下一页</button>
@@ -256,6 +282,36 @@
           <div class="field"><label>限速（每秒新连接数，0=关）</label><input id="s_rate_limit_per_sec" type="number"></div>
           <div class="field"><label>日志保留条数</label><input id="s_log_max_rows" type="number"></div>
         </div>
+        <h2 style="margin-top:18px">攻击类型自动封禁 <span class="stat-badge">按攻击特征分维度，默认开启</span></h2>
+        <div class="switch"><input type="checkbox" id="s_auto_ban_cc_enabled"><label for="s_auto_ban_cc_enabled">CC 攻击自动封禁（https/tcpmux 高频新建连接 → 临时封禁；frp 对 http 类型不触发回调）</label></div>
+        <div class="grid3" style="margin-top:8px">
+          <div class="field"><label>CC 窗口（秒）</label><input id="s_auto_ban_cc_window" type="number"></div>
+          <div class="field"><label>CC 连接数阈值</label><input id="s_auto_ban_cc_threshold" type="number"></div>
+          <div class="field"><label>CC 封禁时长（秒）</label><input id="s_auto_ban_cc_seconds" type="number"></div>
+        </div>
+        <div class="switch" style="margin-top:12px"><input type="checkbox" id="s_auto_ban_scan_enabled"><label for="s_auto_ban_scan_enabled">端口扫描自动封禁（窗口内访问大量不同代理 → 临时封禁）</label></div>
+        <div class="grid3" style="margin-top:8px">
+          <div class="field"><label>扫描窗口（秒）</label><input id="s_auto_ban_scan_window" type="number"></div>
+          <div class="field"><label>不同代理数阈值</label><input id="s_auto_ban_scan_threshold" type="number"></div>
+          <div class="field"><label>扫描封禁时长（秒）</label><input id="s_auto_ban_scan_seconds" type="number"></div>
+        </div>
+        <div class="switch" style="margin-top:12px"><input type="checkbox" id="s_auto_ban_ssh_enabled"><label for="s_auto_ban_ssh_enabled">敏感服务爆破自动封禁（ssh/mysql/redis 等非 HTTP 类代理高频连接 → 永久黑名单）</label></div>
+        <div class="grid3" style="margin-top:8px">
+          <div class="field"><label>爆破窗口（秒）</label><input id="s_auto_ban_ssh_window" type="number"></div>
+          <div class="field"><label>爆破连接数阈值</label><input id="s_auto_ban_ssh_threshold" type="number"></div>
+          <div class="field"><label>处置</label><div style="color:var(--err);font-weight:600;padding-top:7px">永久黑名单</div></div>
+        </div>
+        <p class="muted" style="margin:10px 0 0;font-size:12px">白名单命中的 IP 不受上述自动封禁影响（需已启用白名单开关）；CC 检测依赖 frp NewUserConn 回调，仅对 https/tcpmux 代理生效（http 类型不触发回调，纯 http 代理请以限速/名单手段为主）；敏感服务检测仅针对非 HTTP 类代理，代理名按分隔符匹配关键字（ssh / mysql / redis / rdp / mongo / postgres / elastic / telnet / smb / vnc / ftp），wordpress 这类含子串的普通名不会误判。爆破封禁在黑名单开关关闭时自动降级为临时封禁。</p>
+        <h2 style="margin-top:18px">代理级冷却拦截 <span class="stat-badge">分布式突发处置，默认关闭</span></h2>
+        <div class="switch"><input type="checkbox" id="s_proxy_cool_enabled"><label for="s_proxy_cool_enabled">启用代理级冷却拦截（冷却期内该代理新出现 IP 被拒，已见 IP 放行）</label></div>
+        <div class="grid3" style="margin-top:8px">
+          <div class="field"><label>观测/判定窗口（秒）</label><input id="s_burst_window" type="number"></div>
+          <div class="field"><label>触发下限：连接数</label><input id="s_proxy_cool_min_conns" type="number"></div>
+          <div class="field"><label>触发下限：独立 IP 数</label><input id="s_proxy_cool_uniq_threshold" type="number"></div>
+          <div class="field"><label>仅 1 次占比（%）</label><input id="s_proxy_cool_single_pct" type="number"></div>
+          <div class="field"><label>冷却时长（秒）</label><input id="s_proxy_cool_seconds" type="number"></div>
+        </div>
+        <p class="muted" style="margin:10px 0 0;font-size:12px">误伤提示：出口 IP 变化的真实用户（移动网络切换、动态 IP、CDN 回源）可能被拒。建议先在「连接日志 → 突发观测」观察 1-2 天，确认流量性质且可接受偶发误伤后再启用；白名单 IP 不受影响。</p>
         <div class="row" style="margin-top:14px"><button onclick="saveSettings()">保存策略</button></div>
       </div>
       <div class="box">
@@ -287,8 +343,20 @@ const api = async (path, method='GET', body=null) => {
   const opt = {method, headers:{'Content-Type':'application/json'}};
   if (body) opt.body = JSON.stringify(body);
   const r = await fetch(path, opt);
-  if (r.status === 401) { showLogin(); throw new Error('unauthorized'); }
-  return r.json();
+  // 登录接口的 401/429 是「凭据错误/限速」，不是会话过期，不触发跳登录
+  if (r.status === 401 && path !== '/api/login') { showLogin(); throw new Error('unauthorized'); }
+  let j;
+  try { j = await r.json(); }
+  catch(e) { throw new Error('服务器响应异常（HTTP '+r.status+'）'); }
+  // 统一错误处理：HTTP 非 2xx 或 code!=0 时抛出（由调用方 catch 显示），
+  // 避免调用方各自判断 r.code 造成遗漏（旧实现部分页面直接把错误响应当数据渲染）
+  if (!r.ok || (j && typeof j.code === 'number' && j.code !== 0)) {
+    const err = new Error((j && j.msg) || ('请求失败（HTTP '+r.status+'）'));
+    err.code = (j && j.code) || r.status;
+    err.data = j;
+    throw err;
+  }
+  return j;
 };
 function toast(msg, type='') {
   const t = document.createElement('div');
@@ -308,7 +376,7 @@ async function doLogin(){
     const r = await api('/api/login','POST',{username:u,password:p});
     if(r.code===0){ showApp(); toast('登录成功','ok'); }
     else { $('#lerr').textContent = r.msg||'登录失败'; }
-  }catch(e){ $('#lerr').textContent='网络错误'; }
+  }catch(e){ $('#lerr').textContent = (e && e.message!=='unauthorized') ? (e.message||'登录失败') : '登录失败'; }
 }
 async function doLogout(){ await api('/api/logout','POST'); showLogin(); }
 function showLogin(){ $('#login').classList.remove('hide'); $('#app').classList.add('hide'); $('#lp').value=''; }
@@ -325,28 +393,34 @@ document.querySelectorAll('nav a').forEach(a=>a.onclick=()=>{
 function loadTab(tab){
   document.querySelectorAll('section[id^=tab-]').forEach(s=>s.classList.add('hide'));
   $('#tab-'+tab).classList.remove('hide');
-  ({dash:loadDash, list:()=>loadList(curListType), logs:()=>{loadLogProxies();loadLogs(0);},
+  ({dash:loadDash, list:()=>loadList(curListType), logs:()=>{loadLogProxies();loadLogs(0);loadBurst();},
     bans:loadBans, geoq:loadGeo, proxies:loadProxies, settings:loadSettings}[tab]||(()=>{}))();
 }
 
 /* ---- 概览 ---- */
 async function loadDash(){
-  const r = await api('/api/overview'); const d=r.data;
-  $('#whoami').textContent = '管理员：'+(d.admin_user||'已登录');
-  $('#statCards').innerHTML = [
-    ['今日连接', d.today_conns, 'pri'], ['今日拦截', d.today_rejected, 'err'],
-    ['今日独立IP', d.today_uniq_ip, ''], ['生效封禁', d.active_bans, 'err'],
-    ['黑名单', d.black_count, ''], ['白名单', d.white_count, ''],
-  ].map(([k,v,c])=>`<div class="card"><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`).join('');
-  $('#sysInfo').innerHTML = [
-    ['版本', d.version], ['运行时长', fmtDur(d.uptime)],
-    ['回调地址', d.http_addr+':'+d.http_port],
-    ['黑名单', d.blacklist_enabled?'已启用':'关闭'],
-    ['白名单', d.whitelist_enabled?'已启用':'关闭'],
-    ['自动封禁', d.auto_ban_enabled?'已启用':'关闭'],
-  ].map(([k,v])=>`<div class="field"><label>${k}</label><div>${v}</div></div>`).join('');
-  const lr = await api('/api/logs?limit=15');
-  $('#dashLogs tbody').innerHTML = lr.data.map(logRow).join('') || '<tr><td class="muted">暂无记录</td></tr>';
+  try{
+    const r = await api('/api/overview'); const d=r.data;
+    $('#whoami').textContent = '管理员：'+(d.admin_user||'已登录');
+    $('#statCards').innerHTML = [
+      ['今日连接', d.today_conns, 'pri'], ['今日拦截', d.today_rejected, 'err'],
+      ['今日独立IP', d.today_uniq_ip, ''], ['生效封禁', d.active_bans, 'err'],
+      ['黑名单', d.black_count, ''], ['白名单', d.white_count, ''],
+    ].map(([k,v,c])=>`<div class="card"><div class="k">${esc(k)}</div><div class="v ${c}">${esc(v)}</div></div>`).join('');
+    $('#sysInfo').innerHTML = [
+      ['版本', d.version], ['运行时长', fmtDur(d.uptime)],
+      ['回调地址', (d.http_addr||'')+':'+(d.http_port||'')],
+      ['黑名单', d.blacklist_enabled?'已启用':'关闭'],
+      ['白名单', d.whitelist_enabled?'已启用':'关闭'],
+      ['自动封禁', d.auto_ban_enabled?'已启用':'关闭'],
+      ['CC 封禁', d.auto_ban_cc_enabled?'已启用':'关闭'],
+      ['扫描封禁', d.auto_ban_scan_enabled?'已启用':'关闭'],
+      ['爆破封禁', d.auto_ban_ssh_enabled?'已启用':'关闭'],
+    ].map(([k,v])=>`<div class="field"><label>${esc(k)}</label><div>${esc(v)}</div></div>`).join('');
+    const lr = await api('/api/logs?limit=15');
+    $('#dashLogs tbody').innerHTML = (lr.data||[]).map(logRow).join('')
+      || '<tr><td class="muted" colspan="6">暂无记录</td></tr>';
+  }catch(e){ if(e.message!=='unauthorized') toast('概览加载失败：'+e.message,'err'); }
 }
 function logRow(x){
   return `<tr><td class="muted">${fmtTime(x.ts)}</td><td>${esc(x.ip)}</td><td class="muted">${esc(x.geo||'-')}</td><td>${esc(x.proxy_name||'-')}</td>
@@ -360,27 +434,35 @@ async function loadList(type){ curListType=type;
   $('#btnBlack').className='ghost sm'+(type==='black'?' active':'');
   $('#btnWhite').className='ghost sm'+(type==='white'?' active':'');
   $('#btnAll').className='ghost sm'+(type===''?' active':'');
-  const r = await api('/api/iplist'+(type?'?type='+type:''));
-  $('#listCount').textContent = '共 '+r.data.length+' 条';
-  $('#ipTable tbody').innerHTML = r.data.map(x=>`<tr>
-    <td class="muted">${x.id}</td><td><code>${esc(x.cidr)}</code></td>
-    <td><span class="tag ${x.list_type}">${x.list_type==='black'?'黑名单':'白名单'}</span></td>
-    <td class="muted">${esc(x.geo||'-')}</td>
-    <td class="muted">${esc(x.remark||'')}</td><td class="muted">${fmtTime(x.created_at)}</td>
-    <td><button class="danger sm" onclick="delIp(${x.id})">删除</button></td></tr>`).join('')
-    || '<tr><td class="muted">暂无条目</td></tr>';
+  try{
+    const r = await api('/api/iplist'+(type?'?type='+type:''));
+    $('#listCount').textContent = '共 '+(r.data||[]).length+' 条';
+    $('#ipTable tbody').innerHTML = (r.data||[]).map(x=>`<tr>
+      <td class="muted">${esc(x.id)}</td><td><code>${esc(x.cidr)}</code></td>
+      <td><span class="tag ${x.list_type}">${x.list_type==='black'?'黑名单':'白名单'}</span></td>
+      <td class="muted">${esc(x.geo||'-')}</td>
+      <td class="muted">${esc(x.remark||'')}</td><td class="muted">${fmtTime(x.created_at)}</td>
+      <td><button class="danger sm" onclick="delIp(${esc(x.id)})">删除</button></td></tr>`).join('')
+      || '<tr><td class="muted" colspan="7">暂无条目</td></tr>';
+  }catch(e){ if(e.message!=='unauthorized') toast('名单加载失败：'+e.message,'err'); }
 }
 async function addIp(){
-  const r = await api('/api/iplist','POST',{action:'add',cidr:$('#ipCidr').value,
-    list_type:$('#ipType').value, remark:$('#ipRemark').value});
-  toast(r.msg, r.code===0?'ok':'err'); if(r.code===0){$('#ipCidr').value='';$('#ipRemark').value='';loadList(curListType);}
+  try{
+    const r = await api('/api/iplist','POST',{action:'add',cidr:$('#ipCidr').value,
+      list_type:$('#ipType').value, remark:$('#ipRemark').value});
+    toast(r.msg,'ok'); $('#ipCidr').value=''; $('#ipRemark').value=''; loadList(curListType);
+  }catch(e){ toast(e.message,'err'); }
 }
-async function delIp(id){ const r=await api('/api/iplist','POST',{action:'del',id});
-  toast(r.msg, r.code===0?'ok':'err'); loadList(curListType); }
+async function delIp(id){
+  try{ const r=await api('/api/iplist','POST',{action:'del',id});
+    toast(r.msg,'ok'); loadList(curListType); }catch(e){ toast(e.message,'err'); }
+}
 async function batchImport(){
-  const r = await api('/api/iplist','POST',{action:'batch',text:$('#ipBatch').value,
-    list_type:$('#ipType').value});
-  toast(r.msg, r.code===0?'ok':'err'); if(r.code===0){$('#ipBatch').value='';loadList(curListType);}
+  try{
+    const r = await api('/api/iplist','POST',{action:'batch',text:$('#ipBatch').value,
+      list_type:$('#ipType').value});
+    toast(r.msg,'ok'); $('#ipBatch').value=''; loadList(curListType);
+  }catch(e){ toast(e.message,'err'); }
 }
 
 /* ---- 日志 ---- */
@@ -395,20 +477,80 @@ async function loadLogProxies(){
   }catch(e){}
 }
 async function loadLogs(off){ logOff = off;
-  const ip=$('#logIp').value.trim(), ac=$('#logAction').value, px=$('#logProxy').value;
-  let q=`?limit=${logLimit}&offset=${logOff}`;
-  if(ip) q+='&ip='+encodeURIComponent(ip);
-  if(ac) q+='&action='+ac;
-  if(px) q+='&proxy='+encodeURIComponent(px);
-  const r = await api('/api/logs'+q);
-  $('#logTotal').textContent = '共 '+r.total+' 条';
-  $('#logTable tbody').innerHTML = r.data.map(x=>`<tr>
-    <td class="muted">${fmtTime(x.ts)}</td><td><a href="javascript:;" onclick="quickGeo(${esc(JSON.stringify(x.ip||''))})">${esc(x.ip)}</a></td><td class="muted">${esc(x.geo||'-')}</td><td class="muted">${esc(x.port||'')}</td>
-    <td>${esc(x.proxy_name||'-')}</td><td class="muted">${esc(x.proxy_type||'')}</td><td class="muted">${esc(x.user||'')}</td>
-    <td><span class="tag ${x.action==='allow'?'allow':'reject'}">${esc(x.action)}</span></td>
-    <td class="muted">${esc(x.reason||'')}</td></tr>`).join('') || '<tr><td class="muted">暂无记录</td></tr>';
-  const page = Math.floor(logOff/logLimit)+1, pages = Math.max(1, Math.ceil(r.total/logLimit));
-  $('#logPageInfo').textContent = `第 ${page} / ${pages} 页`;
+  if(($('#logView')||{}).value==='agg'){ loadLogAgg(); return; }
+  try{
+    const ip=$('#logIp').value.trim(), ac=$('#logAction').value, px=$('#logProxy').value;
+    let q=`?limit=${logLimit}&offset=${logOff}`;
+    if(ip) q+='&ip='+encodeURIComponent(ip);
+    if(ac) q+='&action='+ac;
+    if(px) q+='&proxy='+encodeURIComponent(px);
+    const r = await api('/api/logs'+q);
+    const rows = r.data||[];
+    $('#logTotal').textContent = '共 '+(r.total||0)+' 条';
+    $('#logTable tbody').innerHTML = rows.map(x=>`<tr>
+      <td class="muted">${fmtTime(x.ts)}</td><td><a href="javascript:;" onclick="quickGeo(${esc(JSON.stringify(x.ip||''))})">${esc(x.ip)}</a></td><td class="muted">${esc(x.geo||'-')}</td><td class="muted">${esc(x.port||'')}</td>
+      <td>${esc(x.proxy_name||'-')}</td><td class="muted">${esc(x.proxy_type||'')}</td><td class="muted">${esc(x.user||'')}</td>
+      <td><span class="tag ${x.action==='allow'?'allow':'reject'}">${esc(x.action)}</span></td>
+      <td class="muted">${esc(x.reason||'')}</td></tr>`).join('') || '<tr><td class="muted" colspan="9">暂无记录</td></tr>';
+    const page = Math.floor(logOff/logLimit)+1, pages = Math.max(1, Math.ceil((r.total||0)/logLimit));
+    $('#logPageInfo').textContent = `第 ${page} / ${pages} 页`;
+  }catch(e){ if(e.message!=='unauthorized') toast('日志加载失败：'+e.message,'err'); }
+}
+function switchLogView(){
+  const agg=$('#logView').value==='agg';
+  $('#logRawWrap').style.display=agg?'none':'';
+  $('#logAggWrap').style.display=agg?'':'none';
+  $('#logPager').style.display=agg?'none':'';
+  const raw=$('#logRawFilters'); if(raw) raw.style.display=agg?'none':'contents';
+  const win=$('#logWindow'); if(win) win.style.display=agg?'':'none';
+  if(agg) loadLogAgg(); else loadLogs(logOff);
+}
+async function loadLogAgg(){
+  const w=($('#logWindow')||{}).value||'3600';
+  try{
+    const r = await api('/api/logs/summary?window='+w);
+    const rows = r.data||[];
+    const total = r.total_proxies||rows.length;
+    const more = total>rows.length ? `（显示前 ${rows.length} 个）` : '';
+    $('#logTotal').textContent = `最近 ${Math.round((r.window||3600)/3600)} 小时 · 共 ${total} 个代理${more}`;
+    $('#logAggTable tbody').innerHTML = rows.map(x=>{
+      const hot = x.single_pct>=80 && x.uniq_ips>=50;
+      return `<tr><td>${esc(x.proxy_name)}</td><td class="muted">${esc(x.proxy_type||'-')}</td>
+        <td>${esc(x.conns)}</td><td>${esc(x.uniq_ips)}</td><td>${esc(x.single_ips)}</td>
+        <td${hot?' style="color:var(--err);font-weight:600"':''}>${esc(x.single_pct)}%</td>
+        <td class="muted"${x.rejected?' style="color:var(--err)"':''}>${esc(x.rejected||0)}</td>
+        <td class="muted">${fmtTime(x.last_ts)}</td></tr>`;
+    }).join('') || '<tr><td class="muted" colspan="8">暂无记录</td></tr>';
+  }catch(e){ if(e.message!=='unauthorized') toast('聚合加载失败：'+e.message,'err'); }
+}
+/* 突发观测：直连守护进程实时内存快照（与插件端「突发观测」卡片对等） */
+async function loadBurst(){
+  try{
+    const r = await api('/api/burst');
+    const rows = r.data||[], cfg = r.config||{};
+    const badge = $('#burstCoolState');
+    if(badge){
+      badge.className = 'tag ' + (cfg.proxy_cool_enabled?'reject':'gray');
+      badge.textContent = cfg.proxy_cool_enabled
+        ? `冷却已启用（${cfg.proxy_cool_seconds||60}s）` : '冷却未启用（仅观测）';
+    }
+    const tip = $('#burstTip');
+    if(tip){
+      tip.textContent = `窗口 ${cfg.burst_window||60} 秒；冷却触发条件：连接数 ≥ ${cfg.proxy_cool_min_conns||300}`
+        + ` 且独立 IP ≥ ${cfg.proxy_cool_uniq_threshold||200} 且仅 1 次占比 ≥ ${cfg.proxy_cool_single_pct||80}%`
+        + ` → 冷却 ${cfg.proxy_cool_seconds||60} 秒（冷却期内该代理新出现 IP 被拒，老 IP 放行）。`
+        + `定性标签：疑似分布式探测=独立 IP ≥ 50 且仅 1 次占比 ≥ 80%；单点高频=连接数 ≥ 100 且独立 IP ≤ 3。`;
+    }
+    const LV = {distributed_probe:['疑似分布式探测','var(--err)'], single_source:['单点高频','#e6a23c'], normal:['正常','']};
+    $('#burstTable tbody').innerHTML = rows.map(x=>{
+      const lv = LV[x.level]||['正常',''];
+      return `<tr><td>${esc(x.proxy_name)}</td><td class="muted">${esc(x.proxy_type||'-')}</td>
+        <td>${esc(x.conns)}</td><td>${esc(x.uniq_ips)}</td><td>${esc(x.single_pct)}%</td>
+        <td class="muted">${esc(x.rate)}</td>
+        <td${lv[1]?` style="color:${lv[1]};font-weight:600"`:''}>${lv[0]}${x.truncated?' <span class="muted" title="独立 IP 超统计上限，仅统计前 2000 个">（截断）</span>':''}</td>
+        <td>${x.cool_remain>0?`<span class="tag reject">${esc(x.cool_remain)}s</span>`:'-'}</td></tr>`;
+    }).join('') || '<tr><td class="muted" colspan="8">窗口内暂无连接</td></tr>';
+  }catch(e){ if(e.message!=='unauthorized') toast('突发观测加载失败：'+e.message,'err'); }
 }
 function logPage(d){ logOff = Math.max(0, logOff + d*logLimit); loadLogs(logOff); }
 function quickGeo(ip){
@@ -419,72 +561,102 @@ function quickGeo(ip){
   geoQuery();
 }
 async function purgeLogs(){ if(!confirm('确定清空所有连接日志？')) return;
-  const r=await api('/api/logs','POST',{action:'purge'}); toast(r.msg,'ok'); loadLogs(0); }
+  try{ const r=await api('/api/logs','POST',{action:'purge'}); toast(r.msg,'ok'); loadLogs(0); }
+  catch(e){ toast(e.message,'err'); } }
 
 /* ---- 封禁 ---- */
-async function loadBans(){
-  const r = await api('/api/bans');
-  $('#banTable tbody').innerHTML = r.data.map(x=>`<tr>
-    <td>${esc(x.ip)}</td><td class="muted">${esc(x.geo||'-')}</td><td class="muted">${esc(x.reason||'')}</td>
-    <td class="muted">${fmtTime(x.banned_at)}</td><td class="muted">${fmtTime(x.expire_at)}</td>
-    <td><button class="sm" onclick="unban(${esc(JSON.stringify(x.ip||''))})">解封</button></td></tr>`).join('')
-    || '<tr><td class="muted">当前无生效封禁</td></tr>';
-  $('#banHis tbody').innerHTML = r.history.map(x=>`<tr>
-    <td>${esc(x.ip)}</td><td class="muted">${esc(x.geo||'-')}</td><td class="muted">${esc(x.reason||'')}</td>
-    <td class="muted">${fmtTime(x.banned_at)}</td><td class="muted">${fmtTime(x.expire_at)}</td>
-    <td><span class="tag ${x.released?'gray':'reject'}">${x.released?'已解封':'生效中'}</span></td></tr>`).join('')
-    || '<tr><td class="muted">暂无历史</td></tr>';
+function banState(x){
+  // 三态：已解封 / 生效中（未到期）/ 已过期（自然到期释放前的展示态）
+  if(x.released) return {cls:'gray', text:'已解封'};
+  const now = Math.floor(Date.now()/1000);
+  if(x.expire_at && x.expire_at <= now) return {cls:'gray', text:'已过期'};
+  return {cls:'reject', text:'生效中'};
 }
-async function unban(ip){ const r=await api('/api/bans','POST',{action:'unban',ip});
-  toast(r.msg,'ok'); loadBans(); }
+async function loadBans(){
+  try{
+    const r = await api('/api/bans');
+    $('#banTable tbody').innerHTML = (r.data||[]).map(x=>`<tr>
+      <td>${esc(x.ip)}</td><td class="muted">${esc(x.geo||'-')}</td><td class="muted">${esc(x.reason||'')}</td>
+      <td class="muted">${fmtTime(x.banned_at)}</td><td class="muted">${fmtTime(x.expire_at)}</td>
+      <td><button class="sm" onclick="unban(${esc(JSON.stringify(x.ip||''))})">解封</button></td></tr>`).join('')
+      || '<tr><td class="muted" colspan="6">当前无生效封禁</td></tr>';
+    $('#banHis tbody').innerHTML = (r.history||[]).map(x=>{
+      const st = banState(x);
+      return `<tr>
+      <td>${esc(x.ip)}</td><td class="muted">${esc(x.geo||'-')}</td><td class="muted">${esc(x.reason||'')}</td>
+      <td class="muted">${fmtTime(x.banned_at)}</td><td class="muted">${fmtTime(x.expire_at)}</td>
+      <td><span class="tag ${st.cls}">${st.text}</span></td></tr>`;
+    }).join('')
+      || '<tr><td class="muted" colspan="6">暂无历史</td></tr>';
+  }catch(e){ if(e.message!=='unauthorized') toast('封禁数据加载失败：'+e.message,'err'); }
+}
+async function unban(ip){ try{ const r=await api('/api/bans','POST',{action:'unban',ip});
+  toast(r.msg,'ok'); loadBans(); }catch(e){ toast(e.message,'err'); } }
 async function manualBan(){ const ip=$('#banIp').value.trim();
   if(!ip) return toast('请输入 IP','err');
-  const r=await api('/api/bans','POST',{action:'ban',ip,seconds:+$('#banSec').value||3600});
-  toast(r.msg, r.code===0?'ok':'err'); $('#banIp').value=''; loadBans(); }
+  try{
+    const r=await api('/api/bans','POST',{action:'ban',ip,seconds:+$('#banSec').value||3600});
+    toast(r.msg,'ok'); $('#banIp').value=''; loadBans();
+  }catch(e){ toast(e.message,'err'); }
+}
 
 /* ---- IP 归属查询 ---- */
 async function loadGeo(){
-  const db = await api('/api/geo/db');
-  $('#geoDbInfo').textContent = db.data.available ? ('离线库已加载') : '离线库不可用';
-  const r = await api('/api/logs?limit=1000');
-  // 按 IP 聚合
-  const m = {};
-  r.data.forEach(x=>{ m[x.ip] = (m[x.ip]||0)+1; });
-  const list = Object.entries(m).sort((a,b)=>b[1]-a[1]).slice(0,50);
-  const geoMap = {};
-  r.data.forEach(x=>{ geoMap[x.ip]=x.geo; });
-  $('#geoTopTable tbody').innerHTML = list.map(([ip,n])=>`<tr>
-    <td>${esc(ip)}</td><td class="muted">${esc(geoMap[ip]||'-')}</td><td>${esc(n)}</td></tr>`).join('')
-    || '<tr><td class="muted">暂无数据</td></tr>';
+  try{
+    const db = await api('/api/geo/db');
+    $('#geoDbInfo').textContent = (db.data&&db.data.available) ? '离线库已加载' : '离线库不可用';
+    const r = await api('/api/logs?limit=1000');
+    // 按 IP 聚合
+    const m = {};
+    (r.data||[]).forEach(x=>{ m[x.ip] = (m[x.ip]||0)+1; });
+    const list = Object.entries(m).sort((a,b)=>b[1]-a[1]).slice(0,50);
+    const geoMap = {};
+    (r.data||[]).forEach(x=>{ geoMap[x.ip]=x.geo; });
+    $('#geoTopTable tbody').innerHTML = list.map(([ip,n])=>`<tr>
+      <td>${esc(ip)}</td><td class="muted">${esc(geoMap[ip]||'-')}</td><td>${esc(n)}</td></tr>`).join('')
+      || '<tr><td class="muted" colspan="3">暂无数据</td></tr>';
+  }catch(e){ if(e.message!=='unauthorized') toast('归属地数据加载失败：'+e.message,'err'); }
 }
 async function geoQuery(){
   const ip = $('#geoIp').value.trim();
   if(!ip) return;
-  const r = await api('/api/geo?ip='+encodeURIComponent(ip));
-  if(r.code!==0){ $('#geoResult').innerHTML = `<div class="muted">${esc(r.msg)}</div>`; return; }
-  const d = r.data;
-  $('#geoResult').innerHTML = [
-    ['IP', d.ip], ['归属地', d.geo||'未知'],
-    ['国家/地区', d.country||'-'], ['省份', d.province||'-'], ['城市', d.city||'-'],
-    ['运营商', d.isp||'-'], ['历史连接', d.total_conns], ['近24h连接', d.today_conns],
-  ].map(([k,v])=>`<div class="field"><label>${esc(k)}</label><div>${esc(v)}</div></div>`).join('');
+  try{
+    const r = await api('/api/geo?ip='+encodeURIComponent(ip));
+    const d = r.data;
+    $('#geoResult').innerHTML = [
+      ['IP', d.ip], ['归属地', d.geo||'未知'],
+      ['国家/地区', d.country||'-'], ['省份', d.province||'-'], ['城市', d.city||'-'],
+      ['运营商', d.isp||'-'], ['历史连接', d.total_conns], ['近24h连接', d.today_conns],
+    ].map(([k,v])=>`<div class="field"><label>${esc(k)}</label><div>${esc(v)}</div></div>`).join('');
+  }catch(e){ if(e.message!=='unauthorized') $('#geoResult').innerHTML = `<div class="muted">${esc(e.message)}</div>`; }
 }
 
 /* ---- 代理统计 ---- */
 async function loadProxies(){
-  const r = await api('/api/proxies');
-  $('#proxyTable tbody').innerHTML = r.data.map(x=>`<tr>
-    <td>${esc(x.proxy_name)}</td><td class="muted">${esc(x.proxy_type)}</td>
-    <td>${esc(x.total)}</td><td style="color:${x.rejected?'var(--err)':''}">${esc(x.rejected)}</td>
-    <td class="muted">${fmtTime(x.last_ts)}</td></tr>`).join('') || '<tr><td class="muted">暂无数据</td></tr>';
+  try{
+    const r = await api('/api/proxies');
+    $('#proxyTable tbody').innerHTML = (r.data||[]).map(x=>`<tr>
+      <td>${esc(x.proxy_name)}</td><td class="muted">${esc(x.proxy_type)}</td>
+      <td>${esc(x.total)}</td><td style="color:${x.rejected?'var(--err)':''}">${esc(x.rejected)}</td>
+      <td class="muted">${fmtTime(x.last_ts)}</td></tr>`).join('') || '<tr><td class="muted" colspan="5">暂无数据</td></tr>';
+  }catch(e){ if(e.message!=='unauthorized') toast('代理统计加载失败：'+e.message,'err'); }
 }
 
 /* ---- 设置 ---- */
+const SET_BOOL = ['blacklist_enabled','whitelist_enabled','auto_ban_enabled','rate_limit_enabled','fw_sync_enabled',
+  'auto_ban_cc_enabled','auto_ban_scan_enabled','auto_ban_ssh_enabled','proxy_cool_enabled'];
+const SET_INT = ['auto_ban_window','auto_ban_threshold','auto_ban_seconds','rate_limit_per_sec','log_max_rows',
+  'auto_ban_cc_window','auto_ban_cc_threshold','auto_ban_cc_seconds',
+  'auto_ban_scan_window','auto_ban_scan_threshold','auto_ban_scan_seconds',
+  'auto_ban_ssh_window','auto_ban_ssh_threshold',
+  'burst_window','proxy_cool_min_conns','proxy_cool_uniq_threshold','proxy_cool_single_pct','proxy_cool_seconds'];
 async function loadSettings(){
-  const r = await api('/api/config'); const c=r.data;
-  ['blacklist_enabled','whitelist_enabled','auto_ban_enabled','rate_limit_enabled','fw_sync_enabled'].forEach(k=>$('#s_'+k).checked=!!c[k]);
-  ['auto_ban_window','auto_ban_threshold','auto_ban_seconds','rate_limit_per_sec','log_max_rows'].forEach(k=>$('#s_'+k).value=c[k]);
-  loadCurUser();
+  try{
+    const r = await api('/api/config'); const c=r.data;
+    SET_BOOL.forEach(k=>$('#s_'+k).checked=!!c[k]);
+    SET_INT.forEach(k=>$('#s_'+k).value=c[k]);
+    loadCurUser();
+  }catch(e){ if(e.message!=='unauthorized') toast('设置加载失败：'+e.message,'err'); }
 }
 async function loadCurUser(){
   try{ const r=await api('/api/overview'); const u=r.data.admin_user||'-';
@@ -492,21 +664,22 @@ async function loadCurUser(){
 }
 async function saveSettings(){
   const b={};
-  ['blacklist_enabled','whitelist_enabled','auto_ban_enabled','rate_limit_enabled','fw_sync_enabled'].forEach(k=>b[k]=$('#s_'+k).checked);
-  ['auto_ban_window','auto_ban_threshold','auto_ban_seconds','rate_limit_per_sec','log_max_rows'].forEach(k=>b[k]=+$('#s_'+k).value||0);
-  const r=await api('/api/config','POST',b); toast(r.msg, r.code===0?'ok':'err');
+  SET_BOOL.forEach(k=>b[k]=$('#s_'+k).checked);
+  SET_INT.forEach(k=>b[k]=+$('#s_'+k).value||0);
+  try{ const r=await api('/api/config','POST',b); toast(r.msg,'ok'); }
+  catch(e){ toast(e.message,'err'); }
 }
 async function changePwd(){
   const old=$('#pwOld').value, nw=$('#pwNew').value;
   const nu=$('#pwNewUser').value.trim(), ou=$('#pwOldUser').value.trim();
   if(!old){ return toast('请先填写原密码','err'); }
   if(!nw && !nu){ return toast('请填写新用户名或新密码','err'); }
-  const r=await api('/api/password','POST',{old,new:nw,new_user:nu,old_user:ou});
-  toast(r.msg, r.code===0?'ok':'err');
-  if(r.code===0){
+  try{
+    const r=await api('/api/password','POST',{old,new:nw,new_user:nu,old_user:ou});
+    toast(r.msg,'ok');
     $('#pwOld').value=''; $('#pwNew').value=''; $('#pwNewUser').value=''; $('#pwOldUser').value='';
     loadCurUser();
-  }
+  }catch(e){ toast(e.message,'err'); }
 }
 
 /* ---- 启动 ---- */

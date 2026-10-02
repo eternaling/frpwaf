@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import re
+import secrets
 import time
 
 from . import config
@@ -24,7 +25,7 @@ def _sign(payload_bytes, secret):
 
 
 def create_token(user):
-    cfg = config.get()
+    cfg = config.load()
     payload = json.dumps({"u": user, "exp": int(time.time()) + SESSION_TTL}).encode()
     b = base64.urlsafe_b64encode(payload).decode().rstrip("=")
     return b + "." + _sign(payload, cfg["secret"])
@@ -39,32 +40,40 @@ def verify_token(token):
         payload = base64.urlsafe_b64decode(b + pad)
     except Exception:
         return None
-    cfg = config.get()
-    if not hmac.compare_digest(sig, _sign(payload, cfg["secret"])):
+    # 宝塔插件与守护进程分属不同进程；认证不使用决策路径的 1 秒配置缓存。
+    cfg = config.load()
+    try:
+        # 非 ASCII 签名（如构造的 "abc.中文"）会让 compare_digest 抛 TypeError，
+        # 必须捕获返回 None，否则未登录请求会 500（信息泄露面 + 噪声）。
+        if not hmac.compare_digest(sig, _sign(payload, cfg["secret"])):
+            return None
+    except (TypeError, KeyError):
         return None
     try:
         data = json.loads(payload)
     except Exception:
         return None
-    if int(data.get("exp", 0)) < time.time():
+    try:
+        if int(data.get("exp", 0)) < time.time():
+            return None
+    except (TypeError, ValueError):
         return None
     return data.get("u")
 
 
 def check_login(user, password):
-    cfg = config.get()
+    cfg = config.load()
     return (user == cfg.get("admin_user")
             and hmac.compare_digest(str(password), str(cfg.get("admin_password"))))
 
 
 def change_password(old, new):
-    cfg = config.get()
+    cfg = config.load()
     if not hmac.compare_digest(str(old), str(cfg.get("admin_password"))):
         return False, "原密码错误"
     if not new or len(str(new)) < 4:
         return False, "新密码至少 4 位"
-    cfg["admin_password"] = str(new)
-    config.save(cfg)
+    config.save({"admin_password": str(new), "secret": secrets.token_hex(32)})
     return True, "修改成功"
 
 
@@ -74,7 +83,7 @@ def change_credentials(old, new, new_user="", old_user=""):
     参数：old（原密码，必填校验）、new（新密码，可空=不改）、
           new_user（新用户名，可空=不改）、old_user（原用户名，可选二次校验）。
     """
-    cfg = config.get()
+    cfg = config.load()
     if not hmac.compare_digest(str(old), str(cfg.get("admin_password"))):
         return False, "原密码错误"
     old_user = (old_user or "").strip()
@@ -94,6 +103,6 @@ def change_credentials(old, new, new_user="", old_user=""):
         patch["admin_password"] = str(new)
     if not patch:
         return False, "未修改任何内容"
-    cfg.update(patch)
-    config.save(cfg)
+    patch["secret"] = secrets.token_hex(32)
+    config.save(patch)   # 改账号或密码时撤销全部旧会话
     return True, "账号已更新"

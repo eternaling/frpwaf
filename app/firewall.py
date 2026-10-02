@@ -31,12 +31,16 @@ SET6 = "frpwaf_block6"
 CHAIN = "FRPWAF_BLOCK"
 
 _lock = threading.Lock()
+# 全量同步串行锁：从「读库构建快照」到「下发内核」全程互斥。
+# 否则并发同步（如引擎封禁线程 + 后台轮询 + 面板手动同步）中，持旧快照的
+# 调用可能后于新快照执行，把已解封条目重新写回内核（写覆盖竞态）。
+_sync_lock = threading.RLock()
 
 
-def _run(args, timeout=10):
+def _run(args, timeout=10, input_data=None):
     try:
         p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           timeout=timeout)
+                           input=input_data, timeout=timeout)
         return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
     except Exception as e:
         return 1, "", str(e)
@@ -110,25 +114,39 @@ def _members(setname):
 
 
 def _reconcile(setname, want):
-    """让集合内容与 want({member: timeout}) 一致。timeout<=0 表示永久。"""
+    """让集合内容与 want({member: timeout}) 一致。timeout<=0 表示永久。
+
+    批量提交：`ipset restore` 一次事务完成增删（原实现逐条 spawn ipset 命令，
+    集合较大时进程风暴）；restore 内容里的 `del` 对不存在成员不报错，
+    增删顺序为「先删后加」，与逐条语义一致。
+    """
     cur = _members(setname)
     if cur is None:
         _run(["ipset", "create", setname, "hash:net", "timeout", "0", "-exist"])
         cur = _members(setname) or {}
+    cmds = []
+    for m in list(cur):
+        if m not in want:
+            cmds.append("del %s %s" % (setname, m))
     for m, t in want.items():
         permanent = (not t) or t <= 0
         if m in cur:
             cur_perm = (cur[m] or 0) <= 0
             if cur_perm == permanent:
                 continue  # 已存在且性质一致
-            _run(["ipset", "del", setname, m, "-exist"])  # 永久/临时 变更，重建
+            cmds.append("del %s %s" % (setname, m))  # 永久/临时 变更，重建
         if permanent:
-            _run(["ipset", "add", setname, m, "-exist"])
+            cmds.append("add %s %s" % (setname, m))
         else:
-            _run(["ipset", "add", setname, m, "timeout", str(int(t)), "-exist"])
-    for m in list(cur):
-        if m not in want:
-            _run(["ipset", "del", setname, m, "-exist"])
+            cmds.append("add %s %s timeout %d" % (setname, m, int(t)))
+    if not cmds:
+        return
+    payload = ("\n".join(cmds) + "\n").encode("utf-8")
+    rc, _, err = _run(["ipset", "restore", "-exist"], input_data=payload)
+    if rc != 0:
+        # 批量失败（如内核不支持 restore）：退化为逐条执行，保证同步仍然完成
+        for line in cmds:
+            _run(["ipset"] + line.split())
 
 
 def _member(net):
@@ -178,49 +196,53 @@ def sync(permanent, bans, whitelist=None):
     permanent : 永久黑名单 CIDR 列表
     bans      : 生效中的临时封禁（含 ip / expire_at）
     whitelist : 白名单 CIDR，命中的成员不下发到内核（白名单优先）
+
+    快照构建与内核下发全程持 _sync_lock：并发调用时后到者排队执行，
+    以最新入参重建快照，避免旧快照覆盖新结果（解封后被回填的竞态）。
     """
     if not available():
         return False
-    want4, want6 = {}, {}
-    now = int(time.time())
-    # 先放临时封禁（带到期时间；单 IP 或 CIDR 均可）
-    for b in (bans or []):
-        ip = (b.get("ip") or "").strip() if isinstance(b, dict) else ""
-        if not ip:
-            continue
-        try:
-            net = ipaddress.ip_network(ip, strict=False)
-        except ValueError:
-            continue
-        t = int(b.get("expire_at") or 0) - now
-        if t <= 0:
-            continue  # 已到期，交给集合自身超时移除
-        (want6 if net.version == 6 else want4)[_member(net)] = t
-    # 永久黑名单最后写入，始终为永久（timeout 0），不被临时封禁覆盖
-    for cidr in (permanent or []):
-        n = _norm(cidr)
-        if not n:
-            continue
-        member, ver = n
-        (want6 if ver == 6 else want4)[member] = 0
-
-    # 白名单优先：把落在白名单内的成员按 CIDR 差集剔除
-    if whitelist:
-        wnets = []
-        for cidr in whitelist:
+    with _sync_lock:
+        want4, want6 = {}, {}
+        now = int(time.time())
+        # 先放临时封禁（带到期时间；单 IP 或 CIDR 均可）
+        for b in (bans or []):
+            ip = (b.get("ip") or "").strip() if isinstance(b, dict) else ""
+            if not ip:
+                continue
             try:
-                wnets.append(ipaddress.ip_network(cidr, strict=False))
+                net = ipaddress.ip_network(ip, strict=False)
             except ValueError:
                 continue
-        if wnets:
-            _apply_whitelist(want4, wnets)
-            _apply_whitelist(want6, wnets)
+            t = int(b.get("expire_at") or 0) - now
+            if t <= 0:
+                continue  # 已到期，交给集合自身超时移除
+            (want6 if net.version == 6 else want4)[_member(net)] = t
+        # 永久黑名单最后写入，始终为永久（timeout 0），不被临时封禁覆盖
+        for cidr in (permanent or []):
+            n = _norm(cidr)
+            if not n:
+                continue
+            member, ver = n
+            (want6 if ver == 6 else want4)[member] = 0
 
-    with _lock:
-        _ensure()
-        _reconcile(SET4, want4)
-        if _have("ip6tables"):
-            _reconcile(SET6, want6)
+        # 白名单优先：把落在白名单内的成员按 CIDR 差集剔除
+        if whitelist:
+            wnets = []
+            for cidr in whitelist:
+                try:
+                    wnets.append(ipaddress.ip_network(cidr, strict=False))
+                except ValueError:
+                    continue
+            if wnets:
+                _apply_whitelist(want4, wnets)
+                _apply_whitelist(want6, wnets)
+
+        with _lock:
+            _ensure()
+            _reconcile(SET4, want4)
+            if _have("ip6tables"):
+                _reconcile(SET6, want6)
     return True
 
 
@@ -237,15 +259,18 @@ def sync_from_store():
     if not available():
         return False
     from . import config, store
-    cfg = config.get()
-    perms = []
-    if cfg.get("blacklist_enabled", True):
-        perms = [r["cidr"] for r in store._query("SELECT cidr FROM ip_list WHERE list_type='black'")]
-    whites = []
-    if cfg.get("whitelist_enabled", False):
-        whites = [r["cidr"] for r in store._query("SELECT cidr FROM ip_list WHERE list_type='white'")]
-    bans = store.active_bans()
-    return sync(perms, bans, whites)
+    with _sync_lock:
+        cfg = config.get()
+        if not cfg.get("fw_sync_enabled", True):
+            return False
+        perms = []
+        if cfg.get("blacklist_enabled", True):
+            perms = [r["cidr"] for r in store._query("SELECT cidr FROM ip_list WHERE list_type='black'")]
+        whites = []
+        if cfg.get("whitelist_enabled", False):
+            whites = [r["cidr"] for r in store._query("SELECT cidr FROM ip_list WHERE list_type='white'")]
+        bans = store.active_bans()
+        return sync(perms, bans, whites)
 
 
 def remove(ip):
@@ -258,7 +283,8 @@ def remove(ip):
         return False
     setname = SET6 if net.version == 6 else SET4
     member = str(net.network_address) if net.prefixlen == net.max_prefixlen else str(net)
-    _run(["ipset", "del", setname, member, "-exist"])
+    with _sync_lock:
+        _run(["ipset", "del", setname, member, "-exist"])
     return True
 
 
@@ -276,15 +302,16 @@ def teardown():
     """移除 iptables 规则、链与集合（卸载时调用）。"""
     if not _have("iptables"):
         return False
-    _run(["iptables", "-D", "INPUT", "-j", CHAIN])
-    _run(["iptables", "-F", CHAIN])
-    _run(["iptables", "-X", CHAIN])
-    if _have("ip6tables"):
-        _run(["ip6tables", "-D", "INPUT", "-j", CHAIN])
-        _run(["ip6tables", "-F", CHAIN])
-        _run(["ip6tables", "-X", CHAIN])
-    _run(["ipset", "destroy", SET4])
-    _run(["ipset", "destroy", SET6])
+    with _sync_lock:
+        _run(["iptables", "-D", "INPUT", "-j", CHAIN])
+        _run(["iptables", "-F", CHAIN])
+        _run(["iptables", "-X", CHAIN])
+        if _have("ip6tables"):
+            _run(["ip6tables", "-D", "INPUT", "-j", CHAIN])
+            _run(["ip6tables", "-F", CHAIN])
+            _run(["ip6tables", "-X", CHAIN])
+        _run(["ipset", "destroy", SET4])
+        _run(["ipset", "destroy", SET6])
     return True
 
 
