@@ -1,7 +1,7 @@
 # 统一行尾为 LF：覆盖 Windows 系统默认 core.autocrlf=true。
 # 背景：本仓库有大量 Shell 脚本（install.sh / build.sh / frpwaf.init 等）面向
 # 宝塔面板 Linux 运行；CRLF 化会导致 bash 报 `$'\r': command not found`。
-# 同时双端同步脚本按 LF 归一化比对，行尾漂移会造成无意义的镜像差异。
+# 同时多端同步脚本按 LF 归一化比对，行尾漂移会造成无意义的镜像差异。
 
 *               text=auto
 .gitattributes  text eol=lf
@@ -21,6 +21,7 @@
 *.init          text eol=lf
 *.cjs           text eol=lf
 *.js            text eol=lf
+*.ts            text eol=lf
 *.css           text eol=lf
 *.html          text eol=lf
 
