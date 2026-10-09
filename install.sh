@@ -42,9 +42,14 @@ Install_frpwaf()
     fi
 
     # init 脚本
+    # 行尾归一化：若插件包带 CRLF（Windows 工作区打包），装到 /etc/init.d/frpwaf 后
+    # shebang 会变成 "#!/bin/bash\r"，内核找不到解释器，服务启动/重启报
+    # `cannot execute: required file not found`。此处兑底再转一次 LF。
     cp -f ${PLUGIN_DIR}/frpwaf.init ${INIT}
+    sed -i 's/\r$//' ${INIT}
     chmod +x ${INIT}
     cp -f ${INIT} /usr/bin/frpwaf
+    sed -i 's/\r$//' /usr/bin/frpwaf
     chmod +x /usr/bin/frpwaf
 
     # 开机自启

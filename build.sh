@@ -34,6 +34,55 @@ chmod +x "$PKG/install.sh" "$PKG/uninstall.sh" "$PKG/frpwaf.init"
 find "$PKG" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 find "$PKG" -name '*.py[co]' -delete 2>/dev/null || true
 find "$PKG" -name '.DS_Store' -delete 2>/dev/null || true
+
+# ---- 行尾归一化（关键）----
+# 背景：仓库索引是 LF，但 Windows 工作区（core.autocrlf=true）是 CRLF，而上面是
+# `cp -a` 直接拷工作区。若不归一化，成品包里的 `frpwaf.init` 首行会变成
+# `#! /bin/bash\r`，装到 /etc/init.d/frpwaf 后内核找不到解释器 `/bin/bash\r`，
+# 服务启动/重启报：`cannot execute: required file not found`。
+# 这里强制转成 LF，保证在任意平台（Linux / Windows Git Bash）打包产物都一致。
+echo "[*] 行尾归一化为 LF"
+# 选一个真正可用的 python：Windows 上的 python3 可能是应用商店占位符（`-c` 会失败）
+PY=""
+for c in python3 python; do
+  if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys' >/dev/null 2>&1; then PY="$c"; break; fi
+done
+if [ -n "$PY" ]; then
+  echo "[*] 使用 $PY 归一化"
+  find "$PKG" -type f \( -name '*.py' -o -name '*.sh' -o -name '*.init' -o -name '*.html' \
+    -o -name '*.css' -o -name '*.js' -o -name '*.json' -o -name '*.md' -o -name '*.txt' \) \
+    -exec "$PY" -c 'import sys
+for p in sys.argv[1:]:
+    d = open(p, "rb").read()
+    if b"\r" in d:
+        open(p, "wb").write(d.replace(b"\r\n", b"\n").replace(b"\r", b"\n"))' {} +
+else
+  echo "[!] 未找到可用 python，改用 sed"
+  find "$PKG" -type f \( -name '*.py' -o -name '*.sh' -o -name '*.init' -o -name '*.html' \
+    -o -name '*.css' -o -name '*.js' -o -name '*.json' -o -name '*.md' -o -name '*.txt' \) \
+    -exec sed -i 's/\r$//' {} +
+fi
+
+# 校验：包内文本文件不得残留 CR（残留则构建失败，绝不产出 CRLF 包）
+# 校验：包内文本文件不得残留 CR（残留则构建失败，绝不产出 CRLF 包）
+# 注：不用 `find -exec grep -lU`——GNU grep 3.0 下该组合会把所有文本文件误报为命中。
+if [ -n "$PY" ]; then
+  CRLF_HIT=$(find "$PKG" -type f \( -name '*.py' -o -name '*.sh' -o -name '*.init' -o -name '*.html' \
+    -o -name '*.css' -o -name '*.js' -o -name '*.json' -o -name '*.md' -o -name '*.txt' \) \
+    -exec "$PY" -c 'import sys
+for p in sys.argv[1:]:
+    if b"\r" in open(p, "rb").read():
+        print(p)' {} + 2>/dev/null || true)
+else
+  CRLF_HIT=$(grep -rlU $'\r' "$PKG" 2>/dev/null || true)
+fi
+if [ -n "$CRLF_HIT" ]; then
+  echo "[!] 错误：包内仍有 CRLF 文件，已中止打包（避免服务报 cannot execute）"
+  echo "$CRLF_HIT" | head -10
+  exit 1
+fi
+echo "[*] 行尾检查通过（全 LF）"
+
 echo "[*] 包内容:"; ls -la "$PKG"
 
 if [ "$1" == "zip" ]; then

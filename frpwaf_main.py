@@ -14,7 +14,6 @@ import secrets
 import shutil
 import sys
 import threading
-import subprocess
 import time
 import traceback
 
@@ -26,7 +25,7 @@ os.chdir(BASE_PATH)
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PLUGIN_DIR)
 sys.path.insert(0, "class/")
-import public
+import public  # noqa: E402  （必须先 sys.path.insert 再 import，宝塔插件约定）
 
 WAF_HOME = "/opt/frpwaf"
 WAF_PORT = 7080
@@ -298,9 +297,14 @@ class frpwaf_main:
             public.ExecShell("cp -a %s/web/. %s/web/ 2>/dev/null" % (PLUGIN_DIR, WAF_HOME))
             os.makedirs(os.path.join(WAF_HOME, "data"), exist_ok=True)
             # 2. 安装 init 脚本
+            #    行尾归一化：插件包若带 CRLF（Windows 工作区打包），装到 /etc/init.d/frpwaf 后
+            #    shebang 会变成 "#!/bin/bash\r"，内核找不到解释器，重启报
+            #    `cannot execute: required file not found`。这里兑底转 LF。
             public.ExecShell("cp -f %s/frpwaf.init %s" % (PLUGIN_DIR, WAF_INIT))
+            public.ExecShell("sed -i 's/\\r$//' %s" % WAF_INIT)
             public.ExecShell("chmod +x %s" % WAF_INIT)
             public.ExecShell("cp -f %s %s" % (WAF_INIT, "/usr/bin/frpwaf"))
+            public.ExecShell("sed -i 's/\\r$//' /usr/bin/frpwaf")
             public.ExecShell("chmod +x /usr/bin/frpwaf")
             # 3. 开机自启
             if "CentOS" in public.get_os_version() or "Red" in public.get_os_version():
@@ -480,14 +484,14 @@ class frpwaf_main:
         segments.append((cur_is_header, cur))
         changed = False
         for i, (header, body) in enumerate(segments):
-            if header and header.startswith("[[httpPlugins]]") and any("frpwaf" in l for l in body):
+            if header and header.startswith("[[httpPlugins]]") and any("frpwaf" in ln for ln in body):
                 nb = []
-                for l in body:
-                    if re.match(r"\s*addr\s*=", l):
+                for ln in body:
+                    if re.match(r"\s*addr\s*=", ln):
                         nb.append('addr = "127.0.0.1:%d"' % int(port))
                         changed = True
                     else:
-                        nb.append(l)
+                        nb.append(ln)
                 segments[i] = (header, nb)
         if changed:
             out = []

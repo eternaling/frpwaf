@@ -1,8 +1,9 @@
 # 12 · Bug 修复记录
 
 本文记录本项目**历次发现并修复的全部功能 Bug**，含现象、根因、修复与验证。
-共 13 批（Bug A–I 为历史单点修复；Bug J 为 2026-10-01 全项目审查批次；
-Bug K/L 为 2026-10-02 AI 大批量审查修复批次；Bug M 为 2026-10-02 CDN 回源误封批次），
+共 14 批（Bug A–I 为历史单点修复；Bug J 为 2026-10-01 全项目审查批次；
+Bug K/L 为 2026-10-02 AI 大批量审查修复批次；Bug M 为 2026-10-02 CDN 回源误封批次；
+Bug N 为 2026-10-09 Windows 打包 CRLF 污染批次），
 均在隔离环境复现、修复、验证后应用到生产。
 
 > 编号顺序为**发现顺序**，与修复提交顺序略有交叉（Bug B 与 A 同批提交）。
@@ -24,6 +25,7 @@ Bug K/L 为 2026-10-02 AI 大批量审查修复批次；Bug M 为 2026-10-02 CDN
 | K | `ai.py` / `index.html` | v1.3.11 | v1.3.11 | 已提交发布 |
 | L | `frpwaf_main.py` / `index.html` / `ai.py` | v1.3.11 | v1.3.11 | 已提交发布 |
 | M | `ai.py` / `config.py` / `store.py` / `daemon.py` / `frpwaf_main.py` / 双端面板 | v1.3.12 | v1.3.12 | 待提交 |
+| N | `build.sh` / `install.sh` / `frpwaf_main.py` | 待提交 | 待发布 | 待提交 |
 
 > A、B 随 `cedf595` 一起提交并打 Tag `v1.3.7`；C、D、E 随后修复，随 Tag
 > `v1.3.8` 一起提交（见 [13-变更历史与版本.md](13-变更历史与版本.md) §2/§4）。
@@ -626,6 +628,68 @@ Cloudflare 回源超时 → **整站 522**。
 
 ---
 
+## Bug N（2026-10-09）：Windows 打包 CRLF 污染致 init 脚本无法执行
+
+### 现象
+
+服务重启/启动时报：
+
+```
+/usr/bin/bash: line 1: /etc/init.d/frpwaf: cannot execute: required file not found
+```
+
+### 根因
+
+`/etc/init.d/frpwaf` 的 shebang 变成了 `#! /bin/bash\r`（末尾多一个 CR）。
+内核解析 shebang 时把解释器路径当作 `/bin/bash\r`，该文件不存在 →
+`cannot execute: required file not found`。
+
+CR 的来源：仓库**索引里是 LF（正确）**，但 Windows 工作区
+（`core.autocrlf=true`）是 CRLF，而 `build.sh` 用 `cp -a` **直接拷工作区**打包，
+于是 CRLF 混进成品包；安装时 `cp -f frpwaf.init /etc/init.d/frpwaf`
+把 CR 一起带到了系统里。
+
+即：**只要在 Windows 上执行打包，就会复现**（与代码逻辑无关，是打包链路缺陷）。
+
+### 修复
+
+三层纵深防御（根因 + 两道兜底）：
+
+1. **`build.sh`（根因）**：组装完包后，把所有文本文件
+   （`*.py`/`*.sh`/`*.init`/`*.html`/`*.css`/`*.js`/`*.json`/`*.md`/`*.txt`）
+   强制归一化为 LF；随后**校验**，若仍残留 CR 则 `exit 1` 中止打包
+   —— 保证任何平台产出的包都是 LF；
+2. **`install.sh`（兜底）**：拷贝 init 脚本后 `sed -i 's/\r$//'`，
+   旧包也能装出正确的脚本；
+3. **`frpwaf_main.py` `install_waf()`（兜底）**：面板「安装 / 更新」按钮
+   走同一流程，同样做行尾归一化。
+
+附带修复：`build.sh` 中选取 python 解释器时跳过 Windows 应用商店占位符
+（`python3 -c` 会失败），并加 `sed` 回退；校验不用
+`find -exec grep -lU`（GNU grep 3.0 下会把所有文本文件误报为命中），改用 python 判定。
+
+### 验证
+
+- 完整构建通过，退出码 0，输出「行尾检查通过（全 LF）」；
+- 成品包复核：`frpwaf.init` / `install.sh` / `uninstall.sh` / `frpwaf_main.py` /
+  `app/*.py` / `index.html` / `info.json` 均 **CRLF=0**，shebang 为 `#! /bin/bash`；
+- `python -m py_compile app/*.py frpwaf_main.py` 通过；
+- `bash -n install.sh uninstall.sh build.sh frpwaf.init` 通过。
+
+### 受影响环境的手工修复
+
+已装旧版（init 脚本带 CR）的机器，二选一：
+
+```bash
+# 方式一：直接修系统里的脚本
+sed -i 's/\r$//' /etc/init.d/frpwaf /usr/bin/frpwaf
+/etc/init.d/frpwaf restart
+
+# 方式二：面板点「安装 / 更新」（新版本已内置归一化）
+```
+
+---
+
 ## 附：历史遗留的其它修复（早期版本，非本轮）
 
 这些在更早的提交中已修复，一并记录：
@@ -654,3 +718,4 @@ Cloudflare 回源超时 → **整站 522**。
 | K | `ai.py` / `index.html` | max_tokens 写死致大批量输出截断、整轮作废 | 高（大批量审查不可用） |
 | L | `frpwaf_main.py` / `index.html` / `ai.py` | 立即审查同步执行致按钮卡死；拆分到单条致送审碎片化 | 高（按钮不可用 + 审查慢） |
 | M | `ai.py` / `config.py` / `store.py` / `daemon.py` / `frpwaf_main.py` / 双端面板 | AI 误封 CDN 回源边缘 IP 致整站 522；缺回源豁免与批量恢复工具 | 高（整站不可访问） |
+| N | `build.sh` / `install.sh` / `frpwaf_main.py` | Windows 工作区 CRLF 混入成品包，`/etc/init.d/frpwaf` shebang 变 `#!/bin/bash\r`，服务重启报 `cannot execute: required file not found` | 高（服务无法启动/重启） |
