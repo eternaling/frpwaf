@@ -288,6 +288,7 @@ class frpwaf_main:
 
     def install_waf(self, get=None):
         try:
+            self._audit("插件端安装/更新 WAF 网页端")
             # 1. 把运行文件同步到 /opt/frpwaf（首次安装 + 后续更新都要覆盖，
             #    否则「安装 / 更新」按钮只会重启服务、不会更新代码）。
             #    用 "app/." 形式避免嵌套成 app/app；data/ 不受影响。
@@ -332,6 +333,7 @@ class frpwaf_main:
 
     def uninstall_waf(self, get=None):
         try:
+            self._audit("插件端卸载 FRP WAF")
             # frps 持有回调时必须先摘除并成功重启，才能停止 WAF。
             frp = _app("frp")
             frps_running = False
@@ -387,12 +389,22 @@ class frpwaf_main:
             return public.returnMsg(False, "卸载失败：" + traceback.format_exc())
 
     # ---------------- 服务控制 ----------------
+    def _audit(self, msg):
+        """操作审计：向 data/frpwaf.log 追加 [审计] 行（与 daemon 同一文件，供「运行日志」页查看）。"""
+        try:
+            p = os.path.join(WAF_HOME, "data", "frpwaf.log")
+            with open(p, "a", encoding="utf-8") as f:
+                f.write("[%s] [审计] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+        except Exception:
+            pass
+
     def waf_admin(self, get):
         if not hasattr(get, "status") or not get.status:
             return public.returnMsg(False, "参数错误")
         act = get.status
         if act not in ("start", "stop", "restart"):
             return public.returnMsg(False, "参数错误")
+        self._audit("插件端服务控制：%s" % act)
         res = public.ExecShell("%s %s" % (WAF_INIT, act))
         if res[1]:
             return public.returnMsg(False, res[1])
@@ -563,6 +575,7 @@ class frpwaf_main:
     def apply_to_frps(self, get=None):
         """向 frps.toml 注入 [[httpPlugins]] 并重启 frps。"""
         try:
+            self._audit("插件端注入 frps 回调（httpPlugins）")
             content = self._read(FRPS_TOML)
             if not content.strip():
                 return public.returnMsg(False, "未找到 frps.toml")
@@ -1133,16 +1146,13 @@ class frpwaf_main:
             return ""
 
     def _fw_sync(self):
-        """把黑名单/封禁同步到内核防火墙（失败静默）。
+        """把黑名单/封禁同步到内核（失败静默）。
 
-        关闭内核封禁开关时显式清理 ipset/iptables，避免「已关闭却仍被内核丢包」。
+        sync_from_store() 内部按 fw_sync_enabled / block_page_enabled 决定
+        DROP（静默丢包）、REDIRECT（展示拦截页）或清理，故统一调用它。
         """
         try:
-            fw = _app("firewall")
-            if self._cfg().get("fw_sync_enabled", True):
-                fw.sync_from_store()
-            else:
-                fw.teardown()
+            _app("firewall").sync_from_store()
         except Exception:
             pass
 
@@ -1157,16 +1167,17 @@ class frpwaf_main:
             return {"status": True, "data": {"available": False, "enabled": False}}
 
     def kernban_sync(self, get=None):
-        """手动触发一次内核封禁同步（开关关闭时改为清理内核残留）。"""
+        """手动触发一次内核同步（按开关决定 DROP / REDIRECT / 清理）。"""
         try:
+            self._audit("插件端手动同步内核封禁")
             fw = _app("firewall")
-            if self._cfg().get("fw_sync_enabled", True):
-                ok = fw.sync_from_store()
-                if ok:
-                    return public.returnMsg(True, "已同步到内核防火墙")
-                return public.returnMsg(False, "当前环境不支持（需 root + ipset/iptables）")
-            fw.teardown()
-            return public.returnMsg(True, "内核封禁已关闭，已清理内核规则")
+            ok = fw.sync_from_store()
+            st = fw.status()
+            if ok:
+                return public.returnMsg(True, "已同步到内核防火墙")
+            if st.get("mode") == "off":
+                return public.returnMsg(True, "内核封禁与拦截页均已关闭，已清理内核规则")
+            return public.returnMsg(False, "当前环境不支持（需 root + ipset/iptables）")
         except Exception:
             return public.returnMsg(False, "同步失败：" + traceback.format_exc()[-200:])
 
@@ -1557,14 +1568,18 @@ class frpwaf_main:
     POLICY_BOOL = ["blacklist_enabled", "whitelist_enabled", "auto_ban_enabled",
                    "rate_limit_enabled", "fw_sync_enabled", "ai_enabled",
                    "auto_ban_cc_enabled", "auto_ban_scan_enabled", "auto_ban_ssh_enabled",
-                   "proxy_cool_enabled"]
+                   "proxy_cool_enabled",
+                   "block_page_enabled", "block_page_404_enabled",
+                   "block_page_ban_enabled", "block_page_risk_enabled"]
     POLICY_INT = ["auto_ban_window", "auto_ban_threshold", "auto_ban_seconds",
                   "rate_limit_per_sec", "log_max_rows",
                   "auto_ban_cc_window", "auto_ban_cc_threshold", "auto_ban_cc_seconds",
                   "auto_ban_scan_window", "auto_ban_scan_threshold", "auto_ban_scan_seconds",
                   "auto_ban_ssh_window", "auto_ban_ssh_threshold",
                   "burst_window", "proxy_cool_min_conns", "proxy_cool_uniq_threshold",
-                  "proxy_cool_single_pct", "proxy_cool_seconds"]
+                  "proxy_cool_single_pct", "proxy_cool_seconds",
+                  "block_page_port"]
+    POLICY_STR = ["github_repo", "block_page_redirect_ports"]
 
     def get_policy(self, get=None):
         """读取准入策略（实际生效值，供设置页回显）。"""
@@ -1574,6 +1589,8 @@ class frpwaf_main:
             data[k] = bool(cfg.get(k, False))
         for k in self.POLICY_INT:
             data[k] = cfg.get(k, 0)
+        for k in self.POLICY_STR:
+            data[k] = str(cfg.get(k, "") or "")
         return {"status": True, "data": data}
 
     def save_policy(self, get=None):
@@ -1588,6 +1605,9 @@ class frpwaf_main:
                         patch[k] = max(0, int(getattr(get, k)))
                     except (TypeError, ValueError):
                         pass
+            for k in self.POLICY_STR:
+                if hasattr(get, k):
+                    patch[k] = str(getattr(get, k) or "").strip()
             if "auto_ban_window" in patch and patch["auto_ban_window"] < 1:
                 patch["auto_ban_window"] = 1
             # 攻击类型封禁：窗口参数同样强制 ≥1 秒；
@@ -1611,9 +1631,59 @@ class frpwaf_main:
             except Exception:
                 pass
             self._fw_sync()
+            try:
+                _app("blockpage").ensure()   # 拦截页端口/开关变更后立即生效
+            except Exception:
+                pass
             return public.returnMsg(True, "策略已保存")
         except Exception:
             return public.returnMsg(False, "保存失败：" + traceback.format_exc()[-200:])
+
+    # ---------------- 静态拦截页 / GitHub 在线升级 / 关于 ----------------
+    def _upgrade_repo(self, get=None):
+        """升级仓库：请求参数 repo 优先，否则取配置 github_repo。"""
+        repo = ""
+        try:
+            repo = (get.repo or "").strip()
+        except Exception:
+            pass
+        if not repo:
+            repo = str(self._cfg().get("github_repo") or "").strip()
+        return repo
+
+    def upgrade_check(self, get=None):
+        """检查 GitHub 更新（无网/无仓库返回中文错误，不抛异常）。"""
+        try:
+            res = _app("upgrade").check(self._upgrade_repo(get))
+            return {"status": bool(res.get("ok")), "data": res,
+                    "msg": res.get("error") or res.get("msg") or "检查完成"}
+        except Exception:
+            return {"status": False, "msg": "检查更新失败：" + traceback.format_exc()[-200:]}
+
+    def upgrade_apply(self, get=None):
+        """执行 GitHub 在线升级（检查→下载→备份→覆盖→重启→失败回滚）。"""
+        try:
+            self._audit("插件端触发 GitHub 在线升级")
+            res = _app("upgrade").apply(self._upgrade_repo(get))
+            return {"status": bool(res.get("ok")), "data": res,
+                    "msg": res.get("error") or res.get("msg") or "升级完成"}
+        except Exception:
+            return {"status": False, "msg": "升级失败：" + traceback.format_exc()[-200:]}
+
+    def about(self, get=None):
+        """关于页信息：版本、署名、仓库、许可、运行时说明。"""
+        try:
+            cfg = self._cfg_effective()
+            return {"status": True, "data": {
+                "name": "FRP WAF",
+                "version": _app("__init__").__version__,
+                "author": _app("__init__").__author__,
+                "repo": str(cfg.get("github_repo") or ""),
+                "license": "MIT",
+                "runtime": "Python 3 标准库 + SQLite + 原生 JS（零第三方依赖）",
+            }}
+        except Exception:
+            return {"status": False, "msg": "读取失败"}
 
     # ---------------- 管理员账号 ----------------
     def get_admin(self, get=None):

@@ -1,4 +1,8 @@
 <!DOCTYPE html>
+<!--
+  FRP WAF · 独立 Web 端管理面板（web/index.html）
+  署名：nightsoil.cn 永夜工作室
+-->
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -46,6 +50,11 @@
   nav{display:flex;gap:4px;flex:1}
   nav a{padding:7px 13px;border-radius:7px;color:var(--muted);font-weight:500}
   nav a.active{background:var(--panel2);color:var(--txt)}
+  /* 左下角署名（固定定位，不占布局、不挡点击） */
+  .fw-sign{position:fixed;left:12px;bottom:10px;font-size:10px;color:var(--muted);
+           background:transparent;white-space:nowrap;z-index:30}
+  .fw-sign a{color:inherit;text-decoration:none}
+  .fw-sign a:hover{color:var(--pri);text-decoration:underline}
   .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px}
   .card .k{color:var(--muted);font-size:12px;margin-bottom:6px}
@@ -102,13 +111,19 @@
       <a data-tab="list">IP 名单</a>
       <a data-tab="logs">连接日志</a>
       <a data-tab="bans">封禁管理</a>
+      <a data-tab="ai">AI 审查</a>
+      <a data-tab="kernban">内核封禁</a>
+      <a data-tab="service">服务控制</a>
+      <a data-tab="syslog">运行日志</a>
       <a data-tab="geoq">IP 归属查询</a>
       <a data-tab="proxies">代理统计</a>
       <a data-tab="settings">设置</a>
+      <a data-tab="about">关于</a>
     </nav>
     <span class="muted" id="whoami"></span>
     <button class="ghost sm" onclick="doLogout()">退出</button>
   </header>
+  <div class="fw-sign"><a href="https://nightsoil.cn" target="_blank" rel="noopener noreferrer">© 2026 nightsoil.cn 永夜工作室</a></div>
   <div class="wrap">
 
     <!-- 概览 -->
@@ -270,6 +285,73 @@
       </div>
     </section>
 
+    <!-- AI 审查 -->
+    <section id="tab-ai" class="hide">
+      <div class="box">
+        <h2>AI 自动 IP 审查 <span class="stat-badge" id="aiState">-</span>
+          <span class="grow"></span>
+          <button class="danger sm" onclick="aiRunNow()">立即审查</button>
+        </h2>
+        <p class="muted" style="margin:0 0 10px">AI 审查的模型/密钥/调度配置在插件端「AI 审查」页维护；此处可查看最近审查记录并手动触发。</p>
+        <div class="scroll" style="max-height:420px"><table id="aiTable"><tbody></tbody></table></div>
+      </div>
+    </section>
+
+    <!-- 内核封禁 -->
+    <section id="tab-kernban" class="hide">
+      <div class="box">
+        <h2>内核级封禁 <span class="stat-badge" id="kbState">-</span>
+          <span class="grow"></span>
+          <button class="sm" onclick="kbSync()">立即同步</button>
+        </h2>
+        <div id="kbInfo" class="grid3"></div>
+        <p class="muted" style="margin:12px 0 0">内核级封禁（ipset+iptables）把命中封禁的 IP 在内核层直接丢包；关闭后若拦截页开启，则改为 REDIRECT 展示封禁页。需 root + ipset/iptables。</p>
+      </div>
+    </section>
+
+    <!-- 服务控制 -->
+    <section id="tab-service" class="hide">
+      <div class="box">
+        <h2>服务控制 <span class="stat-badge">高危操作，将写入审计日志</span></h2>
+        <div class="row">
+          <button class="sm" onclick="svcAction('restart')">重启服务</button>
+          <button class="danger sm" onclick="svcAction('stop')">停止服务</button>
+        </div>
+        <p class="muted" style="margin:12px 0 0">停止/重启后网页端将短暂不可访问；请到服务器执行 <code>/etc/init.d/frpwaf start</code> 重新启动。程序升级请用「关于」页的 GitHub 在线升级。</p>
+      </div>
+    </section>
+
+    <!-- 运行日志 -->
+    <section id="tab-syslog" class="hide">
+      <div class="box">
+        <h2>运行日志 <span class="stat-badge" id="syslogCount"></span>
+          <span class="grow"></span>
+          <button class="sm" onclick="loadSyslog()">刷新</button>
+        </h2>
+        <div class="scroll" style="max-height:460px"><pre id="syslogBox" style="margin:0;white-space:pre-wrap;font-size:12px;line-height:1.6"></pre></div>
+      </div>
+    </section>
+
+    <!-- 关于 -->
+    <section id="tab-about" class="hide">
+      <div class="box">
+        <h2>关于 FRP WAF</h2>
+        <div id="aboutKv" class="grid3"></div>
+        <p class="muted" style="margin:16px 0 0" id="aboutAuthor"></p>
+        <div class="box" style="margin-top:14px">
+          <h2>在线升级（GitHub）</h2>
+          <div class="row">
+            <div class="field grow"><label>仓库地址 owner/repo</label>
+              <input id="upRepo" placeholder="如 nightsoil/frpwaf"></div>
+            <button onclick="upSave()" style="margin-top:18px">保存仓库</button>
+            <button class="sm" style="margin-top:18px" onclick="upCheck()">检查更新</button>
+            <button class="danger sm" style="margin-top:18px" onclick="upApply()">一键升级</button>
+          </div>
+          <p class="muted" id="upMsg" style="margin:10px 0 0">流程：检查最新版本 → 下载 → 校验 → 备份 → 覆盖程序 → 重启；失败自动回滚，不覆盖 data/。</p>
+        </div>
+      </div>
+    </section>
+
     <!-- 设置 -->
     <section id="tab-settings" class="hide">
       <div class="box">
@@ -400,7 +482,8 @@ function loadTab(tab){
   document.querySelectorAll('section[id^=tab-]').forEach(s=>s.classList.add('hide'));
   $('#tab-'+tab).classList.remove('hide');
   ({dash:loadDash, list:()=>loadList(curListType), logs:()=>{loadLogProxies();loadLogs(0);loadBurst();},
-    bans:loadBans, geoq:loadGeo, proxies:loadProxies, settings:loadSettings}[tab]||(()=>{}))();
+    bans:loadBans, ai:loadAI, kernban:loadKernban, service:()=>{}, syslog:loadSyslog,
+    geoq:loadGeo, proxies:loadProxies, settings:loadSettings, about:loadAbout}[tab]||(()=>{}))();
 }
 
 /* ---- 概览 ---- */
@@ -696,6 +779,95 @@ async function changePwd(){
     $('#pwOld').value=''; $('#pwNew').value=''; $('#pwNewUser').value=''; $('#pwOldUser').value='';
     loadCurUser();
   }catch(e){ toast(e.message,'err'); }
+}
+
+/* ---- AI 审查 ---- */
+async function loadAI(){
+  try{
+    const r = await api('/api/ai/review');
+    const rows = r.data||[];
+    $('#aiState').textContent = rows.length + ' 条记录';
+    $('#aiTable').innerHTML = rows.length
+      ? '<thead><tr><th>时间</th><th>IP</th><th>判定</th><th>处置</th><th>理由</th></tr></thead><tbody>'
+        + rows.map(x=>'<tr><td>'+esc(fmtTime(x.ts))+'</td><td>'+esc(x.ip)+'</td><td>'+esc(x.verdict)+'</td><td>'+esc(x.action)+'</td><td>'+esc(x.reason)+'</td></tr>').join('')+'</tbody>'
+      : '<tbody><tr><td class="muted">暂无审查记录</td></tr></tbody>';
+  }catch(e){ toast(e.message||'加载失败','err'); }
+}
+async function aiRunNow(){
+  if(!confirm('立即执行一次 AI 审查？将调用已配置的大模型接口（高危操作，写入审计日志）。')) return;
+  try{ const r = await api('/api/ai/review','POST',{}); toast(r.msg||'已触发','ok'); loadAI(); }
+  catch(e){ toast(e.message||'执行失败','err'); }
+}
+/* ---- 内核封禁 ---- */
+async function loadKernban(){
+  try{
+    const r = await api('/api/kernban'); const d=r.data||{};
+    const modeTxt = {drop:'内核丢包（DROP）', redirect:'拦截页（REDIRECT）', off:'未启用'}[d.mode]||'-';
+    $('#kbState').textContent = d.available ? modeTxt : '环境不支持';
+    $('#kbInfo').innerHTML = [
+      ['可用', d.available?'是':'否'], ['模式', modeTxt],
+      ['IPv4 条目', d.set4], ['IPv6 条目', d.set6],
+      ['INPUT 规则', d.rule?'已挂载':'未挂载'], ['REDIRECT 规则', d.redirect?'已挂载':'未挂载'],
+      ['REDIRECT 端口', (d.redirect_ports||[]).join(', ')||'-'], ['内核开关', d.enabled?'开':'关'],
+    ].map(kvCard).join('');
+  }catch(e){ toast(e.message||'加载失败','err'); }
+}
+async function kbSync(){
+  if(!confirm('立即同步内核封禁规则？（高危操作，写入审计日志）')) return;
+  try{ const r = await api('/api/kernban/sync','POST',{}); toast(r.msg||'已同步','ok'); loadKernban(); }
+  catch(e){ toast(e.message||'同步失败','err'); }
+}
+function kvCard(x){
+  return '<div style="background:var(--panel2);border-radius:8px;padding:10px 12px">'
+    + '<div class="muted" style="font-size:12px">'+x[0]+'</div>'
+    + '<div style="font-weight:600;margin-top:4px">'+x[1]+'</div></div>';
+}
+/* ---- 服务控制 ---- */
+async function svcAction(act){
+  const label = act==='restart'?'重启':'停止';
+  if(!confirm('确定要'+label+' FRP WAF 服务？'+(act==='stop'?'停止后网页端将不可访问。':'')+'（高危操作，写入审计日志）')) return;
+  try{ const r = await api('/api/service','POST',{action:act}); toast(r.msg||'已提交','ok'); }
+  catch(e){ toast(e.message||'操作失败','err'); }
+}
+/* ---- 运行日志 ---- */
+async function loadSyslog(){
+  try{
+    const r = await api('/api/syslog?limit=300'); const d=r.data||{};
+    $('#syslogCount').textContent = (d.total||0)+' 行（显示末尾 '+(d.lines||[]).length+' 行）';
+    $('#syslogBox').textContent = (d.lines||[]).join('\n') || '暂无日志';
+  }catch(e){ toast(e.message||'加载失败','err'); }
+}
+/* ---- 关于 / 在线升级 ---- */
+async function loadAbout(){
+  try{
+    const r = await api('/api/about'); const d=r.data||{};
+    const repo = d.repo||'';
+    const repoHtml = repo? '<a href="https://github.com/'+esc(repo)+'" target="_blank" rel="noopener">'+esc(repo)+'</a>' : '（未配置）';
+    $('#aboutKv').innerHTML = [
+      ['名称', esc(d.name||'FRP WAF')], ['版本', esc(d.version||'-')],
+      ['署名', esc(d.author||'-')], ['许可', esc(d.license||'MIT')],
+      ['运行时', esc(d.runtime||'-')], ['GitHub', repoHtml],
+    ].map(kvCard).join('');
+    $('#aboutAuthor').innerHTML = '© 2026 <a href="https://nightsoil.cn" target="_blank" rel="noopener noreferrer">'+esc(d.author||'nightsoil.cn 永夜工作室')+'</a> · FRP WAF'+(repo?(' · '+repoHtml):'');
+    $('#upRepo').value = repo;
+  }catch(e){ toast(e.message||'加载失败','err'); }
+}
+async function upSave(){
+  try{ await api('/api/config','POST',{github_repo:($('#upRepo').value||'').trim()}); toast('仓库已保存','ok'); loadAbout(); }
+  catch(e){ toast(e.message||'保存失败','err'); }
+}
+async function upCheck(){
+  $('#upMsg').textContent='检查中…';
+  try{ const r = await api('/api/upgrade/check','POST',{}); const d=r.data||{};
+    $('#upMsg').textContent = d.ok ? ('当前 '+d.current+'，最新 '+d.latest+(d.has_update?'（可升级）':'（已是最新）')) : (r.msg||'检查失败');
+  }catch(e){ $('#upMsg').textContent = e.message||'检查失败'; }
+}
+async function upApply(){
+  if(!confirm('确定从 GitHub 下载并升级？升级期间服务会重启，失败会自动回滚（高危操作，写入审计日志）。')) return;
+  $('#upMsg').textContent='升级中，请稍候…';
+  try{ const r = await api('/api/upgrade/apply','POST',{}); const d=r.data||{};
+    $('#upMsg').textContent = r.msg || '完成'; toast(r.msg||'完成', d.ok?'ok':'err');
+  }catch(e){ $('#upMsg').textContent = e.message||'升级失败'; toast(e.message||'升级失败','err'); }
 }
 
 /* ---- 启动 ---- */

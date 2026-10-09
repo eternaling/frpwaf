@@ -1,3 +1,7 @@
+<!--
+  FRP WAF · 宝塔插件端面板（index.html）
+  署名：nightsoil.cn 永夜工作室
+-->
 <style>
   /* 宝塔把插件内容放在固定 720px 宽的弹层 #plugin-view 里（内联样式），
      这里用 !important 覆盖，放宽到接近全屏，才能左右铺开。 */
@@ -14,6 +18,13 @@
   .fw-main .bt-w-menu p.bgw{background:#fff;color:#2d8cf0;font-weight:600;
       border-left:3px solid #2d8cf0;padding-left:17px}
   .fw-wrap{font-size:13px;color:#333}
+  /* 左侧菜单栏左下角署名：绝对定位于 .fw-main，不改变菜单自身布局 */
+  .fw-main{position:relative}
+  .fw-main .fw-sign{position:absolute;left:0;bottom:0;width:150px;text-align:center;
+    padding:10px 2px;font-size:10px;line-height:1.4;color:#9aa4b2;background:transparent;
+    box-sizing:border-box;white-space:nowrap;letter-spacing:-0.3px;z-index:5}
+  .fw-main .fw-sign a{color:inherit;text-decoration:none;cursor:pointer}
+  .fw-main .fw-sign a:hover{color:#2d8cf0;text-decoration:underline}
   .fw-wrap h2{margin:0;font-size:17px;display:flex;align-items:center;gap:10px}
   .fw-badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:12px;
     font-weight:600;white-space:nowrap;line-height:1.5;vertical-align:middle}
@@ -97,18 +108,32 @@
     <p data-item="ai">AI 审查</p>
     <p data-item="connlog">连接日志</p>
     <p data-item="proxy">代理统计</p>
-    <p data-item="frp">frp 管理</p>
-    <p data-item="frps">frps 集成</p>
     <p data-item="geo">IP 归属查询</p>
     <p data-item="settings">设置</p>
     <p data-item="log">运行日志</p>
+    <p data-item="frp">frp 管理</p>
+    <p data-item="frps">frps 集成</p>
+    <p data-item="about">关于</p>
   </div>
+  <div class="fw-sign"><a href="https://nightsoil.cn" target="_blank" rel="noopener noreferrer">© 2026 nightsoil.cn 永夜工作室</a></div>
   <div class="bt-w-con">
     <div class="fw-wrap">
 
       <!-- 概览 -->
       <div class="bt-w-item active" data-item="status">
         <h2>概览 <span id="fwStatus" class="fw-badge off">检测中…</span></h2>
+        <div class="fw-card" style="margin-bottom:14px">
+          <h3>首次使用引导 <span style="color:#999;font-size:12px;font-weight:400">完成以下两步，WAF 才会真正生效</span></h3>
+          <div class="fw-tip" style="margin:0 0 12px">
+            本插件依附 frp 服务端运行，需先完成：<b>① frp 管理</b>——安装并启动 frps；
+            <b>② frps 集成</b>——把 WAF 回调（httpPlugins）注入 frps 配置并重启。
+            两步都完成后，frps 的每个新连接才会经过本插件的准入决策（黑白名单 / 自动封禁 / 内核封禁等）。
+          </div>
+          <div class="fw-row">
+            <button class="btn btn-success btn-sm" onclick="fwGoto('frp')">① 去「frp 管理」</button>
+            <button class="btn btn-success btn-sm" onclick="fwGoto('frps')">② 去「frps 集成」</button>
+          </div>
+        </div>
         <div class="fw-stats" id="fwStats"></div>
         <div class="fw-cols">
           <div class="fw-col">
@@ -126,7 +151,7 @@
                 <button class="btn btn-default btn-sm" onclick="fwInstall()">安装 / 更新网页端</button>
                 <button class="btn btn-danger btn-sm" onclick="fwUninstall()">卸载</button>
               </div>
-              <div class="fw-tip">管理面板：<a id="fwUrl" href="#" target="_blank"></a>（账号 <code id="fwCredUser">admin</code>，密码 <code id="fwCredPwd">••••••</code>，不回显；如需修改请到「设置」页）</div>
+              <div class="fw-tip">管理面板：<a id="fwUrl" href="#" target="_blank" rel="noopener noreferrer"></a>（账号 <code id="fwCredUser">admin</code>，密码 <code id="fwCredPwd">••••••</code>，不回显；如需修改请到「设置」页）</div>
             </div>
             <div class="fw-card">
               <h3>网页端（WAF 管理面板）<span id="fwWebBadge" class="fw-badge off">检测中…</span></h3>
@@ -648,6 +673,31 @@
             </div>
           </div>
           <div class="fw-card fw-span-2">
+            <h3>静态拦截页 <span style="color:#999;font-size:12px;font-weight:400">被封 IP 展示页面，默认开启</span></h3>
+            <div class="fw-grid cols-2">
+              <div>
+                <label><input type="checkbox" id="s_block_page_enabled"> 启用拦截页服务</label>
+                <div class="fw-tip" style="margin-top:6px">frp 回调只能 allow/reject、无法返回 HTML；frps 的 custom404Page 只对未注册域名生效。故「被封 IP 展示页面」由本服务在内核层改道实现。</div>
+                <div class="fw-tip" style="margin-top:6px"><b>内核级封禁开启</b> → DROP 静默丢包（无页面）；<b>内核级封禁关闭 + 拦截页开启</b> → iptables REDIRECT 展示页面；两者都关 → 仅应用层拒绝。</div>
+                <div class="fw-kv" style="grid-template-columns:150px 1fr;margin-top:10px">
+                  <div class="k">拦截页服务端口</div>
+                  <div><input id="s_block_page_port" class="bt-input-text" type="number" min="1" max="65535" style="width:120px"></div>
+                  <div class="k">REDIRECT 目标端口</div>
+                  <div><input id="s_block_page_redirect_ports" class="bt-input-text" placeholder="留空=自动取 frps vhostHTTPPort" style="width:260px"></div>
+                </div>
+              </div>
+              <div class="fw-switches">
+                <label><input type="checkbox" id="s_block_page_ban_enabled"> 封禁页（blocked）</label>
+                <label><input type="checkbox" id="s_block_page_risk_enabled"> 风控页（risk）</label>
+                <label><input type="checkbox" id="s_block_page_404_enabled"> 404 页</label>
+              </div>
+            </div>
+            <div class="fw-row" style="margin-top:14px">
+              <button class="btn btn-success btn-sm" onclick="fwSavePolicy()">保存策略</button>
+              <button class="btn btn-default btn-sm" onclick="fwLoadPolicy()">重新加载</button>
+            </div>
+          </div>
+          <div class="fw-card fw-span-2">
             <h3>管理员账号 <span style="color:#999;font-size:12px;font-weight:400">Web 管理面板</span></h3>
             <div class="fw-kv" style="grid-template-columns:130px 1fr">
               <div class="k">当前用户名</div>
@@ -666,6 +716,36 @@
               <button class="btn btn-default btn-sm" onclick="fwLoadAdmin()">重新加载</button>
             </div>
             <div class="fw-tip">可只改用户名、只改密码，或两者一起改（须填写原密码校验）。</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 关于 -->
+      <div class="bt-w-item" data-item="about">
+        <h2>关于</h2>
+        <div class="fw-grid cols-2">
+          <div class="fw-card">
+            <h3>FRP WAF</h3>
+            <div class="fw-kv" id="fwAboutKv"></div>
+            <div class="fw-tip">零第三方依赖：Python 3 标准库 + SQLite + 原生 JS 单文件 SPA。</div>
+          </div>
+          <div class="fw-card">
+            <h3>署名</h3>
+            <div class="fw-tip" id="fwAboutAuthor" style="margin:0"></div>
+            <div class="fw-tip" style="margin-top:10px">本项目开源发布，请勿用于倒卖；转载请保留署名与仓库链接。</div>
+          </div>
+          <div class="fw-card fw-span-2">
+            <h3>在线升级（GitHub） <span style="color:#999;font-size:12px;font-weight:400">发布到 GitHub 后可在线升级</span></h3>
+            <div class="fw-kv" style="grid-template-columns:130px 1fr">
+              <div class="k">仓库地址</div>
+              <div><input id="s_github_repo" class="bt-input-text" placeholder="owner/repo（如 nightsoil/frpwaf）" style="width:300px"></div>
+            </div>
+            <div class="fw-row" style="margin-top:12px">
+              <button class="btn btn-success btn-sm" onclick="fwSaveRepo()">保存仓库</button>
+              <button class="btn btn-default btn-sm" onclick="fwUpgradeCheck()">检查更新</button>
+              <button class="btn btn-danger btn-sm" onclick="fwUpgradeApply()">一键升级</button>
+            </div>
+            <div id="fwUpgradeMsg" class="fw-tip" style="margin-top:10px">流程：检查最新版本 → 下载 → 校验 → 备份 → 覆盖程序 → 重启；失败自动回滚，不覆盖 data/。</div>
           </div>
         </div>
       </div>
@@ -725,6 +805,7 @@ document.querySelectorAll('.fw-main .bt-w-menu p').forEach(function(p){
     if(t==='connlog'){ fwLogLoadProxies(); fwLoadBurst(); fwLogPage(0); }
     if(t==='proxy'){ fwLoadProxies(); }
     if(t==='settings'){ fwLoadPolicy(); fwLoadAdmin(); }
+    if(t==='about'){ fwLoadAbout(); }
     if(t==='frp'){ fwFrpLoad(); }
   };
 });
@@ -822,9 +903,13 @@ function fwLoadDashLogs(){
   });
 }
 function fwCtl(act){
-  fwSend('waf_admin', {status:act}, function(r){
-    bt_tools.msg(r && r.msg ? r.msg : '操作完成', (r&&r.status));
-    setTimeout(fwLoadInfo, 1500);
+  var label = act==='stop'?'停止':(act==='restart'?'重启':'启动');
+  layer.confirm('确认'+label+' FRP WAF 服务？'+(act==='stop'?'（停止后管理面板将不可访问，需到服务器执行 /etc/init.d/frpwaf start 恢复）':'（期间连接会短暂中断）'), {icon:3, title:'提示'}, function(i){
+    layer.close(i);
+    fwSend('waf_admin', {status:act}, function(r){
+      bt_tools.msg(r && r.msg ? r.msg : '操作完成', (r&&r.status));
+      setTimeout(fwLoadInfo, 1500);
+    });
   });
 }
 function fwInstall(){
@@ -1158,25 +1243,88 @@ function fwLoadProxies(){
 
 /* ---- 准入策略 / 密码 ---- */
 var FW_POLICY_BOOL=['blacklist_enabled','whitelist_enabled','auto_ban_enabled','rate_limit_enabled','fw_sync_enabled','ai_enabled',
-  'auto_ban_cc_enabled','auto_ban_scan_enabled','auto_ban_ssh_enabled','proxy_cool_enabled'];
+  'auto_ban_cc_enabled','auto_ban_scan_enabled','auto_ban_ssh_enabled','proxy_cool_enabled',
+  'block_page_enabled','block_page_ban_enabled','block_page_risk_enabled','block_page_404_enabled'];
 var FW_POLICY_INT=['auto_ban_window','auto_ban_threshold','auto_ban_seconds','rate_limit_per_sec','log_max_rows',
   'auto_ban_cc_window','auto_ban_cc_threshold','auto_ban_cc_seconds',
   'auto_ban_scan_window','auto_ban_scan_threshold','auto_ban_scan_seconds',
   'auto_ban_ssh_window','auto_ban_ssh_threshold',
-  'burst_window','proxy_cool_min_conns','proxy_cool_uniq_threshold','proxy_cool_single_pct','proxy_cool_seconds'];
+  'burst_window','proxy_cool_min_conns','proxy_cool_uniq_threshold','proxy_cool_single_pct','proxy_cool_seconds',
+  'block_page_port'];
+var FW_POLICY_STR=['github_repo','block_page_redirect_ports'];
 function fwLoadPolicy(){
   fwSend('get_policy', {}, function(r){
     var c=(r&&r.data)||{};
     FW_POLICY_BOOL.forEach(function(k){ var e=document.getElementById('s_'+k); if(e) e.checked=!!c[k]; });
     FW_POLICY_INT.forEach(function(k){ var e=document.getElementById('s_'+k); if(e) e.value=(c[k]===undefined?'':c[k]); });
+    FW_POLICY_STR.forEach(function(k){ var e=document.getElementById('s_'+k); if(e) e.value=(c[k]===undefined?'':c[k]); });
   });
 }
 function fwSavePolicy(){
   var b={};
   FW_POLICY_BOOL.forEach(function(k){ var e=document.getElementById('s_'+k); if(e) b[k]=e.checked?1:0; });
   FW_POLICY_INT.forEach(function(k){ var e=document.getElementById('s_'+k); if(e) b[k]=parseInt(e.value||'0',10)||0; });
+  FW_POLICY_STR.forEach(function(k){
+    // github_repo 的输入框在「关于」页（本页可能未打开过，值为空）；保存策略时跳过它，
+    // 避免把未加载的仓库地址清空 —— 该字段由 fwSaveRepo 单独提交。
+    if(k==='github_repo') return;
+    var e=document.getElementById('s_'+k); if(e) b[k]=(e.value||'').trim();
+  });
   fwSend('save_policy', b, function(r){
     bt_tools.msg((r&&r.msg)||'已保存', (r&&r.status)); fwLoadPolicy();
+  });
+}
+/* ---- 关于 / 在线升级 ---- */
+/* 概览引导：跳转到指定菜单项（复用菜单点击逻辑） */
+function fwGoto(item){
+  var p=document.querySelector('.fw-main .bt-w-menu p[data-item="'+item+'"]');
+  if(p) p.click();
+}
+function fwLoadAbout(){
+  fwSend('about', {}, function(r){
+    var d=(r&&r.data)||{};
+    var repo=d.repo||'';
+    var repoHtml=repo?('<a href="https://github.com/'+fwEsc(repo)+'" target="_blank" rel="noopener">'+fwEsc(repo)+'</a>'):'（未配置）';
+    var kv=document.getElementById('fwAboutKv');
+    if(kv){ kv.innerHTML=''
+      +'<div class="k">版本</div><div>'+fwEsc(d.version||'-')+'</div>'
+      +'<div class="k">署名</div><div>'+fwEsc(d.author||'-')+'</div>'
+      +'<div class="k">GitHub 仓库</div><div>'+repoHtml+'</div>'
+      +'<div class="k">许可</div><div>'+fwEsc(d.license||'MIT')+'</div>'
+      +'<div class="k">运行时</div><div>'+fwEsc(d.runtime||'-')+'</div>'; }
+    var a=document.getElementById('fwAboutAuthor');
+    if(a){ a.innerHTML='© 2026 <a href="https://nightsoil.cn" target="_blank" rel="noopener noreferrer">'+fwEsc(d.author||'nightsoil.cn 永夜工作室')+'</a> · FRP WAF'+(repo?(' · '+repoHtml):''); }
+    var g=document.getElementById('s_github_repo');
+    if(g) g.value=repo;   // 升级卡片已移到「关于」页，这里负责回填仓库地址
+  });
+}
+/* 只提交仓库地址（避免在「关于」页调用 fwSavePolicy 时把未加载的策略字段一起覆盖） */
+function fwSaveRepo(){
+  var e=document.getElementById('s_github_repo');
+  fwSend('save_policy', {github_repo:(e&&e.value||'').trim()}, function(r){
+    bt_tools.msg((r&&r.msg)||'已保存', (r&&r.status));
+  });
+}
+function fwUpgradeCheck(){
+  var box=document.getElementById('fwUpgradeMsg');
+  if(box) box.textContent='检查中…';
+  fwSend('upgrade_check', {}, function(r){
+    var d=(r&&r.data)||{};
+    var msg=(r&&r.msg)||'';
+    if(d.ok){ msg='当前 '+d.current+'，最新 '+d.latest+(d.has_update?'（可升级）':'（已是最新）'); }
+    if(box) box.textContent=msg;
+    bt_tools.msg(msg, !!(d.ok));
+  });
+}
+function fwUpgradeApply(){
+  if(!confirm('确定从 GitHub 下载并升级？升级期间服务会重启，失败会自动回滚。')) return;
+  var box=document.getElementById('fwUpgradeMsg');
+  if(box) box.textContent='升级中，请稍候…';
+  fwSend('upgrade_apply', {}, function(r){
+    var d=(r&&r.data)||{};
+    var msg=(r&&r.msg)||'';
+    if(box) box.textContent=msg;
+    bt_tools.msg(msg, !!(d.ok));
   });
 }
 function fwLoadAdmin(){
@@ -1227,8 +1375,11 @@ function fwLoadKernBan(){
   });
 }
 function fwKernBanSync(){
-  fwSend('kernban_sync', {}, function(r){
-    bt_tools.msg((r&&r.msg)||'完成', (r&&r.status)); fwLoadKernBan();
+  layer.confirm('确认立即同步内核封禁规则？（高危操作，将写入操作审计）', {icon:3, title:'提示'}, function(i){
+    layer.close(i);
+    fwSend('kernban_sync', {}, function(r){
+      bt_tools.msg((r&&r.msg)||'完成', (r&&r.status)); fwLoadKernBan();
+    });
   });
 }
 
