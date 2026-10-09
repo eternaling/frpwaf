@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<!--
+  FRP WAF · 风控页（risk）
+  访问行为触发风险控制时展示（例如代理级冷却、突发观测命中）。
+  署名：nightsoil.cn 永夜工作室
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>安全验证</title>
+<style>
+  :root{color-scheme:light}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;
+       gap:22px;padding:32px 18px;font:15px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+       color:#1f2733;background:linear-gradient(160deg,#eef6f1 0%,#e3efe8 100%)}
+  .card{width:100%;max-width:520px;background:#fff;border-radius:16px;padding:38px 32px;text-align:center;
+        box-shadow:0 12px 34px rgba(31,39,51,.10),0 2px 6px rgba(31,39,51,.05)}
+  .ico{width:64px;height:64px;margin:0 auto 18px;display:flex;align-items:center;justify-content:center;
+       border-radius:50%;background:#eef7f0}
+  h1{margin:0 0 10px;font-size:21px;font-weight:700;letter-spacing:.3px}
+  p{margin:6px 0;color:#4a5566}
+  .sub{font-size:13px;color:#8a94a4;margin-top:14px}
+  footer{font-size:12px;color:#98a2b3}
+  footer a{color:inherit;text-decoration:none}
+  footer a:hover{color:#2d8cf0;text-decoration:underline}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="ico">
+      <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#30a46c" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+        <path d="M9 12l2 2 4-4"/>
+      </svg>
+    </div>
+    <h1>安全验证</h1>
+    <p>当前访问行为触发了风险控制，请稍后重试。</p>
+    <p class="sub">短时间内请勿频繁刷新；持续异常可能被临时限制访问。</p>
+  </div>
+  <footer><a href="https://nightsoil.cn" target="_blank" rel="noopener noreferrer">© 2026 nightsoil.cn 永夜工作室</a> · frpwaf</footer>
+</body>
+</html>

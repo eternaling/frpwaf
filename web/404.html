@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<!--
+  FRP WAF · 404 页
+  拦截页服务收到未定义路径、或对应页面开关被关闭时的兜底页。
+  署名：nightsoil.cn 永夜工作室
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>页面不存在</title>
+<style>
+  :root{color-scheme:light}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;
+       gap:22px;padding:32px 18px;font:15px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+       color:#1f2733;background:linear-gradient(160deg,#f4f5f8 0%,#e9ebf1 100%)}
+  .card{width:100%;max-width:520px;background:#fff;border-radius:16px;padding:38px 32px;text-align:center;
+        box-shadow:0 12px 34px rgba(31,39,51,.10),0 2px 6px rgba(31,39,51,.05)}
+  .code{font:700 46px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#c7ccd6;margin-bottom:14px}
+  h1{margin:0 0 10px;font-size:20px;font-weight:700}
+  p{margin:6px 0;color:#4a5566}
+  .sub{font-size:13px;color:#8a94a4;margin-top:14px}
+  footer{font-size:12px;color:#98a2b3}
+  footer a{color:inherit;text-decoration:none}
+  footer a:hover{color:#2d8cf0;text-decoration:underline}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="code">404</div>
+    <h1>页面不存在</h1>
+    <p>您访问的页面不存在或已被移除。</p>
+    <p class="sub">请检查地址是否正确。</p>
+  </div>
+  <footer><a href="https://nightsoil.cn" target="_blank" rel="noopener noreferrer">© 2026 nightsoil.cn 永夜工作室</a> · frpwaf</footer>
+</body>
+</html>
