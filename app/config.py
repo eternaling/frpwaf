@@ -129,9 +129,9 @@ DEFAULTS = {
     "ai_review_state": "",                # "running"=正在审查（插件端轮询进度）
     "ai_review_started": 0,               # 本轮审查开始时间戳（判断进度是否僵死）
     # ---- GitHub 在线升级 ----
-    # 仓库地址 owner/repo（如 "nightsoil/frpwaf"）；留空 = 未配置（不写死地址，
-    # 由用户在设置页填写）。填写后插件端/Web 端可「检查更新 / 一键升级」。
-    "github_repo": "",
+    # 仓库地址 owner/repo；默认指向本项目公开仓库（可在面板「关于」页改成自己的 fork）。
+    # 置空 = 未配置（「检查更新 / 一键升级」会提示先填仓库地址）。
+    "github_repo": "eternaling/frpwaf",
     "github_last_check": 0,               # 上次检查更新时间戳
     "github_last_result": "",             # 上次检查结果摘要（前端展示）
     "github_last_ok": True,               # 上次检查是否成功
@@ -167,6 +167,21 @@ def migrate_legacy_attack(cfg):
         if _th < 1 and _win <= 1:
             cfg[_en] = True   # 疑似旧版 0/0/0 哨兵：恢复默认开启
     cfg[_ATTACK_MIGRATED] = True
+    return cfg
+
+
+# 一次性迁移标记：旧配置里 `github_repo` 为空（键缺失或保存过空值）时填入默认公开仓库。
+# 只做一次，之后用户手动清空不再被重置。
+_GITHUB_REPO_MIGRATED = "_github_repo_default_migrated"
+
+
+def migrate_github_repo(cfg):
+    """一次性把空 `github_repo` 填为 DEFAULTS 默认值（见 _GITHUB_REPO_MIGRATED 注释）。"""
+    if cfg.get(_GITHUB_REPO_MIGRATED):
+        return cfg
+    if not str(cfg.get("github_repo") or "").strip():
+        cfg["github_repo"] = DEFAULTS["github_repo"]
+    cfg[_GITHUB_REPO_MIGRATED] = True
     return cfg
 
 
@@ -290,6 +305,7 @@ def load():
         except Exception:
             pass
     migrate_legacy_attack(cfg)   # 一次性：旧版 0/0/0 哨兵组合恢复默认开启
+    migrate_github_repo(cfg)     # 一次性：空 github_repo 填入默认公开仓库
     normalize_auto_ban(cfg)   # 生效值统一：开关开启时未设置参数回退默认，避免「开着不生效」
     normalize_burst_cool(cfg)   # 突发观测/冷却防呆：窗口无效回退；冷却开启时参数防呆
     normalize_block_page(cfg)   # 拦截页防呆：端口非法/冲突回退；重定向端口白名单化
@@ -443,6 +459,7 @@ def save(patch):
         merged = dict(DEFAULTS)
         merged.update(disk)
         migrate_legacy_attack(merged)   # 先于 patch：旧版哨兵迁移不覆盖本次显式修改
+        migrate_github_repo(merged)     # 先于 patch：空仓库地址填默认值，不覆盖本次显式修改
         merged.update(patch)
         normalize_auto_ban(merged)      # 防呆：开关开启时未设置参数回退默认
         normalize_burst_cool(merged)    # 防呆：观测窗口无效回退；冷却开启时参数防呆
