@@ -1,0 +1,11 @@
+{
+  "typeCheckingMode": "off",
+  "pythonVersion": "3.8",
+  "pythonPlatform": "Linux",
+  "exclude": [
+    "**/node_modules",
+    "**/__pycache__",
+    "dist",
+    "scratchpad"
+  ]
+}
