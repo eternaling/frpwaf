@@ -843,10 +843,13 @@ async function loadAbout(){
     const r = await api('/api/about'); const d=r.data||{};
     const repo = d.repo||'';
     const repoHtml = repo? '<a href="https://github.com/'+esc(repo)+'" target="_blank" rel="noopener">'+esc(repo)+'</a>' : '（未配置）';
+    // 公开仓库链接（方便他人直接打开）：优先用配置的仓库，为空则回退项目默认公开仓库
+    const pubUrl = 'https://github.com/' + (repo || 'eternaling/frpwaf');
+    const pubHtml = '<a href="'+esc(pubUrl)+'" target="_blank" rel="noopener noreferrer">'+esc(pubUrl)+'</a>';
     $('#aboutKv').innerHTML = [
       ['名称', esc(d.name||'FRP WAF')], ['版本', esc(d.version||'-')],
       ['署名', esc(d.author||'-')], ['许可', esc(d.license||'MIT')],
-      ['运行时', esc(d.runtime||'-')], ['GitHub', repoHtml],
+      ['运行时', esc(d.runtime||'-')], ['公开仓库', pubHtml],
     ].map(kvCard).join('');
     $('#aboutAuthor').innerHTML = '© 2026 <a href="https://nightsoil.cn" target="_blank" rel="noopener noreferrer">'+esc(d.author||'nightsoil.cn 永夜工作室')+'</a> · FRP WAF'+(repo?(' · '+repoHtml):'');
     $('#upRepo').value = repo;

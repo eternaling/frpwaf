@@ -1285,11 +1285,14 @@ function fwLoadAbout(){
     var d=(r&&r.data)||{};
     var repo=d.repo||'';
     var repoHtml=repo?('<a href="https://github.com/'+fwEsc(repo)+'" target="_blank" rel="noopener">'+fwEsc(repo)+'</a>'):'（未配置）';
+    // 公开仓库链接（方便他人直接打开）：优先用配置的仓库，为空则回退项目默认公开仓库
+    var pubUrl='https://github.com/'+(repo||'eternaling/frpwaf');
+    var pubHtml='<a href="'+fwEsc(pubUrl)+'" target="_blank" rel="noopener noreferrer">'+fwEsc(pubUrl)+'</a>';
     var kv=document.getElementById('fwAboutKv');
     if(kv){ kv.innerHTML=''
       +'<div class="k">版本</div><div>'+fwEsc(d.version||'-')+'</div>'
       +'<div class="k">署名</div><div>'+fwEsc(d.author||'-')+'</div>'
-      +'<div class="k">GitHub 仓库</div><div>'+repoHtml+'</div>'
+      +'<div class="k">公开仓库</div><div>'+pubHtml+'</div>'
       +'<div class="k">许可</div><div>'+fwEsc(d.license||'MIT')+'</div>'
       +'<div class="k">运行时</div><div>'+fwEsc(d.runtime||'-')+'</div>'; }
     var a=document.getElementById('fwAboutAuthor');
