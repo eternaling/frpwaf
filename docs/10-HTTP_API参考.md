@@ -105,8 +105,8 @@ ai_timeout`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/kernban` | `{available, enabled, set4, set6, rule}` |
-| POST | `/api/kernban/sync` | 手动同步；开关关闭时清理内核残留 |
+| GET | `/api/kernban` | `{available, enabled, mode, set4, set6, rule, redirect, redirect_ports}`（`mode`: `drop` / `redirect` / `off`） |
+| POST | `/api/kernban/sync` | 按开关同步（DROP / nat REDIRECT / 清理）；写审计日志 |
 
 ### 11. AI
 
@@ -118,15 +118,29 @@ ai_timeout`。
 | POST | `/api/ai/test` | 测试连接（可用表单覆盖 base/key/model/protocol） |
 
 > `POST /api/ai/review` 在 daemon 进程内同步执行审查（与插件端 `ai_run_now`
-> 的异步触发不同）；大批量送审可能耗时较长，独立 Web 端目前未提供入口，
-> 日常请从宝塔插件端操作（见 [07](07-管理面板与插件功能.md)）。
+> 的异步触发不同）；大批量送审可能耗时较长。独立 Web 端自 2026-10 起已在
+> 「AI 审查」页提供「立即审查」入口（`aiRunNow`，二次确认 + 写审计）；
+> 大批量场景仍建议从宝塔插件端操作（见 [07](07-管理面板与插件功能.md)）。
 
-> **后端存在、但独立 Web 端无 UI 的接口**：`/api/kernban`、`/api/kernban/sync`、
-> `/api/ai/*`（以上接口可用 curl 直接调用，但 `web/index.html` 未提供入口，
-> 日常请从宝塔插件端操作）。Web 端实际使用的只有：登录/登出、概览、版本、配置、
-> 改密、名单、日志、封禁、代理统计、归属地。
+> **Web 端无专属 UI 的接口**：`/api/blockpage`（拦截页服务状态，诊断用）、
+> `/api/ai/test`（AI 连接测试，插件端专用）、`/api/version`、`/api/ai/results`
+> （`/api/ai/review` GET 的别名）。其余 `/api/kernban`、`/api/ai/review`、
+> `/api/service`、`/api/syslog`、`/api/about`、`/api/upgrade/*` 自 2026-10 起均已在
+> `web/index.html` 提供入口。仍仅插件端可用的能力是 frp 管理、frps 集成注入、
+> 网页端开关/改端口、静态拦截页开关（依赖宝塔面板上下文与 root 流程）。
 
-### 12. frp 回调（非 API，但由同一进程提供）
+### 12. 关于 / 运行日志 / 服务控制 / 在线升级 / 拦截页
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/about` | `{name, version, author, repo, license, runtime}` |
+| GET | `/api/syslog?limit=N` | `data/frpwaf.log` 尾部（limit 1~2000，默认 200）→ `{lines, total}` |
+| POST | `/api/service` | `{action:"restart"\|"stop"}`；延迟约 2s 执行（避免当前请求被自身重启打断）；写审计 |
+| GET | `/api/upgrade/check` | 检查 GitHub 最新版本（取 `github_repo` 或入参 `repo`）→ `{ok,current,latest,has_update,tarball,url,notes}` |
+| POST | `/api/upgrade/apply` | 执行在线升级（下载 → 校验 → 备份 → 覆盖程序 → 重启；失败自动回滚，**不覆盖 data/**）；写审计 |
+| GET | `/api/blockpage` | 拦截页服务状态 `{enabled, running, port}` |
+
+### 13. frp 回调（非 API，但由同一进程提供）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -179,11 +193,14 @@ ai_timeout`。
 ### 策略 / 内核 / 账号
 
 `waf_overview`、`get_policy`、`save_policy`、`kernban_status`、`kernban_sync`、
-`get_admin`、`change_admin_pwd(old,new,new_user,old_user)`。
+`get_admin`、`change_admin_pwd(old,new,new_user,old_user)`、
+`about`、`upgrade_check`、`upgrade_apply`。
 
 > `get_policy` / `save_policy` 的布尔键含 `auto_ban_cc_enabled` / `auto_ban_scan_enabled` /
-> `auto_ban_ssh_enabled` / `proxy_cool_enabled`，整型键含三组窗口/阈值/时长参数与
-> 突发观测/冷却参数（见 [04 §3.4.1 / §3.5.1](04-数据模型与配置项.md)）。
+> `auto_ban_ssh_enabled` / `proxy_cool_enabled` / `block_page_enabled` / `block_page_ban_enabled` /
+> `block_page_risk_enabled` / `block_page_404_enabled`，整型键含三组窗口/阈值/时长参数、
+> 突发观测/冷却参数与 `block_page_port`，字符串键含 `github_repo` / `block_page_redirect_ports`
+> （见 [04 §3.4.1 / §3.5.1 / §3.7.1 / §3.10](04-数据模型与配置项.md)）。
 
 ### AI
 
