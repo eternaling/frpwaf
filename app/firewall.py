@@ -29,6 +29,7 @@ import time
 SET4 = "frpwaf_block"
 SET6 = "frpwaf_block6"
 CHAIN = "FRPWAF_BLOCK"
+NAT_CHAIN = "FRPWAF_REDIRECT"
 
 _lock = threading.Lock()
 # 全量同步串行锁：从「读库构建快照」到「下发内核」全程互斥。
@@ -52,10 +53,8 @@ def _have(name):
 
 def available():
     """当前环境是否支持内核级封禁。"""
-    try:
-        if os.geteuid() != 0:
-            return False
-    except AttributeError:
+    geteuid = getattr(os, "geteuid", None)   # Windows 无该接口：直接视为不支持
+    if geteuid is None or geteuid() != 0:
         return False
     return _have("ipset") and _have("iptables")
 
@@ -71,10 +70,15 @@ def _norm(cidr):
     return str(net), net.version
 
 
-def _ensure():
-    """确保集合、链、规则就绪（幂等）。"""
+def _ensure_sets():
+    """创建 ipset 集合（幂等；不含 iptables 规则）。"""
     _run(["ipset", "create", SET4, "hash:net", "timeout", "0", "-exist"])
-    # 链
+    if _have("ip6tables"):
+        _run(["ipset", "create", SET6, "hash:net", "family", "inet6", "timeout", "0", "-exist"])
+
+
+def _ensure_drop():
+    """确保 filter 表 FRPWAF_BLOCK 链与 DROP 规则就绪（幂等）。"""
     _run(["iptables", "-N", CHAIN])
     rc, _, _ = _run(["iptables", "-C", "INPUT", "-j", CHAIN])
     if rc != 0:
@@ -82,9 +86,7 @@ def _ensure():
     rc, _, _ = _run(["iptables", "-C", CHAIN, "-m", "set", "--match-set", SET4, "src", "-j", "DROP"])
     if rc != 0:
         _run(["iptables", "-A", CHAIN, "-m", "set", "--match-set", SET4, "src", "-j", "DROP"])
-    # IPv6（可选）
     if _have("ip6tables"):
-        _run(["ipset", "create", SET6, "hash:net", "family", "inet6", "timeout", "0", "-exist"])
         _run(["ip6tables", "-N", CHAIN])
         rc, _, _ = _run(["ip6tables", "-C", "INPUT", "-j", CHAIN])
         if rc != 0:
@@ -92,6 +94,97 @@ def _ensure():
         rc, _, _ = _run(["ip6tables", "-C", CHAIN, "-m", "set", "--match-set", SET6, "src", "-j", "DROP"])
         if rc != 0:
             _run(["ip6tables", "-A", CHAIN, "-m", "set", "--match-set", SET6, "src", "-j", "DROP"])
+
+
+def _clear_drop():
+    """移除 DROP 规则（保留链与 INPUT 跳转，便于快速切回）。"""
+    _run(["iptables", "-D", CHAIN, "-m", "set", "--match-set", SET4, "src", "-j", "DROP"])
+    if _have("ip6tables"):
+        _run(["ip6tables", "-D", CHAIN, "-m", "set", "--match-set", SET6, "src", "-j", "DROP"])
+
+
+def _rule_redirect(ipt, setname, port, block_port):
+    """幂等下发一条 REDIRECT 规则（先 -C 再 -A）。"""
+    rule = ["-m", "set", "--match-set", setname, "src", "-p", "tcp",
+            "--dport", str(port), "-j", "REDIRECT", "--to-ports", str(block_port)]
+    rc, _, _ = _run([ipt, "-t", "nat", "-C", NAT_CHAIN] + rule)
+    if rc != 0:
+        _run([ipt, "-t", "nat", "-A", NAT_CHAIN] + rule)
+
+
+def _ensure_redirect(ports, block_port):
+    """确保 nat 表 FRPWAF_REDIRECT 链与 REDIRECT 规则就绪（幂等）。
+
+    被禁 IP 访问 frps HTTP 端口时，在 PREROUTING 阶段改道到拦截页服务；
+    必须先摘除 DROP（nat 在 filter 之前，但改道后的包仍会在 INPUT 被 DROP 命中）。
+    """
+    _run(["iptables", "-t", "nat", "-N", NAT_CHAIN])
+    rc, _, _ = _run(["iptables", "-t", "nat", "-C", "PREROUTING", "-j", NAT_CHAIN])
+    if rc != 0:
+        _run(["iptables", "-t", "nat", "-I", "PREROUTING", "1", "-j", NAT_CHAIN])
+    if _have("ip6tables"):
+        _run(["ip6tables", "-t", "nat", "-N", NAT_CHAIN])
+        rc, _, _ = _run(["ip6tables", "-t", "nat", "-C", "PREROUTING", "-j", NAT_CHAIN])
+        if rc != 0:
+            _run(["ip6tables", "-t", "nat", "-I", "PREROUTING", "1", "-j", NAT_CHAIN])
+    for p in ports:
+        _rule_redirect("iptables", SET4, p, block_port)
+        if _have("ip6tables"):
+            _rule_redirect("ip6tables", SET6, p, block_port)
+
+
+def _clear_redirect():
+    """移除 nat 表 REDIRECT 链与规则（幂等）。"""
+    _run(["iptables", "-t", "nat", "-D", "PREROUTING", "-j", NAT_CHAIN])
+    _run(["iptables", "-t", "nat", "-F", NAT_CHAIN])
+    _run(["iptables", "-t", "nat", "-X", NAT_CHAIN])
+    if _have("ip6tables"):
+        _run(["ip6tables", "-t", "nat", "-D", "PREROUTING", "-j", NAT_CHAIN])
+        _run(["ip6tables", "-t", "nat", "-F", NAT_CHAIN])
+        _run(["ip6tables", "-t", "nat", "-X", NAT_CHAIN])
+
+
+def _mode(cfg):
+    """内核层处置模式：drop（静默丢包）/ redirect（重定向到拦截页）/ off。"""
+    if cfg.get("fw_sync_enabled", True):
+        return "drop"
+    if cfg.get("block_page_enabled", True):
+        return "redirect"
+    return "off"
+
+
+def _redirect_ports(cfg):
+    """REDIRECT 目标端口：显式配置优先，否则自动读取 frps vhostHTTPPort。
+
+    显式配置为逗号分隔端口（normalize 已白名单化）；自动读取失败或为空时返回 []，
+    调用方据此退化为 DROP（至少保证拦截）。
+    """
+    ports = []
+    for tok in str(cfg.get("block_page_redirect_ports") or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            p = int(tok)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= p <= 65535 and p not in ports:
+            ports.append(p)
+    if ports:
+        return ports
+    try:
+        from . import frp
+        ok, data = frp.load_config("frps")
+        if ok and isinstance(data, dict):
+            try:
+                v = int(data.get("vhostHTTPPort") or 0)
+            except (TypeError, ValueError):
+                v = 0
+            if 1 <= v <= 65535:
+                ports.append(v)
+    except Exception:
+        pass
+    return ports
 
 
 def _members(setname):
@@ -239,7 +332,7 @@ def sync(permanent, bans, whitelist=None):
                 _apply_whitelist(want6, wnets)
 
         with _lock:
-            _ensure()
+            _ensure_sets()
             _reconcile(SET4, want4)
             if _have("ip6tables"):
                 _reconcile(SET6, want6)
@@ -247,7 +340,7 @@ def sync(permanent, bans, whitelist=None):
 
 
 def sync_from_store():
-    """从数据库读取黑名单与生效封禁并同步。
+    """从数据库读取黑名单与生效封禁，并按开关决定内核层处置。
 
     必须与引擎决策保持一致：内核层是「应用层拦截」的加速手段，其拦截集合
     应当等于应用层实际会拒绝的集合，否则会出现：
@@ -255,13 +348,22 @@ def sync_from_store():
       - whitelist_enabled 关闭后，内核仍按白名单剔除成员 -> 黑名单漏封。
     故这里按开关裁剪：黑名单开关关闭则不下发永久黑名单；白名单开关关闭则
     不把白名单作为剔除条件（临时封禁不受名单开关影响，始终下发）。
+
+    处置模式（与需求 7 对应）：
+      - fw_sync_enabled 开            -> DROP（静默丢包，无页面）
+      - 关 + block_page_enabled 开    -> nat REDIRECT 到拦截页服务（展示页面）
+      - 都关                          -> 清理内核规则（仅应用层 reject）
+    失败不回滚数据库（数据库是事实源，内核是派生状态，由后台 10s 轮询兜底）。
     """
     if not available():
         return False
     from . import config, store
     with _sync_lock:
         cfg = config.get()
-        if not cfg.get("fw_sync_enabled", True):
+        mode = _mode(cfg)
+        if mode == "off":
+            _clear_drop()
+            _clear_redirect()
             return False
         perms = []
         if cfg.get("blacklist_enabled", True):
@@ -270,7 +372,27 @@ def sync_from_store():
         if cfg.get("whitelist_enabled", False):
             whites = [r["cidr"] for r in store._query("SELECT cidr FROM ip_list WHERE list_type='white'")]
         bans = store.active_bans()
-        return sync(perms, bans, whites)
+        ok = sync(perms, bans, whites)   # 填充 ipset（白名单差集在 sync 内完成）
+        try:
+            block_port = int(cfg.get("block_page_port") or 7081)
+        except (TypeError, ValueError):
+            block_port = 7081
+        with _lock:
+            _ensure_sets()
+            if mode == "drop":
+                _clear_redirect()
+                _ensure_drop()
+            else:  # redirect
+                ports = _redirect_ports(cfg)
+                if ports:
+                    # 先摘 DROP：nat 在 filter 之前，但改道后的包仍会在 INPUT 被 DROP 命中
+                    _clear_drop()
+                    _ensure_redirect(ports, block_port)
+                else:
+                    # 无可用目标端口：退化为 DROP，至少保证拦截
+                    _clear_redirect()
+                    _ensure_drop()
+        return ok
 
 
 def remove(ip):
@@ -303,6 +425,8 @@ def teardown():
     if not _have("iptables"):
         return False
     with _sync_lock:
+        _clear_drop()
+        _clear_redirect()
         _run(["iptables", "-D", "INPUT", "-j", CHAIN])
         _run(["iptables", "-F", CHAIN])
         _run(["iptables", "-X", CHAIN])
@@ -317,10 +441,19 @@ def teardown():
 
 def status():
     """返回给界面展示的状态。"""
-    info = {"available": available(), "enabled": False,
-            "set4": 0, "set6": 0, "rule": False}
+    info = {"available": available(), "enabled": False, "mode": "off",
+            "set4": 0, "set6": 0, "rule": False,
+            "redirect": False, "redirect_ports": []}
     if not info["available"]:
         return info
+    try:
+        from . import config
+        cfg = config.get()
+        info["mode"] = _mode(cfg)
+        info["enabled"] = info["mode"] != "off"
+        info["redirect_ports"] = _redirect_ports(cfg)
+    except Exception:
+        pass
     for name, key in ((SET4, "set4"), (SET6, "set6")):
         rc, out, _ = _run(["ipset", "list", name])
         if rc == 0:
@@ -332,4 +465,6 @@ def status():
                         pass
     rc, _, _ = _run(["iptables", "-C", "INPUT", "-j", CHAIN])
     info["rule"] = (rc == 0)
+    rc, _, _ = _run(["iptables", "-t", "nat", "-C", "PREROUTING", "-j", NAT_CHAIN])
+    info["redirect"] = (rc == 0)
     return info

@@ -539,7 +539,7 @@ fun_start(){{
 
 fun_stop(){{
     if fun_check_run; then
-        echo -n "Stoping ${{ProgramName}} (pid $PID)... "
+        echo -n "Stopping ${{ProgramName}} (pid $PID)... "
         kill $PID && echo " done" || {{ echo " failed"; return 1; }}
     else
         echo "${{ProgramName}} is not running."
@@ -845,7 +845,7 @@ def save_config(kind, patch):
     """
     path = _toml_path(kind)
     ok, cfg = load_config(kind)
-    if not ok:
+    if not ok or not isinstance(cfg, dict):
         return False, cfg
 
     # 规整 patch：maxPoolCount 归位到 [transport]
@@ -909,7 +909,7 @@ def tail_log(kind, lines=300):
     path = "/var/log/frps.log" if kind == "frps" else "/var/log/frpc.log"
     # 优先使用配置里的 log.to
     ok, cfg = load_config(kind)
-    if ok:
+    if ok and isinstance(cfg, dict):
         log = cfg.get("log") or {}
         if isinstance(log, dict) and log.get("to"):
             path = log["to"]
