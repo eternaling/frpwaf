@@ -23,7 +23,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # 相对导入：无论本包以 app 还是 frpwaf_app 名字载入都能正确解析，
 # 避免在面板常驻进程里与外部通用 "app" 包冲突。
-from . import __version__, ai, auth, config, engine, firewall, geo, store  # noqa: E402
+from . import (__author__, __version__, ai, auth, blockpage, config, engine,  # noqa: E402
+               firewall, geo, store, upgrade)
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
 
@@ -34,6 +35,14 @@ _mem_lock = threading.Lock()
 # 运行日志（写入 data/frpwaf.log，供插件「运行日志」页查看）
 _log_lock = threading.Lock()
 _LOG_MAX = 2 * 1024 * 1024      # 超过 2MB 时截断保留尾部 1MB
+
+
+def _audit(msg):
+    """操作审计：写入运行日志（data/frpwaf.log），带 [审计] 标记，便于追溯高危操作。"""
+    try:
+        _log("[审计] %s" % msg)
+    except Exception:
+        pass
 
 
 def _log(msg):
@@ -121,19 +130,15 @@ def _int(v):
 
 
 def _fw_sync():
-    """按当前配置同步内核封禁（失败静默，不影响主流程）。
+    """按当前配置同步内核处置（DROP / REDIRECT / 清理，失败静默）。
 
-    注意：关闭开关时必须显式清理内核残留（ipset + iptables）。否则已下发的
-    封禁规则仍在内核层丢包，表现为「已在面板关闭内核封禁，却仍被拦截」。
+    不再区分「开关开则 sync、关则 teardown」：sync_from_store() 内部按
+    fw_sync_enabled 与 block_page_enabled 决定模式——关闭内核封禁但开启
+    拦截页时需改为 nat REDIRECT（让被封 IP 看到页面），两者都关才清理。
     """
     try:
-        on = bool(config.get().get("fw_sync_enabled", True))
-        if on:
-            firewall.sync_from_store()
-        elif _mem.get("fw_on", None) is not False:
-            # 首次（None）或由开转关：清理可能残留的规则；保持关闭时不重复执行
-            firewall.teardown()
-        _mem["fw_on"] = on
+        firewall.sync_from_store()
+        _mem["fw_on"] = bool(config.get().get("fw_sync_enabled", True))
     except Exception:
         pass
 
@@ -175,10 +180,10 @@ class Handler(BaseHTTPRequestHandler):
     timeout = 30
 
     # ---------- 工具 ----------
-    def log_message(self, fmt, *args):  # 静音默认访问日志
+    def log_message(self, format, *args):  # 静音默认访问日志
         pass
 
-    def _send(self, code, body=b"", ctype="application/json; charset=utf-8", headers=None):
+    def _send(self, code, body: "bytes | str" = b"", ctype="application/json; charset=utf-8", headers=None):
         if isinstance(body, str):
             body = body.encode("utf-8")
         self.send_response(code)
@@ -359,8 +364,11 @@ class Handler(BaseHTTPRequestHandler):
         path = os.path.join(WEB_DIR, name)
         if not os.path.abspath(path).startswith(os.path.abspath(WEB_DIR)) or not os.path.exists(path):
             return self._send(404, "not found", ctype="text/plain; charset=utf-8")
-        with open(path, "rb") as f:
-            data = f.read()
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return self._send(404, "not found", ctype="text/plain; charset=utf-8")
         ctype = "text/html; charset=utf-8" if name.endswith(".html") else "application/octet-stream"
         return self._send(200, data, ctype=ctype)
 
@@ -435,6 +443,11 @@ class Handler(BaseHTTPRequestHandler):
                 "auto_ban_ssh_threshold": int,
                 "rate_limit_enabled": bool, "rate_limit_per_sec": int,
                 "log_max_rows": int, "fw_sync_enabled": bool,
+                # 静态拦截页（404/封禁/风控）与 GitHub 在线升级
+                "block_page_enabled": bool, "block_page_404_enabled": bool,
+                "block_page_ban_enabled": bool, "block_page_risk_enabled": bool,
+                "block_page_port": int, "block_page_redirect_ports": str,
+                "github_repo": str,
                 # 分布式突发观测与代理级冷却
                 "burst_window": int, "proxy_cool_enabled": bool,
                 "proxy_cool_min_conns": int, "proxy_cool_uniq_threshold": int,
@@ -480,6 +493,7 @@ class Handler(BaseHTTPRequestHandler):
                 patch["ai_window"] = 30
             config.save(patch)   # patch 语义：锁内合并磁盘现状，避免覆盖并发写入方字段
             _fw_sync()   # 开关/名单变化立即生效（关闭内核封禁时同步清理残留）
+            blockpage.ensure()   # 拦截页端口/开关变更后立即生效
             return self._json({"code": 0, "msg": "保存成功"})
 
         if path == "/api/password":
@@ -659,17 +673,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"code": 0, "data": st})
 
         if path == "/api/kernban/sync" and method == "POST":
-            if cfg.get("fw_sync_enabled", True):
-                ok = firewall.sync_from_store()
-                return self._json({"code": 0 if ok else 1,
-                                   "msg": "已同步" if ok else "当前环境不支持（需 root + ipset/iptables）",
-                                   "data": firewall.status()})
-            firewall.teardown()
-            return self._json({"code": 0, "msg": "内核封禁已关闭，已清理内核规则",
-                               "data": firewall.status()})
+            _audit("Web 端手动同步内核封禁")
+            ok = firewall.sync_from_store()
+            st = firewall.status()
+            if ok:
+                return self._json({"code": 0, "msg": "已同步", "data": st})
+            if st.get("mode") == "off":
+                return self._json({"code": 0, "msg": "内核封禁与拦截页均已关闭，已清理内核规则",
+                                   "data": st})
+            return self._json({"code": 1,
+                               "msg": "当前环境不支持（需 root + ipset/iptables）",
+                               "data": st})
 
         if path == "/api/ai/review":
             if method == "POST":
+                _audit("Web 端手动触发 AI 审查")
                 try:
                     res = ai.review(force=True)
                 except Exception:
@@ -696,6 +714,55 @@ class Handler(BaseHTTPRequestHandler):
             if ok:
                 return self._json({"code": 0, "msg": "连接成功，模型返回正常"})
             return self._json({"code": 1, "msg": "连接失败：" + str(res)[:300]})
+
+        if path == "/api/blockpage":
+            return self._json({"code": 0, "data": blockpage.status()})
+
+        if path == "/api/about":
+            return self._json({"code": 0, "data": {
+                "name": "FRP WAF", "version": __version__, "author": __author__,
+                "repo": str(cfg.get("github_repo") or ""), "license": "MIT",
+                "runtime": "Python 3 标准库 + SQLite + 原生 JS（零第三方依赖）",
+            }})
+
+        if path == "/api/upgrade/check":
+            body = self._body() if method == "POST" else {}
+            repo = str(body.get("repo") or cfg.get("github_repo") or "").strip()
+            res = upgrade.check(repo)
+            return self._json({"code": 0 if res.get("ok") else 1, "data": res,
+                               "msg": res.get("error") or res.get("msg") or ""})
+
+        if path == "/api/upgrade/apply" and method == "POST":
+            body = self._body()
+            repo = str(body.get("repo") or cfg.get("github_repo") or "").strip()
+            _audit("Web 端触发 GitHub 在线升级（仓库 %s）" % (repo or "未配置"))
+            res = upgrade.apply(repo)
+            _audit("GitHub 在线升级结果：%s" % (res.get("msg") or res.get("error") or "未知"))
+            return self._json({"code": 0 if res.get("ok") else 1, "data": res,
+                               "msg": res.get("error") or res.get("msg") or ""})
+
+        if path == "/api/service" and method == "POST":
+            body = self._body()
+            action = str(body.get("action") or "").strip()
+            if action not in ("restart", "stop"):
+                return self._json({"code": 1, "msg": "不支持的操作（仅 restart / stop）"})
+            _audit("Web 端服务控制：%s" % action)
+            ok = upgrade.schedule_init(action, delay=2)
+            if not ok:
+                return self._json({"code": 1, "msg": "无法执行（未找到服务脚本 /etc/init.d/frpwaf）"})
+            return self._json({"code": 0,
+                               "msg": "已提交，服务将在约 2 秒后%s" % ("重启" if action == "restart" else "停止")})
+
+        if path == "/api/syslog":
+            lim = _int(qs.get("limit", [200])[0])
+            if lim <= 0 or lim > 2000:
+                lim = 200
+            try:
+                with open(config.LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.read().splitlines()
+            except OSError:
+                lines = []
+            return self._json({"code": 0, "data": {"lines": lines[-lim:], "total": len(lines)}})
 
         if path == "/api/version":
             return self._json({"code": 0, "version": __version__})
@@ -763,7 +830,7 @@ def _bg_loop():
             store.trim_bans(20000)
             store.trim_ai_review(5000)
             _fw_sync()
-            # 每约 60 秒做一次 TRUNCATE checkpoint，回收 -wal 文件大小
+            blockpage.ensure()   # 兜底：其它进程（宝塔插件端）改了拦截页配置也能生效
             tick += 1
             if tick % 6 == 0:
                 store.checkpoint(truncate=True)
@@ -799,6 +866,7 @@ def main():
     t = threading.Thread(target=_bg_loop, daemon=True)
     t.start()
     threading.Thread(target=ai.loop_forever, daemon=True).start()
+    blockpage.ensure()   # 拦截页服务（独立端口，受 block_page_enabled 控制）
     httpd = _QuietHTTPServer((addr, port), Handler)
     httpd.daemon_threads = True
     httpd.timeout = 30
