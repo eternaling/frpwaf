@@ -26,7 +26,6 @@
 | [12-Bug修复记录.md](12-Bug修复记录.md) | **历次发现并修复的全部功能 Bug**（含现象、根因、修复、验证） |
 | [13-变更历史与版本.md](13-变更历史与版本.md) | Git 提交、Tag、Release、版本演进 |
 | [14-运维注意事项与约束.md](14-运维注意事项与约束.md) | 不可触碰的约束、危险操作清单、fail-closed 处置 |
-| [agent-migration.md](agent-migration.md) | **Claude/Codex/pi 三端智能体体系迁移与适配报告**（技能/命令/代理/hooks/任务跟踪/同步机制、历批记录与验证结果） |
 | [tasks/README.md](tasks/README.md) | 任务跟踪规范（活跃任务卡与归档目录说明） |
 | [tests/README.md](tests/README.md) | 验证计划与报告规范（`plans/` 与 `reports/YYYY-MM/`） |
 
