@@ -1,6 +1,9 @@
 # ---- 运行时数据（含密钥/密码/连接日志，绝不入库）----
-data/
-dist/
+# 注意：目录类规则必须锚定仓库根（前导 /），否则会误伤同名子目录。
+# 实例：`data/` 曾把 `.agents/hooks/data/` 整个吞掉，导致危险规则真源不入库、
+#        clone 后三端 hooks 全废（本地文件在盘上，所以毫无报错）。
+/data/
+/dist/
 *.db
 *.db-wal
 *.db-shm
@@ -8,7 +11,7 @@ frpwaf.json
 frpwaf.log
 frpwaf.pid
 frp_job.json
-frp_backup/
+/frp_backup/
 
 # ---- Python 字节码 ----
 __pycache__/
@@ -42,3 +45,10 @@ tmpclaude-*-cwd
 # Codex 本机级配置与运行时数据
 .codex/*.local.toml
 .codex/log/
+
+# ---- pi 运行时状态（goal/task 脑文件，不入库）----
+# .pi/ 下只跟踪配置资产：extensions/、prompts/、APPEND_SYSTEM.md；
+# goal 正文、事件流、任务快照属运行时状态，不入库。
+.pi/goals/
+.pi/tasks/
+.pi/.goals-pool-snapshot.json
