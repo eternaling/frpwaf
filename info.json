@@ -3,13 +3,13 @@
   "name": "frpwaf",
   "type": "免费应用",
   "ps": "frp 服务端/客户端管理 + IP 黑白名单/自动封禁/AI 审查，替代官方 frp管理器",
-  "versions": "1.3.12",
+  "versions": "1.4.0",
   "checks": [
     "/opt/frpwaf/app/daemon.py"
   ],
   "author": "nightsoil",
   "home": "https://github.com/fatedier/frp",
-  "date": "2026-10-02",
+  "date": "2026-10-09",
   "default": false,
   "display": 1
 }

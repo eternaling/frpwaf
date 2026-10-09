@@ -88,6 +88,20 @@ DEFAULTS = {
     # 内核级封禁：把黑名单/封禁同步到 ipset+iptables，在内核直接丢包，
     # 被禁 IP 连不到 frps，连接计数不再增长（需要 root + ipset/iptables）
     "fw_sync_enabled": True,
+    # ---- 静态拦截页（404 / 封禁 / 风控）----
+    # frp 回调只能返回 allow/reject、无法返回 HTML；frps 的 custom404Page 只对
+    # 「Host 未匹配任何 frpc 域名」的路由失败生效。因此「被封 IP 展示页面」只能靠
+    # 网络层改道：内核级封禁关闭时，用 iptables -t nat REDIRECT 把命中封禁的 IP
+    # 在其访问端口上引导到本服务提供的拦截页。
+    # 语义区分：内核级封禁开 = DROP（静默、无页面）；关 + 拦截页开 = REDIRECT（展示页面）。
+    "block_page_enabled": True,          # 拦截页总开关（默认开启）
+    "block_page_404_enabled": True,      # 404 页开关（默认开启）
+    "block_page_ban_enabled": True,      # 封禁页开关（默认开启）
+    "block_page_risk_enabled": True,     # 风控页开关（默认开启）
+    "block_page_port": 7081,             # 拦截页服务监听端口（与 http_port 解耦，避免误挡面板）
+    # REDIRECT 目标端口：逗号分隔的端口列表（如 "80,8080"）；留空 = 自动读取 frps
+    # 配置的 vhostHTTPPort。留空且读不到时不做 REDIRECT（拦截页功能不生效）。
+    "block_page_redirect_ports": "",
     # ---- AI 自动 IP 审查 ----
     "ai_enabled": False,
     "ai_protocol": "openai",              # openai / anthropic
@@ -114,11 +128,21 @@ DEFAULTS = {
     "ai_run_consumed": 0,                 # 已消费到的请求时间戳（req > consumed 视为待执行）
     "ai_review_state": "",                # "running"=正在审查（插件端轮询进度）
     "ai_review_started": 0,               # 本轮审查开始时间戳（判断进度是否僵死）
+    # ---- GitHub 在线升级 ----
+    # 仓库地址 owner/repo（如 "nightsoil/frpwaf"）；留空 = 未配置（不写死地址，
+    # 由用户在设置页填写）。填写后插件端/Web 端可「检查更新 / 一键升级」。
+    "github_repo": "",
+    "github_last_check": 0,               # 上次检查更新时间戳
+    "github_last_result": "",             # 上次检查结果摘要（前端展示）
+    "github_last_ok": True,               # 上次检查是否成功
 }
 
 
 def _ensure_dir():
-    os.makedirs(DATA_DIR, exist_ok=True)
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except OSError as exc:
+        raise OSError("无法创建数据目录 %s：%s" % (DATA_DIR, exc)) from exc
 
 
 # 一次性迁移标记：旧版设置页缺新键时回显 0/0/0（窗口显示 1），用户点保存会把
@@ -181,6 +205,40 @@ def normalize_auto_ban(cfg):
     return cfg
 
 
+def normalize_block_page(cfg):
+    """拦截页配置防呆（load / save 双路径）。
+
+    - `block_page_port` 非法（非数字/越界）回退默认；与 `http_port` 相同会让拦截页
+      服务与面板争抢同一端口，同样回退默认，避免配置冲突导致服务起不来；
+    - `block_page_redirect_ports` 只保留 1~65535 的端口，去重后按原顺序以逗号拼接。
+    就地修改并返回传入字典（便于链式调用）。
+    """
+    try:
+        _p = int(cfg.get("block_page_port") or 0)
+    except (TypeError, ValueError):
+        _p = 0
+    try:
+        _hp = int(cfg.get("http_port") or 7080)
+    except (TypeError, ValueError):
+        _hp = 7080
+    if _p < 1 or _p > 65535 or _p == _hp:
+        cfg["block_page_port"] = DEFAULTS["block_page_port"]
+    raw = str(cfg.get("block_page_redirect_ports") or "")
+    ports = []
+    for tok in raw.replace("\uff0c", ",").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            _v = int(tok)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= _v <= 65535 and _v not in ports:
+            ports.append(_v)
+    cfg["block_page_redirect_ports"] = ",".join(str(x) for x in ports)
+    return cfg
+
+
 def normalize_burst_cool(cfg):
     """突发观测与代理级冷却参数防呆（load / save 双路径）。
 
@@ -234,6 +292,7 @@ def load():
     migrate_legacy_attack(cfg)   # 一次性：旧版 0/0/0 哨兵组合恢复默认开启
     normalize_auto_ban(cfg)   # 生效值统一：开关开启时未设置参数回退默认，避免「开着不生效」
     normalize_burst_cool(cfg)   # 突发观测/冷却防呆：窗口无效回退；冷却开启时参数防呆
+    normalize_block_page(cfg)   # 拦截页防呆：端口非法/冲突回退；重定向端口白名单化
     if not cfg.get("secret"):
         cfg["secret"] = secrets.token_hex(32)
         try:
@@ -279,6 +338,49 @@ try:
 except ImportError:
     msvcrt = None
 
+# 平台文件锁原语：经 getattr 解析。fcntl 仅 Linux、msvcrt 仅 Windows，静态检查器
+# 在非对应平台下会报「模块缺属性」/「None 无属性」的误报，这里统一解析一次。
+_FLOCK = getattr(fcntl, "flock", None)
+_LOCK_EX = getattr(fcntl, "LOCK_EX", 0)
+_LOCK_NB = getattr(fcntl, "LOCK_NB", 0)
+_LOCK_UN = getattr(fcntl, "LOCK_UN", 0)
+_MSVCRT_LOCKING = getattr(msvcrt, "locking", None)
+_LK_NBLCK = getattr(msvcrt, "LK_NBLCK", 0)
+_LK_UNLCK = getattr(msvcrt, "LK_UNLCK", 0)
+
+
+def _try_lock(fd):
+    """尝试对 fd 加独占非阻塞锁；成功返回 True，失败或平台不支持返回 False。"""
+    if _FLOCK is not None:
+        try:
+            _FLOCK(fd, _LOCK_EX | _LOCK_NB)
+            return True
+        except OSError:
+            return False
+    if _MSVCRT_LOCKING is not None:
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            _MSVCRT_LOCKING(fd, _LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    return False
+
+
+def _unlock(fd):
+    """释放 fd 上的文件锁（失败忽略）。"""
+    if _FLOCK is not None:
+        try:
+            _FLOCK(fd, _LOCK_UN)
+        except OSError:
+            pass
+    elif _MSVCRT_LOCKING is not None:
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            _MSVCRT_LOCKING(fd, _LK_UNLCK, 1)
+        except OSError:
+            pass
+
 
 class _conf_file_lock(object):
     """跨进程写锁（fcntl.flock / msvcrt.locking，取不到锁时降级为无锁）。
@@ -301,31 +403,18 @@ class _conf_file_lock(object):
             return self
         deadline = time.time() + self.timeout
         while True:
-            try:
-                if fcntl is not None:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                else:
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            if _try_lock(fd):
                 self.fd = fd
                 return self
-            except OSError:
-                if time.time() >= deadline:
-                    os.close(fd)      # 拿不到锁：降级为无锁（不阻塞保存）
-                    return self
-                time.sleep(0.05)
+            if time.time() >= deadline:
+                os.close(fd)      # 拿不到锁：降级为无锁（不阻塞保存）
+                return self
+            time.sleep(0.05)
 
-    def __exit__(self, *exc):
+    def __exit__(self, exc_type, exc_value, tb):
         if self.fd is None:
             return False
-        try:
-            if fcntl is not None:
-                fcntl.flock(self.fd, fcntl.LOCK_UN)
-            else:
-                os.lseek(self.fd, 0, os.SEEK_SET)
-                msvcrt.locking(self.fd, msvcrt.LK_UNLCK, 1)
-        except OSError:
-            pass
+        _unlock(self.fd)
         try:
             os.close(self.fd)
         except OSError:
@@ -349,32 +438,32 @@ def save(patch):
     if not isinstance(patch, dict):
         raise TypeError("config.save() 需要 dict（本次修改的字段集合）")
     _ensure_dir()
-    with _save_lock:
-        with _conf_file_lock():
-            disk = _read_disk()
-            merged = dict(DEFAULTS)
-            merged.update(disk)
-            migrate_legacy_attack(merged)   # 先于 patch：旧版哨兵迁移不覆盖本次显式修改
-            merged.update(patch)
-            normalize_auto_ban(merged)      # 防呆：开关开启时未设置参数回退默认
-            normalize_burst_cool(merged)    # 防呆：观测窗口无效回退；冷却开启时参数防呆
-            if not merged.get("secret"):
-                merged["secret"] = secrets.token_hex(32)
-            tmp = "%s.tmp.%d" % (CONF_PATH, os.getpid())   # 按进程隔离临时文件
+    with _save_lock, _conf_file_lock():
+        disk = _read_disk()
+        merged = dict(DEFAULTS)
+        merged.update(disk)
+        migrate_legacy_attack(merged)   # 先于 patch：旧版哨兵迁移不覆盖本次显式修改
+        merged.update(patch)
+        normalize_auto_ban(merged)      # 防呆：开关开启时未设置参数回退默认
+        normalize_burst_cool(merged)    # 防呆：观测窗口无效回退；冷却开启时参数防呆
+        normalize_block_page(merged)    # 防呆：拦截页端口非法/冲突回退；重定向端口白名单化
+        if not merged.get("secret"):
+            merged["secret"] = secrets.token_hex(32)
+        tmp = "%s.tmp.%d" % (CONF_PATH, os.getpid())   # 按进程隔离临时文件
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(merged, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, CONF_PATH)
+        finally:
             try:
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(merged, f, ensure_ascii=False, indent=2)
-                os.replace(tmp, CONF_PATH)
-            finally:
-                try:
-                    if os.path.exists(tmp):
-                        os.remove(tmp)
-                except OSError:
-                    pass
-            try:
-                os.chmod(CONF_PATH, 0o600)
-            except Exception:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
                 pass
+        try:
+            os.chmod(CONF_PATH, 0o600)
+        except Exception:
+            pass
     invalidate()  # 写盘后立即失效缓存
     return merged
 
