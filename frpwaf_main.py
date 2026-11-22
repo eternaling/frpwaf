@@ -134,30 +134,37 @@ def _app(modname):
 # 插件端与 WAF 守护进程写同一个 data/frpwaf.log（「运行日志」页原样展示）。
 # 落进日志的字段里只要带一个 \n，就能凭空插入一整行看似可信的记录（例如伪造的
 # [审计] 行），取证链被污染。日志是安全产品的取证依据，故入口统一净化。
-# _CTRL_RE 与 _log_text 的规则必须与 app/daemon.py 的同名实现保持一致：
-# 两端写同一份日志，口径不同会让「哪一端能伪造日志」成为安全强度的短板。
-_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+#
+# 实现已下沉到 app/textutil.py：两端共用一份，不再各自维护（历史上两边各写一份，
+# 随后出现漂移：升级失败时守护进程报失败、插件端却报成功）。
+# 导入不能放在模块顶层：_app() 依赖 _app_pkg_dir() 建私有包，需等它们定义完。
 _LOG_FIELD_MAX = 64          # 不可信字段（远端返回 / 外部输入）落日志的截断长度
+
+# 取一次 textutil 模块就够了：_app() 每次调用要扫目录比对 mtime（实测 ~2.2ms），
+# 而 _log_text 在日志路径上高频调用，不能每次都走一遍。
+# 缓存的只是模块对象；源文件变更时 _app() 会重载模块，下次取值自然拿到新属性。
+_textutil_mod = []
+
+
+def _textutil():
+    """取 app/textutil 模块（带本地缓存，避开 _app() 的目录扫描开销）。"""
+    if not _textutil_mod:
+        _textutil_mod.append(_app("textutil"))
+    return _textutil_mod[0]
 
 
 def _log_text(v, maxlen=0):
-    """净化一段要进日志的文本：\r \n 转义成字面量，其它控制字符丢弃。
+    """日志/回显净化：代理到 app/textutil.log_text（与守护进程同一实现）。
 
-    maxlen > 0 时按字符截断（不可信字段统一用 _LOG_FIELD_MAX）。
+    maxlen 语义必须原样透传：0 表示**不截断**，不能在这里换成默认值，
+    否则长文本会被默默截成 64 字符。
     """
-    s = "" if v is None else str(v)
-    s = s.replace("\r", "\\r").replace("\n", "\\n")
-    s = _CTRL_RE.sub("", s)
-    if maxlen and len(s) > maxlen:
-        s = s[:maxlen] + "..."
-    return s
+    return _textutil().log_text(v, maxlen)
 
 
 def _to_bool(v):
-    """宽松布尔解析：字符串 "false"/"0"/"off" 判为 False（bool("false") 是 True）。"""
-    if isinstance(v, str):
-        return v.strip().lower() in ("1", "true", "on", "yes")
-    return bool(v)
+    """宽松布尔解析：代理到 app/textutil.to_bool（与守护进程同一实现）。"""
+    return _textutil().to_bool(v)
 
 
 class frpwaf_main:
@@ -319,18 +326,12 @@ class frpwaf_main:
             return "******"
 
     def _strip_masked(self, patch):
-        """丢弃等于回显掩码的机密字段。
+        """丢弃等于回显掩码的机密字段（代理到 app/textutil.strip_masked）。
 
         「读配置 → 改一项 → 整体回写」的客户端会把 GET 拿到的 ****** 原样提交，
         若照写就把真实密钥覆盖成 ******（AI 审查从此静默失效，且用户看不出异常）。
         """
-        if not isinstance(patch, dict):
-            return patch
-        mv = self._masked_value()
-        for k in self._masked_keys():
-            if k in patch and str(patch[k]) == mv:
-                patch.pop(k, None)
-        return patch
+        return _textutil().strip_masked(patch)
 
     def _set_cfg(self, patch):
         """合并写入配置（patch 语义）。

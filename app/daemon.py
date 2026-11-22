@@ -64,16 +64,18 @@ _fail_log = {}          # 失败类别 -> 上一次记日志的时刻（与 _mem
 # 运行日志（写入 data/frpwaf.log，供插件「运行日志」页查看）
 _log_lock = threading.Lock()
 _LOG_MAX = 2 * 1024 * 1024      # 超过 2MB 时截断保留尾部 1MB
-_LOG_FIELD_MAX = 64             # 不可信字段（代理名/用户/代理类型）落日志时的截断长度
 
-# 配置回显用的掩码值。GET /api/config 把机密字段替换成该值，写入路径若收到
-# 该值说明「客户端只是原样回写」，必须丢弃，否则会把真实密钥覆盖成 ******。
-# 建议后续下沉到 app/config.py（MASKED_VALUE / MASKED_KEYS），三条写入路径共用。
-MASKED_VALUE = "******"
-MASKED_KEYS = ("ai_api_key", "admin_password", "secret")
-
-# 日志字段里必须消除的控制字符（\r \n 在 _log_text 中先转义成字面量，故不在此列）
-_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# 配置回显用的掩码值、日志字段截断长度、日志净化/掩码过滤/布尔解析：
+# 统一由 app/textutil.py 提供（与插件端 frpwaf_main.py 共用同一份实现，
+# 防止两侧行为漂移——历史上就因此出现过「一边报失败、一边报成功」）。
+from .textutil import (  # noqa: E402
+    LOG_FIELD_MAX as _LOG_FIELD_MAX,
+    MASKED_KEYS,
+    MASKED_VALUE,
+    log_text as _log_text,
+    strip_masked as _strip_masked,
+    to_bool as _to_bool,
+)
 
 # ---- AI 接口地址（SSRF）防护 ----
 # 只允许 http/https；下列网段无论配置如何都拒绝（链路本地 + 云厂商元数据）。
@@ -88,38 +90,8 @@ _HTTP_ERR_RE = re.compile(r"^HTTP\s+(\d{3})\b")
 
 
 # ---------- 安全工具 ----------
-def _log_text(v, maxlen=0):
-    """净化一段要进日志/回显的文本：\r \n 转义为字面量，其它控制字符丢弃。
-
-    proxy_name / proxy_type / user 来自 frpc 客户端的 NewUserConn 回调（客户端
-    可控），其中含 \n 就能凭空插入一整行看似可信的日志（如伪造的 [审计] 记录），
-    而 /api/syslog 与插件端「运行日志」页会原样展示 —— 取证链被污染。
-    maxlen > 0 时按字符截断（不可信字段统一用 _LOG_FIELD_MAX）。
-    """
-    s = "" if v is None else str(v)
-    s = s.replace("\r", "\\r").replace("\n", "\\n")
-    s = _CTRL_RE.sub("", s)
-    if maxlen and len(s) > maxlen:
-        s = s[:maxlen] + "..."
-    return s
-
-
-def _strip_masked(patch):
-    """丢弃等于回显掩码的机密字段："读配置→改一项→整体回写"的客户端会把
-    GET 拿到的 ****** 原样提交，若照写就毁掉真实密钥（AI 审查从此静默失效）。"""
-    if not isinstance(patch, dict):
-        return patch
-    for k in MASKED_KEYS:
-        if k in patch and str(patch[k]) == MASKED_VALUE:
-            patch.pop(k, None)
-    return patch
-
-
-def _to_bool(v):
-    """宽松布尔解析：字符串 "false"/"0"/"off" 判为 False（bool("false") 是 True）。"""
-    if isinstance(v, str):
-        return v.strip().lower() in ("1", "true", "on", "yes")
-    return bool(v)
+# _log_text / _strip_masked / _to_bool 已下沉到 app/textutil.py（见顶部 import）：
+# 守护进程与插件端必须用同一份，否则会出现「一边报失败、一边报成功」这类漂移。
 
 
 def _allow_private_ai(cfg):
