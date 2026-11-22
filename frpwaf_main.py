@@ -2129,9 +2129,18 @@ class frpwaf_main:
                                _log_text(res.get("msg") or res.get("error") or "未知",
                                          _LOG_FIELD_MAX)))
                 rep(percent=100, msg="升级完成" if res.get("ok") else "升级失败")
-                return {"ok": bool(res.get("ok")),
-                        "msg": res.get("msg") or "升级完成",
-                        "error": res.get("error") or "",
+                # 失败时的 msg **绝不能**回退成「升级完成」：升级真实失败
+                # （如下载超时）时 res 往往只有 error 没有 msg，旧写法 `res.get("msg") or
+                # "升级完成"` 会让面板报「升级完成」而版本号没变，用户以为升级成功。
+                _ok = bool(res.get("ok"))
+                _err = res.get("error") or ""
+                if _ok:
+                    _msg = res.get("msg") or "升级完成"
+                else:
+                    _msg = res.get("msg") or _err or "升级失败（未返回原因，请查看运行日志）"
+                return {"ok": _ok,
+                        "msg": _msg,
+                        "error": _err,
                         "from": res.get("from") or "",
                         "to": res.get("to") or ""}
 

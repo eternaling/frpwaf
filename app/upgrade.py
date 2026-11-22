@@ -57,6 +57,10 @@ _MAX_READ_CHUNK = 256 * 1024             # 单次读取上限
 # 没有总长度算不出百分比，只能报绝对量；步长取 1MB 是为了让几十 MB 的包
 # 最多产生几十次回调（job 状态是整份 JSON 原子重写，逐 chunk 回调会写爆磁盘）。
 _DL_TEXT_STEP = 1024 * 1024
+# 下载重试：实测同一链路上 248KB 的包耗时在 4.3s–28.2s 之间波动，
+# 单次超时再大也可能撞上更差的时段，重试（新连接）比死等更有效。
+_DL_ATTEMPTS = 3          # 总尝试次数（含首次）
+_DL_TIMEOUT = 120         # 单次 socket 超时（秒）；原来 60s 余量不够
 _MAX_EXTRACT_BYTES = 96 * 1024 * 1024    # 解包后总字节上限
 _MAX_EXTRACT_FILES = 2000                # 解包后文件数上限
 _MAX_SUMS_BYTES = 64 * 1024              # SHA256SUMS 资产体积上限
@@ -771,6 +775,43 @@ def _progress_cb(progress):
     return _emit
 
 
+def _download_with_retry(url, dest, expect_sha256="", max_bytes=_MAX_PKG_BYTES,
+                         progress=None, attempts=_DL_ATTEMPTS, timeout=_DL_TIMEOUT):
+    """带重试的 _download。网络抖动是常态，一次失败不该让升级失败。
+
+    为什么不再加长超时：实测同一条链路上 248KB 的包耗时波动很大
+    （4.3s / 11.0s / 28.2s），单次 socket 超时无论调到多大都可能撞上
+    更差的时段；而重试能让第二次从新的连接开始，比单纯等待更有效。
+
+    - 每个 attempt 重新建连、重新写文件（上一次的半成品被覆盖）
+    - 只对网络/超时类异常重试；**哈希不匹配、体积超限等确定性错误不重试**
+      （重试也不会变好，反而拖长时间，且可能是被投毒）
+    - 每次重试前用 progress 报一句，用户能看到“在重试”而不是卡住
+    返回与 _download 相同：(字节数, sha256)。
+    """
+    last_exc = None
+    for i in range(max(1, int(attempts))):
+        try:
+            return _download(url, dest, expect_sha256=expect_sha256,
+                             max_bytes=max_bytes, timeout=timeout,
+                             progress=progress)
+        except (ValueError,) as exc:
+            # 体积超限 / 哈希不匹配 / 解包前校验失败：确定性错误，不重试
+            raise
+        except Exception as exc:                      # noqa: BLE001
+            last_exc = exc
+            if i + 1 >= max(1, int(attempts)):
+                break
+            if progress is not None:
+                try:
+                    progress(None, "下载中断（%s），正在重试（第 %d/%d 次）…"
+                             % (type(exc).__name__, i + 2, int(attempts)))
+                except Exception:
+                    pass
+            time.sleep(1.5 * (i + 1))
+    raise last_exc if last_exc else RuntimeError("下载失败")
+
+
 def _download_progress(emit):
     """把 _download 的 0-100 下载进度映射到 _P_DOWNLOAD.._P_VERIFIED（30→45）。
 
@@ -866,9 +907,9 @@ def apply(repo, restart=None, progress=None):
             pkg_name = pkg.get("name") or "pkg.tar.gz"
             pkg_path = os.path.join(tmp, "pkg" + _pkg_ext(pkg_name))
             _emit(_P_DOWNLOAD, "正在下载发布包…")
-            size, sha = _download(pkg["url"], pkg_path,
-                                  expect_sha256=pkg["sha256"],
-                                  progress=_download_progress(_emit))
+            size, sha = _download_with_retry(pkg["url"], pkg_path,
+                                             expect_sha256=pkg["sha256"],
+                                             progress=_download_progress(_emit))
             # 哈希比对在 _download 内部完成（不一致会抛异常），走到这里即已通过
             _emit(_P_VERIFIED, "发布包完整性校验通过…")
             _audit("升级包校验通过：%s（%d 字节，sha256 %s，锚点：%s）"
