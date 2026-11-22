@@ -9,66 +9,409 @@
 # Default-Stop:      0 1 6
 # Short-Description: starts the frpwaf
 ### END INIT INFO
+#
+# 本脚本同时承担两个角色：
+#   1) init.d 服务脚本（/etc/init.d/frpwaf）与 /usr/bin/frpwaf 命令；
+#   2) systemd 存在且单元已启用时，转调 systemctl —— 避免「init 停 → systemd 立即复活」
+#      这类双管理冲突（systemd unit 带 Restart=always）。
+#
+# PID 判定不再只看 kill -0：掉电/OOM 重启后 PID 文件里的 PID 很可能已被别的进程复用，
+# 此时单看 kill -0 会误判「已在运行」，start 直接返回 0 而服务其实没起，frps 回调全部
+# 落在无人监听的端口上（fail-closed，所有隧道中断）。故必须校验进程身份（cmdline）。
 
 NAME=frpwaf
-HOME_DIR=/opt/frpwaf
+HOME_DIR=${FRPWAF_HOME:-/opt/frpwaf}
 PIDFILE=${HOME_DIR}/data/frpwaf.pid
 LOGFILE=${HOME_DIR}/data/frpwaf.log
+CONFFILE=${HOME_DIR}/data/frpwaf.json
 PY=/www/server/panel/pyenv/bin/python
 [ -x "$PY" ] || PY=$(command -v python3)
+SYSTEMD_UNIT=/etc/systemd/system/frpwaf.service
 
-get_pid() {
-    [ -f "$PIDFILE" ] && cat "$PIDFILE" 2>/dev/null
+# 守护进程的真实命令行形如 "<python> -m app.daemon"。
+# 用 "-m app.daemon" 而不是宽松的 "app.daemon"，避免把 `python -c "import app.daemon"`
+# 这类巧合命令行也误认成服务进程。
+DAEMON_MATCH="-m app.daemon"
+DAEMON_RE='-m app\.daemon'
+DEFAULT_HTTP_PORT=7080
+
+# ---------- 进程识别 ----------
+
+# 取某 PID 的命令行（argv 以 NUL 分隔，这里转成空格）
+pid_cmdline() {
+    [ -r "/proc/$1/cmdline" ] || return 1
+    tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null
 }
 
-is_running() {
-    pid=$(get_pid)
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
-}
-
-start() {
-    if is_running; then
-        echo "${NAME} (pid $(get_pid)) already running."
-        return 0
-    fi
-    echo -n "Starting ${NAME}... "
-    cd "$HOME_DIR" || exit 1
-    nohup "$PY" -m app.daemon >>"$LOGFILE" 2>&1 &
-    sleep 1.5
-    if is_running; then
-        echo "done (pid $(get_pid))."
-        return 0
-    fi
-    echo "failed"
+# 判断 PID 是否真的是本服务的守护进程（存活 + 命令行匹配）
+is_daemon_pid() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$1" 2>/dev/null || return 1
+    cmd=$(pid_cmdline "$1") || return 1
+    case "$cmd" in
+        *"$DAEMON_MATCH"*) return 0 ;;
+    esac
     return 1
 }
 
-stop() {
-    if ! is_running; then
-        echo "${NAME} is not running."
+# 按命令行反查所有守护进程 PID（用于 pidfile 丢失后的孤儿回收）。
+# pgrep -f 自身不会匹配自己；但会匹配到 systemd 的 `sh -c ... app.daemon` 包装进程，
+# 该包装用 exec 启动 python，PID 不变，因此误认也不影响停止逻辑。
+find_daemon_pids() {
+    if command -v pgrep >/dev/null 2>&1; then
+        # 必须加 `--`：模式以 "-m" 开头，不加会被 pgrep 当成选项
+        # （实测报 `pgrep: invalid option -- 'm'`，返回空，导致孤儿回收失效）。
+        pids=$(pgrep -f -- "$DAEMON_RE" 2>/dev/null)
+        rc=$?
+        # 0=命中，1=无命中（均属正常）；其它才是 pgrep 不可用，回退 /proc 扫描
+        if [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ]; then
+            [ -n "$pids" ] && echo "$pids"
+            return 0
+        fi
+    fi
+    for d in /proc/[0-9]*; do
+        [ -d "$d" ] || continue
+        p=${d#/proc/}
+        cmd=$(pid_cmdline "$p") || continue
+        case "$cmd" in
+            *"$DAEMON_MATCH"*) echo "$p" ;;
+        esac
+    done
+}
+
+get_pid() {
+    [ -f "$PIDFILE" ] || return 1
+    pid=$(tr -d ' \t\r\n' < "$PIDFILE" 2>/dev/null)
+    [ -n "$pid" ] || return 1
+    echo "$pid"
+}
+
+# 「在运行」= PID 文件指向的进程存活 **且** 身份是 app.daemon
+is_running() {
+    pid=$(get_pid) || return 1
+    is_daemon_pid "$pid"
+}
+
+# ---------- 可用性探针 ----------
+
+# 从 data/frpwaf.json 读字符串配置，失败回退默认值
+conf_str() {
+    key=$1
+    def=$2
+    val=""
+    if [ -r "$CONFFILE" ]; then
+        val=$(sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$CONFFILE" 2>/dev/null | head -n 1)
+    fi
+    if [ -n "$val" ]; then echo "$val"; else echo "$def"; fi
+}
+
+# 从 data/frpwaf.json 读数字配置，非数字回退默认值
+conf_num() {
+    key=$1
+    def=$2
+    val=""
+    if [ -r "$CONFFILE" ]; then
+        val=$(sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$CONFFILE" 2>/dev/null | head -n 1)
+    fi
+    case "$val" in
+        ''|*[!0-9]*) val=$def ;;
+    esac
+    echo "$val"
+}
+
+probe_port() {
+    conf_num http_port "$DEFAULT_HTTP_PORT"
+}
+
+# 探测目标地址：通配监听（0.0.0.0 / :: / *）时走回环
+probe_host() {
+    addr=$(conf_str http_addr "0.0.0.0")
+    case "$addr" in
+        ''|'0.0.0.0'|'::'|'*') echo "127.0.0.1" ;;
+        *) echo "$addr" ;;
+    esac
+}
+
+tcp_connect() {
+    if [ -n "${BASH_VERSION:-}" ]; then
+        if (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null; then
+            return 0
+        fi
+    fi
+    if command -v nc >/dev/null 2>&1; then
+        nc -z -w 2 "$1" "$2" >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+# 服务是否真的在提供能力（而不只是进程存在）。
+#
+# 探针选型：打 frp 回调端点 `/frp/handler`，而不是 `/api/version`。
+#   - `/api/version` 属于 `/api/*`，必须先登录（daemon.py 的 _route 里
+#     `if path.startswith("/api/"): if not self._require_login(): return`），
+#     web_enabled=false 时还会被整体 403 —— 它在「服务正常但网页端关闭」的场景会误报为宕机，
+#     不能作为健康探针。
+#   - `/frp/handler` 在鉴权与 web_enabled 判定之前就放行，且永远不需要登录；
+#     用 GET 打它会得到 405（该端点只接受 POST），这个状态码既证明端口在服务，
+#     又不会触发任何封禁/限速副作用（POST 才会进决策引擎）。
+# 端口跟随 http_port：frps 的 httpPlugins 回调地址就是 http://127.0.0.1:<http_port>/frp/handler，
+# 故它就是 fail-closed 的关键路径。
+#
+# `--noproxy '*'` 不可省：机器上若配了 http_proxy/https_proxy（宝塔上很常见，
+# AI 审查与在线升级都要出网），curl 会把 127.0.0.1 的请求也交给代理，
+# 代理回一个 503/502 也算「有 HTTP 响应」，于是「进程活着但端口没监听」被误判为健康，
+# 假阳性回收彻底失效（实测：无 --noproxy 时 503，加了才是 000）。
+probe_alive() {
+    port=$(probe_port)
+    host=$(probe_host)
+    if command -v curl >/dev/null 2>&1; then
+        case "$host" in
+            *:*) url="http://[${host}]:${port}/frp/handler" ;;
+            *)   url="http://${host}:${port}/frp/handler" ;;
+        esac
+        code=$(curl -s --noproxy '*' -o /dev/null -m 3 -w '%{http_code}' "$url" 2>/dev/null)
+        case "$code" in
+            ''|000) return 1 ;;   # 连不上 / 超时
+            *) return 0 ;;        # 有 HTTP 响应即视为在服务
+        esac
+    fi
+    tcp_connect "$host" "$port"
+}
+
+# ---------- systemd 联动 ----------
+
+systemd_present() {
+    [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1
+}
+
+# 由 systemd 托管时，init 子命令必须转调 systemctl。
+# 否则 `frpwaf stop` 杀掉进程后会被 Restart=always 立刻拉回，表现为「停不掉」。
+systemd_managed() {
+    systemd_present || return 1
+    [ -f "$SYSTEMD_UNIT" ] || return 1
+    systemctl is-enabled --quiet frpwaf 2>/dev/null && return 0
+    systemctl is-active --quiet frpwaf 2>/dev/null && return 0
+    return 1
+}
+
+# ---------- 启停 ----------
+
+# 真正执行停止，返回 0 表示已确认无残留进程。
+# 与 stop() 的区别：不打印 not running，供 start 内部回收假阳性时复用。
+# 目标 PID 放在位置参数里（不用数组 / 不用 here-string），保持 POSIX 可解析，
+# 即使有人用 dash/ash 直接跑也不会语法错误。
+stop_quiet() {
+    set --
+    pid=$(get_pid 2>/dev/null)
+    [ -n "$pid" ] && set -- "$pid"
+    # pidfile 丢失/失效时，按 cmdline 反查孤儿进程（并去重）
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        case " $* " in
+            *" $p "*) ;;
+            *) set -- "$@" "$p" ;;
+        esac
+    done <<EOF
+$(find_daemon_pids)
+EOF
+
+    if [ "$#" -eq 0 ]; then
         rm -f "$PIDFILE"
         return 0
     fi
-    pid=$(get_pid)
-    echo -n "Stopping ${NAME} (pid $pid)... "
-    kill "$pid" 2>/dev/null
-    for i in $(seq 1 20); do
-        is_running || break
-        sleep 0.5
+
+    # 1) 全部发 TERM
+    for p in "$@"; do
+        kill "$p" 2>/dev/null || true
     done
-    if is_running; then
-        kill -9 "$pid" 2>/dev/null
+    # 2) 并行等待退出（最多 10s）
+    left_n=0
+    i=0
+    while [ "$i" -lt 20 ]; do
+        left_n=0
+        for p in "$@"; do
+            kill -0 "$p" 2>/dev/null && left_n=$((left_n + 1))
+        done
+        [ "$left_n" -eq 0 ] && break
         sleep 0.5
+        i=$((i + 1))
+    done
+    # 3) 仍未退出的 KILL 兜底
+    if [ "$left_n" -ne 0 ]; then
+        echo "进程未响应 TERM（${left_n} 个），发送 KILL"
+        for p in "$@"; do
+            kill -9 "$p" 2>/dev/null || true
+        done
+        i=0
+        while [ "$i" -lt 10 ]; do
+            left_n=0
+            for p in "$@"; do
+                kill -0 "$p" 2>/dev/null && left_n=$((left_n + 1))
+            done
+            [ "$left_n" -eq 0 ] && break
+            sleep 0.5
+            i=$((i + 1))
+        done
+    fi
+    if [ "$left_n" -ne 0 ]; then
+        echo "停止失败，仍有 ${left_n} 个进程存活"
+        return 1
+    fi
+    rm -f "$PIDFILE"
+    return 0
+}
+
+launch() {
+    echo -n "Starting ${NAME}... "
+    if ! cd "$HOME_DIR"; then
+        echo "failed（无法进入 ${HOME_DIR}）"
+        return 1
+    fi
+    # 提升可打开 fd 上限：每连接一个线程 = 一个 fd，面罩（accept）打满时 EMFILE，
+    # frps 回调也跟着失败 → fail-closed 全部隧道中断。daemon 自身并发闸门上限为几百，
+    # 8192 有余量；硬上限不足时 ulimit 会失败，忽略即可。
+    ulimit -n 8192 2>/dev/null || true
+    rm -f "$PIDFILE"
+    nohup "$PY" -m app.daemon >>"$LOGFILE" 2>&1 &
+    started=$!
+    # 先落盘自己拿到的 PID，守护进程启动后会用自己的 os.getpid() 覆盖（两者一致）
+    echo "$started" > "$PIDFILE" 2>/dev/null || true
+    i=0
+    while [ "$i" -lt 30 ]; do
+        if probe_alive && kill -0 "$started" 2>/dev/null; then
+            pid=$(get_pid 2>/dev/null)
+            echo "done (pid ${pid:-$started})."
+            return 0
+        fi
+        if ! kill -0 "$started" 2>/dev/null; then
+            echo "failed（进程已退出，请查看 ${LOGFILE}）"
+            rm -f "$PIDFILE"
+            return 1
+        fi
+        sleep 0.5
+        i=$((i + 1))
+    done
+    echo "failed（启动超时，端口 $(probe_port) 仍不可用，请查看 ${LOGFILE}）"
+    rm -f "$PIDFILE"
+    return 1
+}
+
+systemd_start() {
+    echo -n "Starting ${NAME} (systemd)... "
+    systemctl start frpwaf >/dev/null 2>&1
+    i=0
+    while [ "$i" -lt 20 ]; do
+        if systemctl is-active --quiet frpwaf && probe_alive; then
+            pid=$(get_pid 2>/dev/null)
+            echo "done (pid ${pid:-?})."
+            return 0
+        fi
+        sleep 0.5
+        i=$((i + 1))
+    done
+    echo "failed（请查看 journalctl -u frpwaf 与 ${LOGFILE}）"
+    return 1
+}
+
+systemd_stop() {
+    echo -n "Stopping ${NAME} (systemd)... "
+    systemctl stop frpwaf >/dev/null 2>&1
+    if systemctl is-active --quiet frpwaf; then
+        echo "failed."
+        return 1
     fi
     rm -f "$PIDFILE"
     echo "done."
     return 0
 }
 
+start() {
+    if systemd_managed; then
+        systemd_start
+        return $?
+    fi
+
+    # 1) PID 文件失效清理：记录的 PID 已退出，或已被别的进程复用
+    stale=$(get_pid 2>/dev/null)
+    if [ -n "$stale" ] && ! is_daemon_pid "$stale"; then
+        echo "PID 文件记录的进程 ${stale} 不是 ${NAME}（进程已退出或 PID 被复用），清理 PID 文件。"
+        rm -f "$PIDFILE"
+        stale=""
+    fi
+
+    # 2) PID 文件丢失/失效但守护进程仍在 → 回填，避免重复拉起（会端口冲突）
+    if [ -z "$stale" ]; then
+        orphan=$(find_daemon_pids | head -n 1)
+        if [ -n "$orphan" ]; then
+            echo "$orphan" > "$PIDFILE" 2>/dev/null || true
+            echo "发现未记账的 ${NAME} 进程 (pid ${orphan})，已回填 PID 文件。"
+        fi
+    fi
+
+    # 3) 已记账且端口可用 → 真在运行
+    if is_running && probe_alive; then
+        echo "${NAME} (pid $(get_pid)) already running."
+        return 0
+    fi
+
+    # 4) 身份对但端口不通（FD 耗尽/死锁等）→ 假阳性，回收后重新拉起
+    if is_running; then
+        echo "${NAME} (pid $(get_pid)) 存活但回调端口 $(probe_port) 不可用，判定为假阳性，重启。"
+        stop_quiet || return 1
+    fi
+
+    launch
+}
+
+stop() {
+    if systemd_managed; then
+        systemd_stop
+        return $?
+    fi
+    pid=$(get_pid 2>/dev/null)
+    orphans=$(find_daemon_pids)
+    if [ -z "$pid" ] && [ -z "$orphans" ]; then
+        echo "${NAME} is not running."
+        rm -f "$PIDFILE"
+        return 0
+    fi
+    if [ -n "$pid" ]; then
+        echo -n "Stopping ${NAME} (pid ${pid})... "
+    else
+        echo -n "Stopping ${NAME} (未记账进程: $(echo "$orphans" | tr '\n' ' '))... "
+    fi
+    if stop_quiet; then
+        echo "done."
+        return 0
+    fi
+    echo "failed."
+    return 1
+}
+
 status() {
+    if systemd_managed; then
+        if systemctl is-active --quiet frpwaf; then
+            pid=$(get_pid 2>/dev/null)
+            echo "${NAME} (systemd, pid ${pid:-?}) is running."
+            return 0
+        fi
+        echo "${NAME} is stopped (systemd unit 已启用但未运行)"
+        return 1
+    fi
     if is_running; then
         echo "${NAME} (pid $(get_pid)) is running."
         return 0
+    fi
+    pid=$(get_pid 2>/dev/null)
+    if [ -n "$pid" ]; then
+        echo "${NAME} is stopped（PID 文件残留 pid ${pid}，该进程已不是 ${NAME}）"
+        return 1
+    fi
+    if [ -n "$(find_daemon_pids)" ]; then
+        echo "${NAME} is stopped（存在未记账进程: $(find_daemon_pids | tr '\n' ' ')，请执行 $0 stop 后 start）"
+        return 1
     fi
     echo "${NAME} is stopped"
     return 1

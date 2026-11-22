@@ -66,14 +66,21 @@ def _build_user_prompt(items):
 
 
 def _collect():
-    """汇总最近窗口内的高频 IP。"""
+    """汇总最近窗口内的高频 IP。
+
+    聚合必须走 `_query_ro`（独立只读连接，不占全局 _lock）：
+    `WHERE ts>=? GROUP BY ip ORDER BY conns DESC` 在窗口突发时（窗口内几万行）
+    可能跑几十到几百毫秒，若占着全局锁，这段时间内每个 NewUserConn 的
+    `add_log_and_bump` 都在排队——frps 回调超时就会被判失败（fail-closed）。
+    WAL 模式下读与写互不阻塞，换成只读连接后慢查询只慢自己。
+    """
     cfg = config.get()
     window = max(30, int(cfg.get("ai_window") or 300))
     min_conns = max(1, int(cfg.get("ai_min_conns") or 20))
     max_ips = max(1, int(cfg.get("ai_max_ips") or 20))
     since = int(time.time()) - window
 
-    rows = store._query(
+    rows = store._query_ro(
         "SELECT ip, COUNT(*) AS conns, "
         "  SUM(CASE WHEN action!='allow' THEN 1 ELSE 0 END) AS rejected, "
         "  GROUP_CONCAT(DISTINCT proxy_name) AS proxies, "

@@ -21,17 +21,20 @@
 │   ├── ai.py                   AI 自动 IP 审查
 │   ├── geo.py                  IP 归属地查询
 │   ├── auth.py                 登录/会话（HMAC 签名 Cookie）
+│   ├── job.py                  后台任务状态（提交 + 轮询：升级/测试连接）
 │   └── daemon.py               守护进程（插件回调 + 管理 API + 静态页）
 ├── web/index.html              独立管理面板（SPA）
 ├── data/                       运行时数据（SQLite / 配置 / 日志 / PID）
 │   ├── frpwaf.db               名单、日志、封禁、统计
-│   └── frpwaf.json             配置（含管理员密码）
+│   ├── frpwaf.json             配置（含管理员密码）
+│   └── job_upgrade.json        升级/测试连接等后台任务状态（前端轮询，可 cat 查看）
 ├── frpwaf_main.py              插件后端（public 接口）
 ├── index.html                  插件前端（宝塔面板内嵌页）
 ├── info.json                   插件元信息
 ├── install.sh                  插件安装/卸载脚本
 ├── uninstall.sh                插件卸载脚本
-├── frpwaf.init                 服务启动脚本（/etc/init.d/frpwaf）
+├── frpwaf.init                 服务启动脚本（安装为 /etc/init.d/frpwaf + /usr/bin/frpwaf）
+├── frpwaf.service              systemd unit（有 systemd 时装为 /etc/systemd/system/frpwaf.service）
 ├── build.sh                    组装 & 打包 & 安装插件
 └── README.md
 
@@ -68,11 +71,19 @@ bash build.sh install
 
 | 项目 | 值 |
 |---|---|
-| 管理面板 | `http://<服务器IP>:7080/` |
+| 管理面板 | `http://127.0.0.1:7080/`（**默认仅本机监听**） |
+| 远程访问 | 默认关闭；需在网页端「设置 → 监听与安全」勾选「允许远程访问」（绑定 `0.0.0.0`） |
 | 账号 | `admin`（默认，可在面板内修改） |
-| 密码 | `123456`（默认，**请安装后立即修改**） |
-| 插件回调 | `http://127.0.0.1:7080/frp/handler` |
+| 密码 | `123456`（默认，**首次登录会被强制修改**） |
+| 插件回调 | `http://127.0.0.1:7082/frp/handler`（独立监听，与面板分端口） |
 
+> **默认值已收紧**：v1.4.2 之后面板默认只绑 `127.0.0.1`，`install.sh` 首次安装会把
+> 可访问地址显式写进 `data/frpwaf.json`（已存在则不覆盖）。要从外网打开面板，
+> 必须显式开启「允许远程访问」，且请先改掉默认口令。
+>
+> **首次登录强制改密**：配置项 `password_changed` 为 `false` 时，除登录、改密与只读概览外
+> 的接口一律返回 `403 需先修改默认口令`；把口令改回 `123456` 会被强制要求重改。
+>
 > 宝塔面板 → 软件商店 → 已安装/第三方插件 中会出现「FRP WAF 防火墙」。
 
 ---
@@ -84,10 +95,14 @@ bash build.sh install
    ```toml
    [[httpPlugins]]
    name = "frpwaf"
-   addr = "127.0.0.1:7080"
+   addr = "127.0.0.1:7082"
    path = "/frp/handler"
    ops = ["NewUserConn"]
    ```
+
+   > `addr` 取配置 `frp_handler_addr:frp_handler_port`（默认 `127.0.0.1:7082`），
+   > 由插件端「frps 集成 → 注入」写入；面板与回调分端口，各自有独立并发配额。
+   > 旧配置（无 `frp_handler_*` 两项）回退 `http_addr:http_port`（即 `7080`）。
 
 2. 每次有用户访问代理端口，frps 会 POST 请求到 `/frp/handler?op=NewUserConn`，
    body 含 `content.remote_addr`（来源 IP:端口）、`proxy_name` 等。
@@ -132,7 +147,8 @@ frp 的 `httpPlugins` 是**应用层**准入：被拒绝的连接，其 **TCP �
 | 手动同步 | 插件「IP 封禁」页「立即同步」按钮 / `POST /api/kernban/sync` |
 | 状态查询 | `GET /api/kernban` |
 
-- 后台线程每 10 秒自动对账一次（增/删/到期），无需人工维护。
+- 后台线程每 30 秒自动对账一次（增/删/到期），无需人工维护；内核状态另有每 600 秒一次的
+  规则/成员审计（记忆化后靠审计发现外部改动）。
 - 临时封禁使用集合的 per-entry `timeout`，到期由内核自动移除；永久黑名单 `timeout=0`。
 - 需要 **root + ipset + iptables**；不满足时自动降级为「不启用」，仍由 frp 应用层拦截。
 - 卸载插件时会清理 `FRPWAF_BLOCK` 链与 ipset 集合。
@@ -197,7 +213,7 @@ frp 的 `httpPlugins` 是**应用层**准入：被拒绝的连接，其 **TCP �
 |---|---|
 | 启用审查 | 开启后后台线程按间隔自动审查 |
 | 协议 | `openai`（`/v1/chat/completions`）或 `anthropic`（`/v1/messages`） |
-| 接口地址 | 填到根，如 `http://127.0.0.1:3000`；也可填 `.../v1` 或完整路径，程序会自动识别、不会重复拼接 |
+| 接口地址 | 填到根，如 `http://127.0.0.1:3000`；也可填 `.../v1` 或完整路径，程序会自动识别、不会重复拼接。**只允许 `http`/`https`**，且元数据/链路本地网段（`169.254.0.0/16`、`100.100.100.200`、`fe80::/10`、`fd00:ec2::254`）**永远拒绝**；私有/回环地址由 `ai_allow_private`（默认 `true`）控制 |
 | API Key | Bearer / x-api-key |
 | 模型 | 如 `claude-haiku-4.5` |
 | 审查间隔 | 秒，最短 60 |
@@ -229,18 +245,25 @@ frp 的 `httpPlugins` 是**应用层**准入：被拒绝的连接，其 **TCP �
 ## 常用操作
 
 ```bash
-# 服务控制
-/etc/init.d/frpwaf start|stop|restart|status
+# 服务控制（两种托管方式都兼容：systemd 托管时自动转调 systemctl）
+frpwaf start|stop|restart|status
+# systemd 托管时也可直接用：
+systemctl start|stop|restart|status frpwaf
 
 # 重新组装并安装插件（代码改动后）
 cd /opt/frpwaf && bash build.sh install
 
-# 查看 WAF 日志
+# 查看 WAF 日志（两种托管方式的日志都在这里）
 tail -f /opt/frpwaf/data/frpwaf.log
 
-# 备份数据
+# 备份数据（自动快照在 /opt/frpwaf/data/backup/，每 24h 一份保留 7 份，恢复见 docs/11 §3）
 cp /opt/frpwaf/data/frpwaf.db /root/frpwaf.db.bak
 ```
+
+> **从旧版（只有 init.d）升级后如果 systemctl 没生效**：systemd 会缓存旧 sysv 脚本的状态，
+> 表现为 `systemctl start` 静默不执行、`journalctl -u frpwaf` 显示 `-- No entries --`。
+> 执行 `systemctl stop frpwaf && systemctl reset-failed frpwaf && systemctl start frpwaf` 即可。
+> 细节与回退方法见 [docs/02](docs/02-目录结构与安装部署.md) §3.1。
 
 ---
 
@@ -254,8 +277,21 @@ cp /opt/frpwaf/data/frpwaf.db /root/frpwaf.db.bak
   若 frps 与 WAF 分机部署，本机制会拒绝回调，需改回同机部署或调整校验策略。
 - **CC 检测覆盖范围**：frp 对 **http 类型代理不触发 NewUserConn 回调**，
   CC 自动封禁仅对 https/tcpmux 等类型生效（纯 http 代理请用限速/名单/前置代理防护）。
-- 管理面板监听 `0.0.0.0:7080`，**请确保云安全组仅对你的 IP 开放该端口**，
-  或改用强密码，避免面板暴露在公网。
+- **管理面板默认只监听 `127.0.0.1:7080`**（不再默认 `0.0.0.0`），外网默认访问不到。
+  确实需要远程访问时：先在面板里改掉默认口令，再到网页端「设置 → 监听与安全」
+  勾选「允许远程访问」，并**自行确认云安全组 / 宝塔防火墙只对你的 IP 放行该端口**——
+  面板接口侧的监听地址只接受 `127.0.0.1` / `0.0.0.0` / `::1` / `::` 四个值，
+  其它地址（如某张内网网卡）请手改 `data/frpwaf.json` 的 `http_addr` 后重启服务。
+- **回调与面板分端口**：frps 回调默认走 `127.0.0.1:7082`（`frp_handler_addr` /
+  `frp_handler_port`），面板与回调各有并发闸门（默认 96 / 32，超限直接断连不排队），
+  `frpwaf.init` 启动前会 `ulimit -n 8192`。这样面板被扫描打满时不会连带
+  让 frps 因回调失败而 fail-closed 拒绝全部隧道。
+- **服务托管**：有 systemd 时装 `frpwaf.service`（`Restart=always`，崩溃 2 秒自愈），
+  无 systemd 回退 init.d。两种方式共存但只有一种生效，切换方法见
+  [docs/02](docs/02-目录结构与安装部署.md) §3.1。
+- **地址解析失败默认放行**：`remote_addr` 解析不出 IP 时放行（不计入黑白名单），
+  但会计入 `/api/overview` 的 `invalid_addr` 并告警——该值持续增长说明名单在静默失效。
+  想改成 fail-closed（解析不出就拒连）请置 `strict_addr=true`。
 - 修改 `frps.toml` 中的 `httpPlugins` 后需重启 frps（会瞬断隧道）。
 - 卸载插件（`bash install.sh uninstall` 或直接运行 `uninstall.sh`；无参数运行
   `install.sh` 仅提示用法、不执行卸载）会移除 init 脚本，

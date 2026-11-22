@@ -4,6 +4,7 @@
 
 配置保存在 data/frpwaf.json，首次运行自动生成（含默认管理员 admin/123456）。
 """
+import copy
 import json
 import os
 import secrets
@@ -20,16 +21,64 @@ PID_PATH = os.path.join(DATA_DIR, "frpwaf.pid")
 # 观测数据在 daemon 进程内存中，宝塔插件端是另一个进程，必须经文件共享。
 BURST_SNAPSHOT_PATH = os.path.join(DATA_DIR, "burst_snapshot.json")
 
+# ---- 配置回显掩码 ----
+# GET 回显配置时把 MASKED_KEYS 里的机密字段替换成 MASKED_VALUE；写入路径若收到
+# 该值，说明客户端只是「读配置 → 改一项 → 整体回写」，必须丢弃（丢弃 = 保留
+# 磁盘原值，**不是清空**）。否则真实密钥/口令会被覆盖成 ******：AI 审查从此
+# 静默失效、管理员口令变成掩码字符。三条写入路径（daemon / 插件端 / 本模块
+# save）共用这一份定义，不要各自硬编码副本。
+MASKED_VALUE = "******"
+MASKED_KEYS = ("ai_api_key", "admin_password", "secret")
+
 DEFAULTS = {
-    # 管理/WAF 监听地址（frps httpPlugins 会回调到这里）
-    "http_addr": "0.0.0.0",
+    # 管理面板监听地址。默认仅本机：旧默认 0.0.0.0 + 默认口令 admin/123456
+    # 等于把面板直接摆到公网（登录即拿到 root 级操作面）。
+    # 「装完能打开面板」由 install.sh 在首次安装时显式写入本项保证；
+    # 需要远程访问请在面板「设置 → 监听与安全」打开「允许远程访问」，
+    # 或手改 data/frpwaf.json 后重启服务。
+    "http_addr": "127.0.0.1",
     "http_port": 7080,
+    # frps 回调（POST /frp/handler）的独立监听。与面板分端口的意义：面板被
+    # 慢连接/扫描打满时，回调仍有独立并发配额，不会让 frps 因回调失败而
+    # fail-closed 拒绝全部连接。frps 与本服务同机，回调不需要公网可达。
+    # 注意：frps.toml 里 [[httpPlugins]] 的 addr 必须与「本项:端口」一致，
+    # 该注入在插件端（frpwaf_main.py）完成。
+    "frp_handler_addr": "127.0.0.1",
+    "frp_handler_port": 7082,
+    # 并发闸门（每连接一个线程，超限直接断开而不是排队——排队的连接本身占 FD）。
+    # 面板与回调各自独立配额：面板被打满时回调仍保有自己的额度。
+    # FD 上限由 frpwaf.init 的 `ulimit -n 8192` 保证。
+    "max_concurrent": 96,
+    "handler_max_concurrent": 32,
+    # ---- 地址解析策略与 AI 出网策略 ----
+    # strict_addr：frps 回调里的来源地址解析不出 IP 时的处置策略。
+    #   False（默认）= 保持现状放行（reason=invalid-ip-pass），但计数并告警；
+    #   True = 直接拒连（fail-closed，reason=invalid-ip-strict）。
+    "strict_addr": False,
+    # ai_allow_private：AI 接口地址是否允许私有/回环网段。
+    #   True（默认）= 允许：AI 网关通常是内网自建（如 http://127.0.0.1:3000），
+    #                  一刀切禁私有地址等于直接废掉该功能；
+    #   False = 只允许公网地址。
+    # 注意：无论取值如何，链路本地与云元数据地址（169.254.0.0/16、fe80::/10、
+    # fd00:ec2::254 等）都由出网校验硬拒，不受本开关影响。
+    "ai_allow_private": True,
+    # ---- 安全水位告警（可选）----
+    # 后台循环把 /api/health 的 level 从「非 bad」变成 bad 时向该地址 POST 一次，
+    # 恢复（bad -> 非 bad）再发一次；同类事件 30 分钟内不重复。
+    # 留空 = 关闭（默认关闭：多数部署没有接收端，开了只会白跑网络请求）。
+    # 地址在保存时与每次发送前都过 SSRF 校验（复用 ai_url_guard）。
+    "alert_webhook": "",
     # 是否启用「网页端」（WAF 管理面板）。关闭后仅停用网页访问（/ 与 /api/*），
     # frps 回调（/frp/handler）与 WAF 防护照常运行，可从宝塔插件端随时重新开启。
     "web_enabled": True,
-    # 管理员账号（默认 admin / 123456，安装后请在面板内及时修改）
+    # 管理员账号（默认 admin / 123456）。
+    # `password_changed` 控制「首次登录强制改密」：为 False 时，除登录/改密/
+    # 静态页以外的所有 API 一律 403「需先修改默认口令」。旧配置没有该键 =
+    # 视为未改密；其与口令实值的一致性由 normalize_password_flag() 维护
+    # （改了密码就置 True，改回默认值则强制回到 False）。
     "admin_user": "admin",
     "admin_password": "123456",
+    "password_changed": False,
     # 会话签名密钥（首次生成后固定）
     "secret": "",
     # 名单开关
@@ -99,6 +148,10 @@ DEFAULTS = {
     "block_page_ban_enabled": True,      # 封禁页开关（默认开启）
     "block_page_risk_enabled": True,     # 风控页开关（默认开启）
     "block_page_port": 7081,             # 拦截页服务监听端口（与 http_port 解耦，避免误挡面板）
+    # 拦截页监听地址：拦截页是被封 IP 经 iptables nat REDIRECT 后的落地页，
+    # 必须保持可从外部访问，因此不能跟随面板的 http_addr（面板收紧到
+    # 127.0.0.1 后拦截页仍需 0.0.0.0）。app/blockpage.py 已改读本项生效。
+    "block_page_addr": "0.0.0.0",
     # REDIRECT 目标端口：逗号分隔的端口列表（如 "80,8080"）；留空 = 自动读取 frps
     # 配置的 vhostHTTPPort。留空且读不到时不做 REDIRECT（拦截页功能不生效）。
     "block_page_redirect_ports": "",
@@ -143,6 +196,14 @@ def _ensure_dir():
         os.makedirs(DATA_DIR, exist_ok=True)
     except OSError as exc:
         raise OSError("无法创建数据目录 %s：%s" % (DATA_DIR, exc)) from exc
+    # 目录权限收紧到 700：默认 umask 022 会得到 755，同机其它用户虽读不到文件
+    # （文件是 600）却能列目录、看到文件名与数量。只改目录本身，不动已有文件。
+    # chmod 失败必须忽略：Windows 等平台 chmod 语义有限，不能因为收紧权限失败
+    # 把服务弄挂（目录不可用时的报错已经在上面抛出）。
+    try:
+        os.chmod(DATA_DIR, 0o700)
+    except OSError:
+        pass
 
 
 # 一次性迁移标记：旧版设置页缺新键时回显 0/0/0（窗口显示 1），用户点保存会把
@@ -295,13 +356,133 @@ def normalize_burst_cool(cfg):
     return cfg
 
 
+def normalize_listen(cfg):
+    """监听地址/端口/并发上限防呆（load / save 双路径）。
+
+    - 端口非法（非数字/越界）回退默认；
+    - `frp_handler_port` 与面板端口或拦截页端口相同 → 起服务时抢端口（或回调
+      打到面板监听上），回退默认；
+    - 并发上限钳制到 [8, 512]：0/1 会让面板几乎不可用，过大则失去闸门意义；
+    - `http_addr` 只做「空值回退」，不限定取值形态：手工填内网网卡地址
+      （如 10.0.0.5）是合法用法。面板接口侧的四值白名单由 daemon 负责。
+    就地修改并返回传入字典（便于链式调用）。
+    """
+    if not str(cfg.get("http_addr") or "").strip():
+        cfg["http_addr"] = DEFAULTS["http_addr"]
+    if not str(cfg.get("frp_handler_addr") or "").strip():
+        cfg["frp_handler_addr"] = DEFAULTS["frp_handler_addr"]
+    if not str(cfg.get("block_page_addr") or "").strip():
+        cfg["block_page_addr"] = DEFAULTS["block_page_addr"]
+
+    def _port(key, fallback):
+        try:
+            _v = int(cfg.get(key) or 0)
+        except (TypeError, ValueError):
+            _v = 0
+        return _v if 1 <= _v <= 65535 else fallback
+
+    cfg["http_port"] = _port("http_port", DEFAULTS["http_port"])
+    cfg["block_page_port"] = _port("block_page_port", DEFAULTS["block_page_port"])
+    _hp = int(cfg["http_port"])
+    _bp = int(cfg["block_page_port"])
+    _hport = _port("frp_handler_port", DEFAULTS["frp_handler_port"])
+    if _hport in (_hp, _bp):
+        _hport = DEFAULTS["frp_handler_port"]
+    # 默认 7082 也可能被用户改成与面板/拦截页相同，逐级兜底避免死循环
+    if _hport in (_hp, _bp):
+        _hport = 7083
+    cfg["frp_handler_port"] = _hport
+
+    for _k in ("max_concurrent", "handler_max_concurrent"):
+        try:
+            _v = int(cfg.get(_k) or 0)
+        except (TypeError, ValueError):
+            _v = 0
+        if _v < 8 or _v > 512:
+            _v = DEFAULTS[_k]
+        cfg[_k] = _v
+    return cfg
+
+
+# 严格布尔取值表：配置文件是手改的 JSON，可能写成 "true" / 1 / "False" / null。
+_TRUE_TOKENS = ("1", "true")
+_FALSE_TOKENS = ("0", "false")
+
+
+def _strict_bool(v, default):
+    """把配置值归一化成 bool；不可识别时返回 default（**绝不静默当 False**）。
+
+    接受：True/False、1/0（含 1.0/0.0）、"1"/"0"、"true"/"false"（大小写不敏感）。
+    其它（None、""、"abc"、2、列表等）一律回退 default，因为两种误判都有实害：
+      - ai_allow_private 被误判成 False，内网 AI 网关直接不可用；
+      - strict_addr 被误判成 False，本想 fail-closed 的机器静默变成放行。
+    """
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str):
+        _s = v.strip().lower()
+        if _s in _TRUE_TOKENS:
+            return True
+        if _s in _FALSE_TOKENS:
+            return False
+    return default
+
+
+def normalize_addr_policy(cfg):
+    """地址解析 / AI 出网策略防呆（load / save 双路径）。
+
+    `strict_addr` 与 `ai_allow_private` 必须是「可识别的布尔」：手写脏值
+    （null、"abc"、2 等）回退 DEFAULTS，而不是被 bool() 静默转成 False/True。
+    就地修改并返回传入字典（便于链式调用）。
+    """
+    for _k in ("strict_addr", "ai_allow_private"):
+        cfg[_k] = _strict_bool(cfg.get(_k, DEFAULTS[_k]), DEFAULTS[_k])
+    return cfg
+
+
+def normalize_password_flag(cfg):
+    """`password_changed` 与口令实值对齐（load / save 双路径）。
+
+    该标志用于「首次登录强制改密」，必须与真实口令一致，否则会出现
+    两种坏结果：
+      1. 用户从宝塔插件端（或手改 json）改了密码，网页端却一直 403；
+      2. 用户把密码改回默认值，标志仍是 True，强制改密形同虚设。
+    故不直接采信存储值：只要口令不等于 DEFAULTS 里的默认口令就算已改密。
+    就地修改并返回传入字典（便于链式调用）。
+    """
+    try:
+        _changed = str(cfg.get("admin_password")) != str(DEFAULTS["admin_password"])
+    except Exception:
+        _changed = False
+    cfg["password_changed"] = _changed
+    return cfg
+
+
 def load():
+    """每次读盘加载配置（含 normalize 防呆；secret 缺失会生成并回写）。
+
+    高频路径请用 `load_cached()`（见文件末尾）：它按文件 stat 指纹缓存，语义等价。
+    """
+    return _load_state()[0]
+
+
+def _load_state():
+    """`load()` 的实际实现，额外返回「磁盘读取是否成功」。
+
+    `disk_ok=False` 表示文件缺失 / JSON 损坏 / 不可读（此时返回 DEFAULTS 兜底值，
+    与 `load()` 的历史行为一致）。`load_cached()` 据此拒绝缓存失败态：把回退值
+    缓存下来会让用户「修好配置后仍然不生效」。
+    """
     _ensure_dir()
     cfg = dict(DEFAULTS)
+    disk_ok = False
     if os.path.exists(CONF_PATH):
         try:
             with open(CONF_PATH, "r", encoding="utf-8") as f:
                 cfg.update(json.load(f))
+            disk_ok = True
         except Exception:
             pass
     migrate_legacy_attack(cfg)   # 一次性：旧版 0/0/0 哨兵组合恢复默认开启
@@ -309,6 +490,9 @@ def load():
     normalize_auto_ban(cfg)   # 生效值统一：开关开启时未设置参数回退默认，避免「开着不生效」
     normalize_burst_cool(cfg)   # 突发观测/冷却防呆：窗口无效回退；冷却开启时参数防呆
     normalize_block_page(cfg)   # 拦截页防呆：端口非法/冲突回退；重定向端口白名单化
+    normalize_listen(cfg)       # 监听地址/端口/并发上限防呆（先 block_page 再本项）
+    normalize_addr_policy(cfg)  # strict_addr / ai_allow_private 必须是可识别的布尔
+    normalize_password_flag(cfg)   # 默认口令未改 → password_changed=False
     if not cfg.get("secret"):
         cfg["secret"] = secrets.token_hex(32)
         try:
@@ -316,7 +500,7 @@ def load():
         except ValueError:
             # 磁盘配置损坏：拒绝覆盖（避免抹掉 secret / 密码等），本次仅用内存值
             pass
-    return cfg
+    return cfg, disk_ok
 
 
 def _read_disk():
@@ -439,20 +623,38 @@ class _conf_file_lock(object):
         return False
 
 
+def strip_masked(patch):
+    """返回「丢弃回显掩码后」的 patch 副本（不修改入参）。
+
+    GET 回显把 MASKED_KEYS 里的字段替换成 MASKED_VALUE；「读配置 → 改一项 →
+    整体回写」的客户端会把掩码原样提交，若照写就把真实值覆盖成 ******。
+    丢弃该字段 = 保留磁盘原值（**不是清空**：清空需显式传空串）。
+
+    这是纵深防御：daemon 与插件端各自也过滤了一层，本函数保证「所有写入路径
+    都经 config.save」时同样安全，并给它们一处可共用的实现。
+    """
+    if not isinstance(patch, dict):
+        return patch
+    return {k: v for k, v in patch.items()
+            if not (k in MASKED_KEYS and str(v) == MASKED_VALUE)}
+
+
 def save(patch):
     """合并写入配置（patch 语义 + 并发保护）。
 
     调用方只传「本次要修改的字段」即可（如 {"admin_password": new}）；
     传完整配置字典同样兼容（等价于对磁盘全量覆盖）。流程：
-      1. 进程内线程锁 + 跨进程文件锁串行化；
-      2. 读磁盘现状（损坏则拒绝保存并抛 ValueError，绝不覆盖）；
-      3. 在现状上先跑一次性旧版迁移，再合并 patch（用户本次意图优先）；
-      4. normalize 防呆后原子替换写入，并失效读缓存。
+      1. 丢弃 patch 里等于回显掩码的机密字段（见 strip_masked）；
+      2. 进程内线程锁 + 跨进程文件锁串行化；
+      3. 读磁盘现状（损坏则拒绝保存并抛 ValueError，绝不覆盖）；
+      4. 在现状上先跑一次性旧版迁移，再合并 patch（用户本次意图优先）；
+      5. normalize 防呆后原子替换写入，并失效读缓存。
 
     返回合并后的完整配置字典（便于调用方直接使用最新值）。
     """
     if not isinstance(patch, dict):
         raise TypeError("config.save() 需要 dict（本次修改的字段集合）")
+    patch = strip_masked(patch)   # 掩码回写防护：丢弃 = 保留磁盘原值，不是清空
     _ensure_dir()
     with _save_lock, _conf_file_lock():
         disk = _read_disk()
@@ -464,6 +666,9 @@ def save(patch):
         normalize_auto_ban(merged)      # 防呆：开关开启时未设置参数回退默认
         normalize_burst_cool(merged)    # 防呆：观测窗口无效回退；冷却开启时参数防呆
         normalize_block_page(merged)    # 防呆：拦截页端口非法/冲突回退；重定向端口白名单化
+        normalize_listen(merged)        # 防呆：监听端口/并发上限非法回退
+        normalize_addr_policy(merged)   # 防呆：strict_addr / ai_allow_private 布尔归一化
+        normalize_password_flag(merged)  # 防呆：password_changed 与口令实值对齐
         if not merged.get("secret"):
             merged["secret"] = secrets.token_hex(32)
         tmp = "%s.tmp.%d" % (CONF_PATH, os.getpid())   # 按进程隔离临时文件
@@ -493,10 +698,15 @@ CACHE_TTL = 1.0  # 秒
 
 
 def invalidate():
-    """使配置缓存立即失效（写配置后调用）。"""
+    """使配置缓存立即失效（写配置后调用）。
+
+    同时清掉 TTL 缓存（`get()`）与 stat 指纹缓存（`load_cached()`），
+    `tests/__init__.py` 的 `reset_caches()` 也走这里，故两个缓存必须一起清。
+    """
     with _cache_lock:
         _cache["cfg"] = None
         _cache["at"] = 0.0
+    _invalidate_load_cache()
 
 
 def get():
@@ -509,4 +719,66 @@ def get():
     with _cache_lock:
         _cache["cfg"] = dict(cfg)
         _cache["at"] = time.time()
+    return cfg
+
+
+# ---- stat 指纹缓存（认证路径专用）----
+# 认证每次请求都要读整份配置（secret / admin_user / admin_password）。`load()`
+# 是 makedirs + 读 JSON + 一串 normalize + 拷贝，面板一页十来个 /api/* 请求就
+# 重复十几次。这里按「文件指纹」缓存整份配置，并且刻意不使用时间窗：
+#   * 键包含 CONF_PATH：测试（tests.new_home）会改写模块常量，不同 home 不能串味；
+#   * 失效条件 (st_mtime_ns, st_size)：插件端与守护进程是两个进程、共用一个
+#     frpwaf.json，跨进程改密必然改动 mtime → 立即失效 → 「改完即生效」与不缓存等价；
+#   * 文件缺失 / 解析失败不缓存（见 _load_state 的 disk_ok）；
+#   * 进出都是独立副本（_copy_cfg）：调用方改返回值不污染缓存。
+_load_cache = {"key": None, "cfg": None}
+_load_cache_lock = threading.Lock()
+
+
+def _copy_cfg(cfg):
+    """配置字典的独立副本：标量不可变直接复用，只深拷容器。
+
+    认证每个请求都要一份，`copy.deepcopy` 整份要几十微秒；名单/映射类配置项
+    才可能是 list/dict，对它们深拷即可保证互不影响（标量本来就改不动）。
+    """
+    return {k: (copy.deepcopy(v) if isinstance(v, (dict, list, set)) else v)
+            for k, v in cfg.items()}
+
+
+def _conf_sig():
+    """配置文件指纹 (mtime_ns, size)；文件不存在或 stat 失败返回 None。"""
+    try:
+        st = os.stat(CONF_PATH)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _invalidate_load_cache():
+    """只清 stat 指纹缓存（`invalidate()` 会连带调用）。"""
+    with _load_cache_lock:
+        _load_cache["key"] = None
+        _load_cache["cfg"] = None
+
+
+def load_cached():
+    """带 stat 指纹失效的 `load()`：文件未改动时零读盘。
+
+    与 `get()` 的 1 秒 TTL 缓存刻意分开：决策路径接受「最多 1 秒旧值」，
+    认证要求跨进程改密立即生效，只能靠指纹判断而不能靠时间窗口。
+    返回**独立副本**（`_copy_cfg`），调用方可自由修改。
+    """
+    sig = _conf_sig()
+    if sig is not None:
+        key = (CONF_PATH, sig)
+        with _load_cache_lock:
+            if _load_cache["key"] == key and _load_cache["cfg"] is not None:
+                return _copy_cfg(_load_cache["cfg"])
+    cfg, disk_ok = _load_state()
+    # 读取前后各取一次指纹，只有文件在读取期间没被改动才缓存：宁可少命中一次，
+    # 也不能把「旧内容 + 新指纹」写进缓存（那样会一直陈旧到文件下次改变）。
+    if disk_ok and sig is not None and sig == _conf_sig():
+        with _load_cache_lock:
+            _load_cache["key"] = (CONF_PATH, sig)
+            _load_cache["cfg"] = _copy_cfg(cfg)
     return cfg

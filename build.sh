@@ -29,6 +29,7 @@ cp -a "$SRC/info.json"      "$PKG/"
 cp -a "$SRC/install.sh"     "$PKG/"
 cp -a "$SRC/uninstall.sh"   "$PKG/"
 cp -a "$SRC/frpwaf.init"    "$PKG/"
+cp -a "$SRC/frpwaf.service" "$PKG/"
 chmod +x "$PKG/install.sh" "$PKG/uninstall.sh" "$PKG/frpwaf.init"
 # 清理字节码缓存 / 编辑器垃圾，避免打进发布包
 find "$PKG" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
@@ -50,7 +51,8 @@ done
 if [ -n "$PY" ]; then
   echo "[*] 使用 $PY 归一化"
   find "$PKG" -type f \( -name '*.py' -o -name '*.sh' -o -name '*.init' -o -name '*.html' \
-    -o -name '*.css' -o -name '*.js' -o -name '*.json' -o -name '*.md' -o -name '*.txt' \) \
+    -o -name '*.css' -o -name '*.js' -o -name '*.json' -o -name '*.md' -o -name '*.txt' \
+    -o -name '*.service' \) \
     -exec "$PY" -c 'import sys
 for p in sys.argv[1:]:
     d = open(p, "rb").read()
@@ -59,7 +61,8 @@ for p in sys.argv[1:]:
 else
   echo "[!] 未找到可用 python，改用 sed"
   find "$PKG" -type f \( -name '*.py' -o -name '*.sh' -o -name '*.init' -o -name '*.html' \
-    -o -name '*.css' -o -name '*.js' -o -name '*.json' -o -name '*.md' -o -name '*.txt' \) \
+    -o -name '*.css' -o -name '*.js' -o -name '*.json' -o -name '*.md' -o -name '*.txt' \
+    -o -name '*.service' \) \
     -exec sed -i 's/\r$//' {} +
 fi
 
@@ -68,7 +71,8 @@ fi
 # 注：不用 `find -exec grep -lU`——GNU grep 3.0 下该组合会把所有文本文件误报为命中。
 if [ -n "$PY" ]; then
   CRLF_HIT=$(find "$PKG" -type f \( -name '*.py' -o -name '*.sh' -o -name '*.init' -o -name '*.html' \
-    -o -name '*.css' -o -name '*.js' -o -name '*.json' -o -name '*.md' -o -name '*.txt' \) \
+    -o -name '*.css' -o -name '*.js' -o -name '*.json' -o -name '*.md' -o -name '*.txt' \
+    -o -name '*.service' \) \
     -exec "$PY" -c 'import sys
 for p in sys.argv[1:]:
     if b"\r" in open(p, "rb").read():

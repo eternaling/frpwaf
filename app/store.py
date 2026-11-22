@@ -9,8 +9,11 @@
   proxy_stat   : 每个代理的累计连接统计
   settings     : 简单键值（预留）
 """
+import contextlib
 import ipaddress
 import os
+import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -21,8 +24,11 @@ _lock = threading.Lock()
 _conn = None
 
 # 生效封禁 IP 的内存缓存：连接决策路径每次都查会全表扫描，故做短 TTL 缓存。
-_bans = {"ips": frozenset(), "at": 0.0}
-_bans_lock = threading.Lock()
+# gen 为失效版本号：重建期间发生过 invalidate 时用来自查，避免把失效前的旧
+# 数据重新发布成新快照（解封接口返回后不能再被旧快照覆盖）。
+_bans = {"ips": (), "at": 0.0, "gen": 0}
+_bans_lock = threading.Lock()        # 只保护快照本身（纯内存，微秒级）
+_bans_build_lock = threading.Lock()  # 保证同一时刻只有一个线程重建缓存
 BANS_TTL = 2.0  # 秒
 
 SCHEMA = """
@@ -57,6 +63,11 @@ CREATE INDEX IF NOT EXISTS idx_conn_log_ip_ts ON conn_log(ip, ts);
 -- 复合索引：summary_by_proxy 聚合视图按 (proxy_name<>'', ts>=窗口) 过滤 + 分组，
 -- 走该索引避免全表扫描后回表过滤 ts（与 idx_conn_log_ip_ts 同思路）。
 CREATE INDEX IF NOT EXISTS idx_conn_log_proxy_ts ON conn_log(proxy_name, ts);
+-- 复合索引：日志面板按 action 过滤（"只看拦截"）与 count_logs(action=) 走该索引。
+-- 取 (action, id) 而非 (action, ts)：store 里没有任何「action + ts 区间」的组合
+-- 条件，而 list_logs 是 `WHERE action=? ORDER BY id DESC LIMIT ?`，按 (action, id)
+-- 可直接有序扫描，省掉过滤后的排序。已有库在 _connect() 里由 IF NOT EXISTS 补齐。
+CREATE INDEX IF NOT EXISTS idx_conn_log_action_id ON conn_log(action, id);
 
 CREATE TABLE IF NOT EXISTS ban_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -198,29 +209,49 @@ def _exec(sql, args=()):
 def _query(sql, args=()):
     with _lock:
         c = _connect()
+        # pi-lens-ignore: python-sql-injection -- SQL 只由本模块的字面量传入，参数全部走占位符绑定
         cur = c.execute(sql, args)
         return [dict(r) for r in cur.fetchall()]
 
 
-def _query_ro(sql, args=()):
-    """只读查询（独立临时连接，**不占全局 _lock**）。
+# 只读连接的 PRAGMA：该连接不受 _lock 保护，与写事务/checkpoint 竞争时靠
+# busy_timeout 让 SQLite 退避重试，而不是立刻抛 database is locked；query_only
+# 兜底：只读连接上永远不该发生写。PRAGMA 不支持占位符绑定，只能写字面量。
+@contextlib.contextmanager
+def _ro_conn():
+    """打开一条独立的只读连接（**不占全局 _lock**），退出时关闭。
 
-    用于面板触发的重聚合查询（summary_by_proxy）：WAL 模式下读与写互不阻塞，
-    长查询不再持有全局 _lock，避免拖住决策路径的缓存重建（banned_ips / _rules）。
-    数据库文件不存在（未初始化）时返回 []。
+    WAL 模式下读与写互不阻塞：长查询不再持有全局 _lock，也就不会把每连接的
+    决策写入（add_log_and_bump）和缓存重建（banned_ips / _rules）堵在后面。
+    - 库文件不存在时先 init() 建库建表（首次安装 / 面板先于后台任务查询）；
+    - busy_timeout 必设：本连接不在 _lock 保护下，只能靠 SQLite 退避重试；
+    - query_only=1 兜底：只读连接上永远不该发生写。
     """
     if not os.path.exists(config.DB_PATH):
-        return []
+        init()
     c = sqlite3.connect(config.DB_PATH, timeout=5)
     try:
         c.row_factory = sqlite3.Row
         c.execute("PRAGMA busy_timeout=5000")
-        return [dict(r) for r in c.execute(sql, args).fetchall()]
+        c.execute("PRAGMA query_only=1")
+        yield c
     finally:
         try:
             c.close()
         except Exception:
             pass
+
+
+def _query_ro(sql, args=()):
+    """只读查询（独立连接，**不占全局 _lock**）。
+
+    除本模块的展示/聚合查询外，也必须供**决策路径的缓存重建**使用：读走只读
+    连接后，一次慢查询既不会阻塞写入，也不会被写入阻塞。
+    """
+    with _ro_conn() as c:
+        # pi-lens-ignore: python-sql-injection -- SQL 只由本模块的字面量传入，参数全部走占位符绑定
+        cur = c.execute(sql, args)
+        return [dict(r) for r in cur.fetchall()]
 
 
 def checkpoint(truncate=False):
@@ -233,6 +264,269 @@ def checkpoint(truncate=False):
         pass
 
 
+# ---------------- 数据快照备份 ----------------
+# 在线升级刻意只备份程序本体、不碰 data/（见 app/upgrade.py），因此数据侧必须
+# 有自己的快照机制：purge_logs / clear_blacklist / 卸载后手删目录都是不可逆
+# 操作，没有快照就只能认栽。目录名、命名规则、保留份数与空间阈值集中在这里，
+# daemon 只负责按周期触发。
+BACKUP_DIRNAME = "backup"
+BACKUP_KEEP = 7                              # 保留份数（每天一份 ≈ 一周）
+BACKUP_MIN_FREE = 200 * 1024 * 1024          # 备份前要求的最小剩余空间（200MB）
+# 备份文件名：frpwaf-YYYYMMDD-HHMMSS-ffffff.db。微秒段必须是名字的一部分，
+# 否则同一秒内的多次备份会撞同一个文件名、互相 overwrite——保留策略就永远
+# 攒不到 keep 份（这曾经是真的 bug：连做 10 次只剩 2 个文件）。
+# 末尾的 -\d{6} 可选：兼容早期只有秒精度的备份文件（不能变成删不掉的垃圾）。
+_BACKUP_NAME_RE = re.compile(r"^frpwaf-\d{8}-\d{6}(?:-\d{6})?\.db$")
+# 临时文件同样按完整模式匹配：清理残留时绝不误删运维自己放的其它文件。
+_BACKUP_TMP_RE = re.compile(r"^frpwaf-\d{8}-\d{6}(?:-\d{6})?\.db\.tmp$")
+_BACKUP_TMP_SUFFIX = ".db.tmp"               # 不以 .db 结尾：不会被当成一份备份
+_STALE_TMP_SEC = 3600                        # 中断残留的临时文件超过 1 小时即清理
+_MAX_NAME_TRIES = 1000                       # 同一微秒内最多顺延多少个名字
+
+
+def backup_dir():
+    """备份目录（默认 data/backup/）。"""
+    return os.path.join(config.DATA_DIR, BACKUP_DIRNAME)
+
+
+def _backup_name(us=None):
+    """备份文件名 frpwaf-YYYYMMDD-HHMMSS-ffffff.db（本地时区，微秒定宽）。
+
+    取整数微秒而不是「秒 + 浮点小数」：epoch 秒已经是 1.7e9，float64 在这个
+    量级上的最小增量约 0.24µs，用浮点算亚秒段会抖。所有字段定宽且分隔符
+    一致，所以**字典序 = 时间序**（保留策略靠排序挑最旧的删）。
+    """
+    if us is None:
+        us = int(time.time() * 1000000)
+    return "frpwaf-%s-%06d.db" % (
+        time.strftime("%Y%m%d-%H%M%S", time.localtime(us // 1000000)),
+        us % 1000000)
+
+
+def _free_bytes(path):
+    """path 所在分区的剩余字节数；目录尚不存在时上溯到存在的祖先。
+
+    取不到（权限/异常/盘符异常）返回 -1：宁可放弃空间判断，也不要因为拿不到
+    数字就永久不备份——备份缺失的代价远大于一次可能失败的写入。
+    """
+    p = os.path.abspath(path)
+    while True:
+        try:
+            return shutil.disk_usage(p).free
+        except OSError:
+            parent = os.path.dirname(p)
+            if parent == p:
+                return -1
+            p = parent
+
+
+def list_backups(dest_dir=None):
+    """已有备份的文件名（按名字升序 = 时间升序）。
+
+    只认本程序生成的命名（frpwaf-<时间戳>.db）：运维自己放进备份目录的其它
+    .db（手拷、别的工具产出）不会被当成一份备份，也就永远不会被裁剪删掉。
+    """
+    d = dest_dir or backup_dir()
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    return sorted(n for n in names if _BACKUP_NAME_RE.match(n))
+
+
+def last_backup_time(dest_dir=None):
+    """最新一份备份的产生时刻（epoch 秒）；一份都没有时返回 0。
+
+    取文件 mtime 而非文件名解析：用户手工拷贝备份文件时名字可能被改，
+    mtime 始终反映「这份快照是什么时候写出来的」。
+    """
+    d = dest_dir or backup_dir()
+    names = list_backups(d)
+    if not names:
+        return 0
+    try:
+        return int(os.path.getmtime(os.path.join(d, names[-1])))
+    except OSError:
+        return 0
+
+
+def _clean_stale_tmp(dest):
+    """清理被中断的备份残留（*.db.tmp），只删 1 小时以前的。
+
+    正常备份写完就 os.replace 掉了；长时间残留说明进程在写入过程中被杀
+    （磁盘满 / OOM / 重启），留着只会白占空间。两个边界：
+      - 只删符合 frpwaf-<时间戳>.db.tmp 完整模式的文件，备份目录里运维自己
+        放的任何其它文件（包括自己命名的 .db）一律不碰；
+      - 加时间窗是为了不误删另一个进程正在写的临时文件。
+    """
+    now = time.time()
+    try:
+        names = os.listdir(dest)
+    except OSError:
+        return 0
+    n = 0
+    for name in names:
+        if not _BACKUP_TMP_RE.match(name):
+            continue
+        p = os.path.join(dest, name)
+        try:
+            if now - os.path.getmtime(p) >= _STALE_TMP_SEC:
+                os.remove(p)
+                n += 1
+        except OSError:
+            pass
+    return n
+
+
+def _prune_backups(dest, keep):
+    """只保留最近 keep 份（文件名排序即时间序），返回删除份数。
+
+    keep <= 0 视为「不裁剪」：宁可多占磁盘，也不因为传入 0 就把全部备份删光。
+    """
+    if keep <= 0:
+        return 0
+    names = list_backups(dest)
+    stale = names[:-keep] if len(names) > keep else []
+    n = 0
+    for name in stale:
+        try:
+            os.remove(os.path.join(dest, name))
+            n += 1
+        except OSError:
+            pass
+    return n
+
+
+def _claim_backup_path(dest):
+    """为本轮备份原子地占一个不重名的 (final, tmp) 路径；占不到返回 None。
+
+    先按当前微秒生成名字，再以 O_CREAT|O_EXCL 创建 `<name>.db.tmp`：OS 保证
+    同一时刻只有一个进程能创建成功，因此并发（daemon 与插件端同时备份）也
+    不会抢到同一个名字。名字已被占（同微秒已有备份，或另一个进程先到）就把
+    时间戳顺延 1µs 重试：新名字仍比旧名字大，字典序 = 时间序不变。
+    返回的 tmp 文件此时已存在（0 字节），SQLite 会把 0 字节文件当成空库打开。
+    """
+    base_us = int(time.time() * 1000000)
+    for bump in range(_MAX_NAME_TRIES):
+        name = _backup_name(base_us + bump)
+        final = os.path.join(dest, name)
+        if os.path.exists(final):       # 同微秒已有成品快照：不能用它（会覆盖旧快照）
+            continue
+        tmp = final + ".tmp"            # frpwaf-*.db.tmp：不以 .db 结尾，不会被当成备份
+        try:
+            fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            continue                    # 另一个进程正在用这个名字
+        except OSError:
+            return None
+        os.close(fd)
+        return final, tmp
+    return None
+
+
+def backup_db(keep=BACKUP_KEEP, dest_dir=None):
+    """把当前库快照成一个独立文件，只保留最近 keep 份。
+
+    返回 (ok, path_or_error)。
+
+    为什么用 sqlite3.Connection.backup() 而不是 VACUUM INTO：
+      - backup() 是官方给**热备份**用的 API，走 SQLite 自己的页级备份协议，
+        WAL 模式下与并发写天然安全（源连接只开读事务，不需要独占锁），备份
+        期间的写入继续落库，快照仍是一致的；
+      - VACUUM INTO 要求 SQLite ≥ 3.27（多数发行版满足，但没必要赌），语义上
+        它是一次「整理后导出」——重写整库、重建所有页，额外 CPU/IO 都落在
+        生产机上，而不是单纯复制；
+      - VACUUM INTO 还要求目标文件不存在、只能写在 SQL 字面量里，失败面更大。
+
+    实现要点：
+      - **不持全局 _lock**：决策路径（add_log_and_bump）靠它串行化写入，一次
+        几十 MB 的备份持锁会直接把回调请求堵死。备份用独立连接，与全局 _conn
+        不共享事务状态；
+      - **先写临时文件再 os.replace 原子落地**：避免备份到一半被中断时留下半个
+        .db 被当成一份可用备份（还原时才发现是废的，代价最大）；
+      - **磁盘守卫**：这台机器曾被日志撑到 90%，把盘塞满会让服务直接失能
+        （SQLite 写不进去 = 日志/封禁全丢），所以剩余空间低于 BACKUP_MIN_FREE
+        干脆不做，并由调用方计数上报；
+      - **文件名绝不撞名**：名字带微秒时间戳（frpwaf-YYYYMMDD-HHMMSS-ffffff.db），
+        另在写入前用 O_CREAT|O_EXCL 原子地占位，撞名就把时间戳顺延 1µs 重试。
+        这一步不能省：只靠「秒级时间戳 + 直接 overwrite」时，连续备份会互相
+        覆盖，保留策略永远攒不到 keep 份（真实缺陷：连做 10 次只剩 2 个文件）；
+      - 库文件不存在（未初始化 / 已被删）返回失败原因，不抛异常：备份由后台
+        循环调用，抛异常只会变成一条没人看的 traceback。
+    """
+    dest = dest_dir or backup_dir()
+    src_path = config.DB_PATH
+    if not os.path.exists(src_path):
+        return False, "数据库文件不存在：%s" % src_path
+    try:
+        os.makedirs(dest, exist_ok=True)
+    except OSError as exc:
+        return False, "无法创建备份目录 %s：%s" % (dest, exc)
+    free = _free_bytes(dest)
+    if 0 <= free < BACKUP_MIN_FREE:
+        return False, ("磁盘剩余空间不足（剩余 %dMB，低于阈值 %dMB），已跳过备份"
+                       % (free // (1024 * 1024), BACKUP_MIN_FREE // (1024 * 1024)))
+    _clean_stale_tmp(dest)
+    claimed = _claim_backup_path(dest)
+    if claimed is None:
+        return False, ("无法占用备份文件名（同名快照过多或临时文件创建失败），"
+                       "已跳过本次不覆盖旧快照")
+    final, tmp = claimed
+    src = None
+    dst = None
+    try:
+        src = sqlite3.connect(src_path, timeout=15)
+        src.execute("PRAGMA busy_timeout=5000")
+        dst = sqlite3.connect(tmp, timeout=15)
+        # pages=-1 = 一次拷完；sleep 只在需要等锁时用得上，WAL 下基本不触发
+        src.backup(dst)
+        dst.close()
+        dst = None
+        src.close()
+        src = None
+        try:
+            # 备份里是全量审计日志/名单/封禁，权限与 db 一致
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, final)
+    except (sqlite3.Error, OSError) as exc:
+        return False, "备份失败：%s" % exc
+    except Exception as exc:            # 兜底：后台循环的调用方不能因此崩
+        return False, "备份失败：%s" % exc
+    finally:
+        for c in (dst, src):
+            if c is not None:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+        # 执行到这里 tmp 还在，说明 os.replace 没成功：必须清掉，否则半个 .db
+        # 会被当成一份「可用」备份（成功时 tmp 已被 replace 掉，这里是空操作）
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    _prune_backups(dest, int(keep or 0))
+    return True, final
+
+
+def export_rows(ban_limit=20000):
+    """导出口径的只读快照：全部名单 + 封禁历史（供 /api/export）。
+
+    只读连接（_query_ro）：导出可能与连接回调并发，绝不能占全局 _lock，
+    也不该把大结果集读进写连接的事务里。
+    """
+    return {
+        "ip_list": _query_ro(
+            "SELECT cidr,list_type,remark,created_at FROM ip_list ORDER BY id"),
+        "bans": _query_ro(
+            "SELECT ip,reason,banned_at,expire_at,released FROM ban_log"
+            " ORDER BY id DESC LIMIT ?", (int(ban_limit),)),
+    }
+
+
 # ---------------- ip_list ----------------
 # 面板名单接口的返回上限：防大名单场景全量返回 + 逐条归属地查询拖垮面板。
 # 仅约束「展示接口」（daemon /api/iplist、插件端 list_ips/list_bans）；
@@ -241,16 +535,19 @@ PANEL_LIST_CAP = 5000
 
 
 def list_ips(list_type=None, limit=0):
-    """名单列表。limit>0 时限制返回条数（面板大名单场景防全表拉取）。"""
+    """名单列表。limit>0 时限制返回条数（面板大名单场景防全表拉取）。
+
+    只读：面板展示 + AI 白名单判定（ai._is_whitelisted）使用，走只读连接。
+    """
     lim = int(limit or 0)
     if list_type:
         if lim > 0:
-            return _query("SELECT * FROM ip_list WHERE list_type=? ORDER BY id DESC LIMIT ?",
-                          (list_type, lim))
-        return _query("SELECT * FROM ip_list WHERE list_type=? ORDER BY id DESC", (list_type,))
+            return _query_ro("SELECT * FROM ip_list WHERE list_type=? ORDER BY id DESC LIMIT ?",
+                             (list_type, lim))
+        return _query_ro("SELECT * FROM ip_list WHERE list_type=? ORDER BY id DESC", (list_type,))
     if lim > 0:
-        return _query("SELECT * FROM ip_list ORDER BY id DESC LIMIT ?", (lim,))
-    return _query("SELECT * FROM ip_list ORDER BY id DESC")
+        return _query_ro("SELECT * FROM ip_list ORDER BY id DESC LIMIT ?", (lim,))
+    return _query_ro("SELECT * FROM ip_list ORDER BY id DESC")
 
 
 def add_ip(cidr, list_type="black", remark=""):
@@ -283,6 +580,7 @@ def clear_blacklist():
 
     供面板「解封全部黑名单」按钮使用；调用方负责刷新规则缓存
     （engine.invalidate_cache）并触发内核同步（firewall.sync_from_store）。
+    写前紧邻的计数刻意留在 _query（与写同一连接），避免并发插入让返回值走样。
     """
     n = _query("SELECT COUNT(*) AS n FROM ip_list WHERE list_type='black'")[0]["n"]
     _exec("DELETE FROM ip_list WHERE list_type='black'")
@@ -290,9 +588,13 @@ def clear_blacklist():
 
 
 def load_rules():
-    """加载为 (black_networks, white_networks) 两个列表。"""
+    """加载为 (black_networks, white_networks) 两个列表。
+
+    决策路径的规则缓存（engine._rules，TTL 3s）靠它重建：必须走只读连接，
+    否则名单很大时重建会让每连接的写入排队。
+    """
     blacks, whites = [], []
-    for row in _query("SELECT cidr,list_type FROM ip_list"):
+    for row in _query_ro("SELECT cidr,list_type FROM ip_list"):
         try:
             net = ipaddress.ip_network(row["cidr"], strict=False)
         except ValueError:
@@ -349,6 +651,9 @@ def add_log_and_bump(ip, port, proxy_name, proxy_type, user, action, reason="",
 
 
 def list_logs(limit=200, offset=0, ip=None, action=None, proxy=None):
+    """日志列表（面板翻页，纯展示）。走只读连接：带 action 过滤 + 深页 OFFSET
+    时可能是全表扫描，占着全局 _lock 会把每连接的决策写堵在后面。
+    """
     sql = "SELECT * FROM conn_log WHERE 1=1"
     args = []
     if ip:
@@ -362,10 +667,11 @@ def list_logs(limit=200, offset=0, ip=None, action=None, proxy=None):
         args.append(proxy)
     sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
     args += [int(limit), int(offset)]
-    return _query(sql, args)
+    return _query_ro(sql, args)
 
 
 def count_logs(ip=None, action=None, proxy=None):
+    """日志总数（面板分页文案 + /api/geo 展示），纯展示、走只读连接。"""
     sql = "SELECT COUNT(*) AS n FROM conn_log WHERE 1=1"
     args = []
     if ip:
@@ -377,12 +683,12 @@ def count_logs(ip=None, action=None, proxy=None):
     if proxy:
         sql += " AND proxy_name=?"
         args.append(proxy)
-    return _query(sql, args)[0]["n"]
+    return _query_ro(sql, args)[0]["n"]
 
 
 def log_proxy_names():
-    """连接日志中出现过的代理名（用于筛选下拉框）。"""
-    return [r["proxy_name"] for r in _query(
+    """连接日志中出现过的代理名（用于筛选下拉框，纯展示）。"""
+    return [r["proxy_name"] for r in _query_ro(
         "SELECT DISTINCT proxy_name FROM conn_log WHERE proxy_name<>'' ORDER BY proxy_name")]
 
 
@@ -422,7 +728,7 @@ def summary_by_proxy(window_sec, limit=50):
                                 "rejected": 0, "last_ts": r["last_ts"] or 0}
     ph = ",".join("?" * len(names))
     rows = _query_ro(
-        "SELECT proxy_name, ip, COUNT(*) AS n,"
+        "SELECT proxy_name, ip, COUNT(*) AS n,"  # noqa: S608 - 只拼接 ? 占位符，值走参数绑定
         " SUM(CASE WHEN action<>'allow' THEN 1 ELSE 0 END) AS rejected"
         " FROM conn_log WHERE ts>=? AND proxy_name IN (%s)"
         " GROUP BY proxy_name, ip" % ph,
@@ -446,7 +752,7 @@ def summary_by_proxy(window_sec, limit=50):
         names = [d["proxy_name"] for d in out]
         ph = ",".join("?" * len(names))
         for r in _query_ro(
-                "SELECT proxy_name, proxy_type FROM proxy_stat"
+                "SELECT proxy_name, proxy_type FROM proxy_stat"  # noqa: S608 - 同上，仅占位符
                 " WHERE proxy_name IN (%s)" % ph, tuple(names)):
             for d in out:
                 if d["proxy_name"] == r["proxy_name"]:
@@ -458,21 +764,58 @@ def summary_by_proxy(window_sec, limit=50):
 
 
 def recent_count_by_ip(ip, window_sec):
+    """某 IP 在窗口内的连接数（/api/geo 展示用，只读）。
+
+    注意：连接决策路径的窗口计数用的是 engine 的内存滑窗，不走这里，
+    所以可以安全地改成独立只读连接。
+    """
     since = int(time.time()) - int(window_sec)
-    rows = _query(
+    rows = _query_ro(
         "SELECT COUNT(*) AS n FROM conn_log WHERE ip=? AND ts>=?", (ip, since)
     )
     return rows[0]["n"]
 
 
 def trim_logs(max_rows):
-    n = _query("SELECT COUNT(*) AS n FROM conn_log")[0]["n"]
-    if n > max_rows:
-        _exec(
-            "DELETE FROM conn_log WHERE id IN "
-            "(SELECT id FROM conn_log ORDER BY id ASC LIMIT ?)",
-            (n - max_rows,),
-        )
+    """裁剪最旧的连接日志，保留最近 max_rows 条（后台 tick 每 10s 一次）。
+
+    不再每轮 `COUNT(*)` 全表计数（20 万行表上属稳态空转）：先用 MIN/MAX(id)
+    预判，`INTEGER PRIMARY KEY` 上取端点只走 b-tree 两端、不扫表；
+    `MAX-MIN+1` 是真实行数的**上界**，它不超上限时必然无需裁剪，直接返回。
+
+    只有在确实超限时才发一条 DELETE。span 可以直接当行数用：本表唯一的删除
+    路径就是这里，且每次删的都是「最旧的一段」，存活行始终是 id 的一个连续
+    后缀，故 span == COUNT(*)。即使 id 出现空洞（人手改库导致），偏大的 span
+    最多多删几条最旧的日志，绝不会留下超过上限的行、也不会抛异常。
+
+    注意写法：必须用「两个标量子查询」而不是 `SELECT MIN(id), MAX(id) FROM t`——
+    后者有 min 和 max 两个聚合，SQLite **用不上 rowid 端点优化**，会退化成全表
+    索引扫描（实测 20 万行 26ms）；拆成两个标量子查询后两者都走 `SEARCH`
+    （EXPLAIN QUERY PLAN 可见），合计约 0.01ms。改回去等于什么都没优化。
+    """
+    try:
+        max_rows = int(max_rows)
+    except (TypeError, ValueError):
+        return
+    if max_rows < 0:
+        max_rows = 0
+    rows = _query_ro(
+        "SELECT (SELECT MIN(id) FROM conn_log) AS lo,"
+        " (SELECT MAX(id) FROM conn_log) AS hi"
+    )
+    if not rows:
+        return
+    lo, hi = rows[0]["lo"], rows[0]["hi"]
+    if lo is None or hi is None:      # 空表：无需裁剪
+        return
+    excess = hi - lo + 1 - max_rows
+    if excess <= 0:
+        return
+    _exec(
+        "DELETE FROM conn_log WHERE id IN "
+        "(SELECT id FROM conn_log ORDER BY id ASC LIMIT ?)",
+        (excess,),
+    )
 
 
 def purge_logs():
@@ -485,27 +828,56 @@ def invalidate_bans():
     """使生效封禁缓存立即失效（增删封禁后调用）。"""
     with _bans_lock:
         _bans["at"] = 0.0
+        _bans["gen"] += 1
 
 
 def banned_ips():
     """生效中的封禁集合（带短 TTL 缓存，供连接决策快速判断）。
 
     返回 ip_network 列表：单 IP 视作 /32、/128，也支持临时封禁整段 CIDR。
-    缓存重建与失效共用一把锁：解封/新增封禁返回后，不会再发布旧快照。
+
+    缓存重建与读路径分离，避免“一次慢查询卡住所有回调”：
+      - 命中/未命中都只短暂持有 _bans_lock（纯内存），绝不持锁做 DB 查询；
+      - 重建由 _bans_build_lock 保证单线程执行，抢不到锁的线程**直接返回旧
+        快照**而不是排队等库（旧快照最多旧 BANS_TTL + 一次查询耗时，对封禁
+        判定的影响是“晚几秒生效”，远优于把 frps 回调拖到 fail-closed）；
+      - 重建期间的 invalidate_bans() 用 gen 版本号识别，失效前读到的旧数据
+        不会被发布成新快照（解封接口返回后不会被旧快照覆盖）。
     """
-    now = time.time()
     with _bans_lock:
-        if now - _bans["at"] < BANS_TTL:
+        if time.time() - _bans["at"] < BANS_TTL:
             return _bans["ips"]
+        snap = _bans["ips"]
+    if not _bans_build_lock.acquire(False):
+        return snap            # 已有线程在重建：先用旧快照，不阻塞决策路径
+    try:
+        at = time.time()
+        with _bans_lock:
+            if at - _bans["at"] < BANS_TTL:   # 等锁期间别人已重建完成
+                return _bans["ips"]
+            gen = _bans["gen"]
         nets = []
-        for b in active_bans():
-            try:
-                nets.append(ipaddress.ip_network((b["ip"] or "").strip(), strict=False))
-            except ValueError:
-                continue
-        _bans["ips"] = tuple(nets)
-        _bans["at"] = time.time()
-        return _bans["ips"]
+        try:
+            for b in active_bans():
+                try:
+                    nets.append(ipaddress.ip_network((b["ip"] or "").strip(), strict=False))
+                except ValueError:
+                    continue
+        except sqlite3.Error:
+            # 库异常：沿用旧快照，并给一个 1s 的重试间隔（at 往后推），
+            # 否则缓存永远处于“失效”状态，每个连接都会来试一次重建。
+            with _bans_lock:
+                if _bans["gen"] == gen:
+                    _bans["at"] = at - BANS_TTL + 1.0
+            return snap
+        nets = tuple(nets)
+        with _bans_lock:
+            if _bans["gen"] == gen:        # 重建期间未被失效 → 发布
+                _bans["ips"] = nets
+                _bans["at"] = at
+            return nets
+    finally:
+        _bans_build_lock.release()
 
 
 def is_banned(ip):
@@ -539,25 +911,31 @@ def add_ban(ip, reason, seconds):
 
 
 def active_bans():
+    """生效中的封禁（面板展示 / 内核同步 / 决策缓存重建，全是只读）。
+
+    走只读连接：调用方包括 banned_ips() 的缓存重建（决策路径）、firewall 的
+    10s 内核对账、面板 /api/bans，都不应该为了一次查询去抢全局 _lock。
+    """
     now = int(time.time())
-    return _query(
+    return _query_ro(
         "SELECT * FROM ban_log WHERE released=0 AND expire_at>? ORDER BY id DESC",
         (now,),
     )
 
 
 def active_bans_count():
-    """生效封禁数量（概览统计用，避免拉全量行）。"""
+    """生效封禁数量（概览统计用，避免拉全量行；只读）。"""
     now = int(time.time())
-    return _query(
+    return _query_ro(
         "SELECT COUNT(*) AS n FROM ban_log WHERE released=0 AND expire_at>?",
         (now,),
     )[0]["n"]
 
 
 def expired_bans():
+    """到期未释放的封禁（engine.auto_release 的输入，只读）。"""
     now = int(time.time())
-    return _query(
+    return _query_ro(
         "SELECT * FROM ban_log WHERE released=0 AND expire_at<=?", (now,)
     )
 
@@ -565,6 +943,41 @@ def expired_bans():
 def release_ban(ban_id):
     _exec("UPDATE ban_log SET released=1 WHERE id=?", (ban_id,))
     invalidate_bans()
+
+
+def release_bans(ids):
+    """批量把 ban_log 里给定 id 标记为已释放（一条语句一次 commit）。
+
+    返回实际影响行数。ids 为空时返回 0 且不执行 SQL。
+    一批临时封禁同时到期时，逐条 `release_ban` 会做 N 次 commit（持锁时间叠加）；
+    这里合并成一条 UPDATE，只提交一次。`released=0` 让返回值表示「本次真正
+    解封的条数」，重复调用幂等。
+    """
+    if not ids:
+        return 0
+    want = []
+    seen = set()
+    for x in ids:
+        try:
+            v = int(x)
+        except (TypeError, ValueError):
+            continue      # 非法 id 直接跳过，不让一条脏数据毁掉整批解封
+        if v in seen:
+            continue
+        seen.add(v)
+        want.append(v)
+    if not want:
+        return 0
+    # 占位符个数是代码生成的（只由 ',' 与 '?' 组成），值仍全部走参数绑定；
+    # 字符串拼接的只有占位符，S608（hardcoded SQL expression）对此是误报。
+    sql = ("UPDATE ban_log SET released=1 WHERE released=0 AND id IN (%s)"  # noqa: S608
+           % ",".join("?" * len(want)))
+    cur = _exec(sql, tuple(want))
+    invalidate_bans()
+    try:
+        return int(cur.rowcount or 0)
+    except (TypeError, ValueError):   # pragma: no cover - 防御性
+        return 0
 
 
 def unban_ip(ip):
@@ -577,6 +990,7 @@ def release_all_bans():
 
     供面板「解封全部临时封禁」按钮使用；调用方负责触发内核同步
     （firewall.sync_from_store），把已释放条目从 ipset 移除。
+    写前紧邻的计数刻意留在 _query（与写同一连接），返回值才是“本次释放条数”。
     """
     n = _query(
         "SELECT COUNT(*) AS n FROM ban_log WHERE released=0 AND expire_at>?",
@@ -589,7 +1003,8 @@ def release_all_bans():
 
 
 def ban_history(limit=200):
-    return _query("SELECT * FROM ban_log ORDER BY id DESC LIMIT ?", (int(limit),))
+    """封禁历史（面板展示，只读）。"""
+    return _query_ro("SELECT * FROM ban_log ORDER BY id DESC LIMIT ?", (int(limit),))
 
 
 def trim_bans(max_rows=20000):
@@ -598,8 +1013,30 @@ def trim_bans(max_rows=20000):
     ban_log 原先无任何裁剪：永久封禁只写 ip_list 不写 ban_log，但自动/手动/AI
     的临时封禁长期累积会导致表与索引持续膨胀。
     生效记录超过上限时允许总行数暂时超过上限。
+    先用 MIN/MAX(id) 做 O(1) 预判（20 万行上不再每 10s 全表计数），确认可能
+    超限后才精确计数：ban_log 要跳过仍生效的封禁，生效行会夹在已结束行之间
+    存活，id 空洞是常态（span 远大于行数），必须拿到真实行数才知道该删几条。
+    这张表被本函数自身限制在 max_rows + 少量生效行，分支内的 COUNT(*) 有界。
+    （MIN/MAX 必须写成两个标量子查询，原因见 trim_logs 的注释。）
     """
-    n = _query("SELECT COUNT(*) AS n FROM ban_log")[0]["n"]
+    try:
+        max_rows = int(max_rows)
+    except (TypeError, ValueError):
+        return
+    if max_rows < 0:
+        max_rows = 0
+    rows = _query_ro(
+        "SELECT (SELECT MIN(id) FROM ban_log) AS lo,"
+        " (SELECT MAX(id) FROM ban_log) AS hi"
+    )
+    if not rows:
+        return
+    lo, hi = rows[0]["lo"], rows[0]["hi"]
+    if lo is None or hi is None:      # 空表：无需裁剪
+        return
+    if hi - lo + 1 <= max_rows:       # 行数上界未超上限 -> 必然无需裁剪
+        return
+    n = _query_ro("SELECT COUNT(*) AS n FROM ban_log")[0]["n"]
     if n > max_rows:
         _exec(
             "DELETE FROM ban_log WHERE id IN "
@@ -626,7 +1063,31 @@ def bump_proxy(proxy_name, proxy_type, rejected=False):
 
 
 def list_proxy_stat():
-    return _query("SELECT * FROM proxy_stat ORDER BY total DESC")
+    """代理累计统计（面板 /api/proxies，只读）。"""
+    return _query_ro("SELECT * FROM proxy_stat ORDER BY total DESC")
+
+
+def trim_proxy_stat(days=90):
+    """删除「最近 days 天无更新」的代理统计行，返回删除行数。
+
+    代理名来自 frpc 客户端，每个新名字都会新增一行且永不清理；proxy_stat 没有
+    id 列（主键 proxy_name），只能按 last_ts（epoch 秒）判断陈旧。
+    行数等于历史上出现过的代理名个数，量级很小，单条 DELETE 即可，无需分段。
+    days <= 0 或非整数一律不删（防止把整表清空）。
+    调用位置见 daemon.py 后台循环，本函数不自动触发。
+    """
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        return 0
+    if days <= 0:
+        return 0
+    cutoff = int(time.time()) - days * 86400
+    cur = _exec("DELETE FROM proxy_stat WHERE last_ts < ?", (cutoff,))
+    try:
+        return int(cur.rowcount or 0)
+    except (TypeError, ValueError):   # pragma: no cover - 防御性
+        return 0
 
 
 # ---------------- ai_review ----------------
@@ -640,38 +1101,79 @@ def add_ai_review(batch_id, ip, verdict, reason, action, model):
 
 
 def list_ai_review(limit=200):
-    return _query("SELECT * FROM ai_review ORDER BY id DESC LIMIT ?", (int(limit),))
+    """AI 审查记录（面板展示，只读）。"""
+    return _query_ro("SELECT * FROM ai_review ORDER BY id DESC LIMIT ?", (int(limit),))
 
 
 def trim_ai_review(max_rows=5000):
-    n = _query("SELECT COUNT(*) AS n FROM ai_review")[0]["n"]
-    if n > max_rows:
-        _exec(
-            "DELETE FROM ai_review WHERE id IN "
-            "(SELECT id FROM ai_review ORDER BY id ASC LIMIT ?)",
-            (n - max_rows,),
-        )
+    """裁剪最旧的 AI 审查记录，保留最近 max_rows 条。
+
+    与 trim_logs 同一套改造：MIN/MAX(id) 做 O(1) 预判，确认超限后才发一条
+    DELETE；span 与真实行数的关系同理（唯一删除路径、每次删最旧的一段）。
+    """
+    try:
+        max_rows = int(max_rows)
+    except (TypeError, ValueError):
+        return
+    if max_rows < 0:
+        max_rows = 0
+    rows = _query_ro(
+        "SELECT (SELECT MIN(id) FROM ai_review) AS lo,"
+        " (SELECT MAX(id) FROM ai_review) AS hi"
+    )
+    if not rows:
+        return
+    lo, hi = rows[0]["lo"], rows[0]["hi"]
+    if lo is None or hi is None:      # 空表：无需裁剪
+        return
+    excess = hi - lo + 1 - max_rows
+    if excess <= 0:
+        return
+    _exec(
+        "DELETE FROM ai_review WHERE id IN "
+        "(SELECT id FROM ai_review ORDER BY id ASC LIMIT ?)",
+        (excess,),
+    )
 
 
 # ---------------- 汇总 ----------------
 def stats():
-    total = _query("SELECT COUNT(*) AS n FROM conn_log")[0]["n"]
+    """概览统计（面板 /api/overview 与插件端 waf_overview，纯展示）。
+
+    7 次聚合在大表上可达几十毫秒（`COUNT(DISTINCT ip)` 与多次全表 COUNT），
+    迁移前全程占着全局 _lock，把这期间的每连接决策写入都堵在后面。现在：
+      - 全部走只读连接，共用一条（避免每次新建连接）；
+      - 不占全局 _lock，与决策路径的写入/缓存重建完全解耦。
+    """
     # 「今日」按服务器本地时区零点计算（面板展示的是本地时间）。
     # 注意：不可用 (ts // 86400 * 86400)，那是 UTC 零点，在东八区 00:00-08:00
     # 会把昨天的数据算进「今日」，导致统计口径与显示不一致。
     _lt = time.localtime()
     today0 = int(time.mktime((_lt.tm_year, _lt.tm_mon, _lt.tm_mday,
                               0, 0, 0, 0, 0, -1)))
-    today = _query("SELECT COUNT(*) AS n FROM conn_log WHERE ts>=?", (today0,))[0]["n"]
-    rejected = _query(
-        "SELECT COUNT(*) AS n FROM conn_log WHERE ts>=? AND action!='allow'", (today0,)
-    )[0]["n"]
-    black = _query("SELECT COUNT(*) AS n FROM ip_list WHERE list_type='black'")[0]["n"]
-    white = _query("SELECT COUNT(*) AS n FROM ip_list WHERE list_type='white'")[0]["n"]
-    bans = active_bans_count()
-    uniq = _query(
-        "SELECT COUNT(DISTINCT ip) AS n FROM conn_log WHERE ts>=?", (today0,)
-    )[0]["n"]
+    now = int(time.time())
+    with _ro_conn() as c:
+        def val(row):
+            return (row[0] if row else 0) or 0
+
+        # 每条 SQL 都写成字面量：既符合“参数必定绑定”的可审计要求，
+        # 也让习惯读 SQL 就能定位索引的人一眼看出走的哪条索引。
+        total = val(c.execute("SELECT COUNT(*) FROM conn_log").fetchone())
+        today = val(c.execute(
+            "SELECT COUNT(*) FROM conn_log WHERE ts>=?", (today0,)).fetchone())
+        rejected = val(c.execute(
+            "SELECT COUNT(*) FROM conn_log WHERE ts>=? AND action!='allow'",
+            (today0,)).fetchone())
+        black = val(c.execute(
+            "SELECT COUNT(*) FROM ip_list WHERE list_type='black'").fetchone())
+        white = val(c.execute(
+            "SELECT COUNT(*) FROM ip_list WHERE list_type='white'").fetchone())
+        bans = val(c.execute(
+            "SELECT COUNT(*) FROM ban_log WHERE released=0 AND expire_at>?",
+            (now,)).fetchone())
+        uniq = val(c.execute(
+            "SELECT COUNT(DISTINCT ip) FROM conn_log WHERE ts>=?",
+            (today0,)).fetchone())
     return {
         "total_conns": total,
         "today_conns": today,

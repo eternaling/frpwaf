@@ -122,6 +122,16 @@
       <!-- 概览 -->
       <div class="bt-w-item active" data-item="status">
         <h2>概览 <span id="fwStatus" class="fw-badge off">检测中…</span></h2>
+        <!-- 安全提示：监听地址来自后端实际生效配置；默认口令状态无法从插件端拿到
+             （需 frpwaf_main.py 的 get_waf_info/waf_overview 回传 password_changed），
+             故口令部分仅作常驻提醒。 -->
+        <div class="fw-card" id="fwSecNotice" style="display:none;margin-bottom:14px;border-color:#f0b429;background:#fffbe6">
+          <h3 style="color:#ad6800">⚠ 面板安全提示</h3>
+          <div class="fw-tip" id="fwSecText" style="margin:0 0 10px;background:transparent"></div>
+          <div class="fw-row">
+            <button class="btn btn-warning btn-sm" onclick="fwGoto('settings')">去「设置」修改口令</button>
+          </div>
+        </div>
         <div class="fw-card" style="margin-bottom:14px">
           <h3>首次使用引导 <span style="color:#999;font-size:12px;font-weight:400">完成以下两步，WAF 才会真正生效</span></h3>
           <div class="fw-tip" style="margin:0 0 12px">
@@ -227,8 +237,15 @@
               </div>
               <span style="flex:1"></span>
               <button class="btn btn-default btn-sm" onclick="fwLoadIpList()">刷新</button>
+              <button class="btn btn-default btn-sm" id="fwExportBtn" onclick="fwExport()">导出数据（JSON）</button>
               <button class="btn btn-danger btn-sm" onclick="fwUnbanAllBlack()">解封全部黑名单</button>
             </div>
+            <div class="fw-tip">
+              导出 IP 名单、临时封禁与封禁历史、配置快照（JSON），可直接当备份或迁移用。
+              机密字段（AI 密钥 / 管理员口令 / secret）由后端掩码为 <code>******</code>，<b>不会</b>写进导出文件。
+              导出走 WAF 网页端接口（默认仅监听 <code>127.0.0.1</code>），需先在网页端登录；若浏览器无法直连会在下方提示原因。
+            </div>
+            <div class="fw-tip" id="fwExportErr" style="display:none;color:#c0392b"></div>
             <div class="fw-table-wrap" style="max-height:360px">
               <table class="fw-table"><thead><tr><th style="width:170px">条目</th><th style="width:90px" class="c">类型</th><th style="width:190px">归属地</th><th>备注</th><th style="width:160px">添加时间</th><th style="width:80px" class="c">操作</th></tr></thead>
               <tbody id="fwIpList"><tr><td colspan="6" style="color:#bbb;text-align:center">加载中…</td></tr></tbody></table>
@@ -277,12 +294,15 @@
               <div><input id="ai_api_key" class="bt-input-text" placeholder="sk-..." style="width:100%" autocomplete="off"></div>
               <div class="k">模型</div>
               <div><input id="ai_model" class="bt-input-text" placeholder="如 claude-haiku-4.5" style="width:100%"></div>
+              <div class="k">允许内网地址</div>
+              <div><input type="checkbox" id="ai_allow_private" checked> 允许 AI 接口访问内网/本机地址（内网自建网关必开）</div>
             </div>
             <div class="fw-row" style="margin-top:12px">
               <button class="btn btn-default btn-sm" onclick="fwAiTest()">测试连接</button>
               <button class="btn btn-success btn-sm" onclick="fwAiSave()">保存配置</button>
             </div>
             <div class="fw-tip">接口地址填到根即可，如 <code>http://127.0.0.1:3000</code>；若填 <code>.../v1</code> 或完整路径也能自动识别，不会重复拼接。</div>
+            <div class="fw-tip"><b>关闭「允许内网地址」后，AI 接口只能访问公网地址，内网自建的 AI 网关将不可用</b>（指向本机/内网的接口地址会保存被拒、测试连接失败）。无论开关如何，链路本地与云元数据地址（<code>169.254.0.0/16</code>、<code>fe80::/10</code>）始终拒绝。</div>
           </div>
 
           <div class="fw-card">
@@ -575,7 +595,9 @@
               <label><input type="checkbox" id="s_rate_limit_enabled"> 启用单 IP 限速</label>
               <label><input type="checkbox" id="s_fw_sync_enabled"> 内核级封禁（ipset+iptables 直接丢包）</label>
               <label><input type="checkbox" id="s_ai_enabled"> 启用 AI 自动审查</label>
+              <label><input type="checkbox" id="s_strict_addr"> 地址解析失败时拒连（更安全，但可能误伤）</label>
             </div>
+            <div class="fw-tip">「地址解析失败时拒连」= fail-closed：开启后无法解析出来源地址的连接（回调缺少 <code>remote_addr</code> 或格式不合法）会被<b>直接拒绝</b>；关闭时保持现状（放行并计入「地址解析失败」计数）。默认关闭，建议先看计数再决定是否收紧。链路本地/云元数据地址不受此开关影响，始终拒绝。</div>
             <div class="fw-tip">修改后需点「保存策略」生效。攻击类型封禁（CC/扫描/爆破）默认开启，参数留 0 视为未设置、保存时自动回退默认值；基础自动封禁默认关闭，请确认阈值合理后再开启。</div>
           </div>
           <div class="fw-card">
@@ -716,6 +738,10 @@
               <button class="btn btn-default btn-sm" onclick="fwLoadAdmin()">重新加载</button>
             </div>
             <div class="fw-tip">可只改用户名、只改密码，或两者一起改（须填写原密码校验）。</div>
+            <div class="fw-tip" style="color:#ad6800">首次安装后请<b>立即修改默认口令 admin / 123456</b>：
+              网页端在口令修改前，除改密接口外的所有 API 都会返回 403（强制首登改密）。
+              如果从没在面板里改过，默认口令等于把管理面板交给任何扫到端口的人。
+            </div>
           </div>
         </div>
       </div>
@@ -727,7 +753,7 @@
           <div class="fw-card">
             <h3>FRP WAF</h3>
             <div class="fw-kv" id="fwAboutKv"></div>
-            <div class="fw-tip">零第三方依赖：Python 3 标准库 + SQLite + 原生 JS 单文件 SPA。</div>
+            <div class="fw-tip">核心零第三方依赖：Python 3 标准库 + SQLite + 原生 JS 单文件 SPA；IP 归属地为可选增强（依赖面板自带的 maxminddb）。</div>
           </div>
           <div class="fw-card">
             <h3>署名</h3>
@@ -870,9 +896,28 @@ function fwRenderCred(){
   // 后端仅回掩码，此处固定展示占位（不再提供明文切换）
   p.textContent = fwCred.pwd ? '••••••' : '(未设置)';
 }
+/* 安全提示：面板监听在通配地址时高亮（数据来自插件端 waf_overview 的实际生效配置） */
+function fwRenderSecNotice(d){
+  var box=document.getElementById('fwSecNotice');
+  var txt=document.getElementById('fwSecText');
+  if(!box||!txt) return;
+  var addr=String((d&&d.http_addr)||'');
+  var port=(d&&d.http_port)||7080;
+  // 127.0.0.1 / ::1 之外都算“可从外部访问”（0.0.0.0、::、或手填的具体网卡地址）
+  var exposed = !!addr && addr!=='127.0.0.1' && addr!=='::1';
+  if(!exposed){ box.style.display='none'; return; }
+  txt.innerHTML =
+    '<div style="margin:0 0 6px">网页端当前监听在 <b>'+fwEsc(addr)+':'+fwEsc(port)+'</b>，'
+    +'即任何能访问该端口的人都能看到登录页。<b>默认口令 admin / 123456 未修改前，面板等于完全开放。</b></div>'
+    +'<div>建议：① 立即在「设置 → 管理员账号」修改口令；'
+    +'② 不需要远程访问时，把监听地址收回本机（修改 <code>/opt/frpwaf/data/frpwaf.json</code> 的 '
+    +'<code>http_addr</code> 为 <code>127.0.0.1</code> 后重启服务，或在网页端面板「设置 → 监听与安全」关闭「允许远程访问」）。</div>';
+  box.style.display='block';
+}
 function fwLoadOverview(){
   fwSend('waf_overview', {}, function(r){
     var d=(r&&r.data)||{};
+    fwRenderSecNotice(d);
     var cards=[
       ['今日连接', d.today_conns||0, 'pri'],
       ['今日拦截', d.today_rejected||0, 'err'],
@@ -1011,6 +1056,71 @@ function fwBatchImport(type){
   fwSend('batch_import_ips', {text:text, list_type:type}, function(r){
     bt_tools.msg((r&&r.msg)||'完成', (r&&r.status));
     if(r&&r.status){ document.getElementById('fwBatchText').value=''; fwLoadIpList(); fwLoadBans(); }
+  });
+}
+/* 导出数据（GET /api/export）：该接口属于 WAF 守护进程（默认 127.0.0.1:7080），
+   不在插件 s= 方法里，插件后端也没有转发方法，所以只能让浏览器直连守护进程。
+   默认面板仅监听本机、且宝塔面板常为 https 而守护进程是 http（混合内容拦截），
+   这两种情况浏览器连不上——必须给出可操作的说明，不能“点了没反应”。 */
+var fwExportBusy=false;
+function fwExportDone(msg){
+  fwExportBusy=false;
+  var btn=document.getElementById('fwExportBtn');
+  if(btn){ btn.disabled=false; btn.textContent='导出数据（JSON）'; }
+  var err=document.getElementById('fwExportErr');
+  if(err){
+    err.textContent = msg || '';
+    err.style.display = msg ? 'block' : 'none';
+  }
+  if(msg) bt_tools.msg('导出未开始，原因见下方红字说明', false);
+}
+function fwExport(){
+  if(fwExportBusy) return;
+  fwExportBusy=true;
+  var btn=document.getElementById('fwExportBtn');
+  if(btn){ btn.disabled=true; btn.textContent='正在导出…'; }
+  var err=document.getElementById('fwExportErr');
+  if(err){ err.style.display='none'; err.textContent=''; }
+  // 面板地址不在本地缓存里（用户直接从左侧菜单进来时可能未加载状态页），先问后端
+  fwSend('get_waf_info', {}, function(r){
+    var base=(r && r.url) ? String(r.url) : '';
+    if(!base){ fwExportDone('未能取到 WAF 网页端地址，请到「状态」页刷新后重试。'); return; }
+    // 地址来自插件后端（_panel_url()），仍然校验一次形状：
+    // 只允许 http(s)+主机(含可选端口) 前缀，避免一旦后端返回异常值就跳出 javascript:/data: 类目标。
+    if(!/^https?:\/\/[A-Za-z0-9._:\[\]-]+\/?$/.test(base)){
+      fwExportDone('WAF 网页端地址格式异常（'+base.replace(/[^\x20-\x7e]/g,'?')+'），已取消导出。');
+      return;
+    }
+    if(base.charAt(base.length-1) !== '/') base += '/';
+    var url = base + 'api/export';
+    var opened=false;
+    // no-cors 预检：只要能拿到（不可读的）响应，就说明浏览器可达守护进程；
+    // 连接被拒 / 混合内容拦截 会直接 reject —— 这两种恰好是默认配置下的常态。
+    fetch(url, {mode:'no-cors', cache:'no-store', credentials:'include'})
+      .then(function(){
+        opened=true;
+        fwExportDone('');
+        // 新标签页打开：后端自带 Content-Disposition，浏览器直接存文件，
+        // 前端不拼文件名；若守护进程未登录，401 的 JSON 只落在新标签页，不会顶掉插件界面。
+        // url 仅由上面校验过的 base + 固定路径 'api/export' 拼成，不接受用户输入或参数。
+        var a=document.createElement('a');
+        a.href=url; a.target='_blank'; a.rel='noopener noreferrer';
+        a.style.display='none';
+        document.body.appendChild(a); a.click(); a.remove();
+      })
+      .catch(function(e){
+        // 已经过预检（说明面板可达），这里再出错只可能是打开链接本身失败，
+        // 不能报成「连不上面板」误导用户。
+        if(opened){
+          fwExportDone('导出链接打开失败（'+((e&&e.message)||'未知错误')+'），请允许本站弹窗后重试。');
+          return;
+        }
+        fwExportDone('浏览器无法直连 WAF 网页端（'+base+'）：面板默认只监听 127.0.0.1，'
+          +'或宝塔面板是 https 而网页端是 http（混合内容被拦截）。'
+          +'可在网页端「设置 → 监听与安全」开启「允许远程访问」后重试'
+          +'（等效于把 /opt/frpwaf/data/frpwaf.json 的 http_addr 改为 0.0.0.0）；'
+          +'也可在服务器上直接导出：curl -s -b <网页端登录 Cookie> '+base+'api/export -o frpwaf-export.json');
+      });
   });
 }
 var fwCurListType='black';
@@ -1251,11 +1361,13 @@ var FW_POLICY_INT=['auto_ban_window','auto_ban_threshold','auto_ban_seconds','ra
   'auto_ban_ssh_window','auto_ban_ssh_threshold',
   'burst_window','proxy_cool_min_conns','proxy_cool_uniq_threshold','proxy_cool_single_pct','proxy_cool_seconds',
   'block_page_port'];
-var FW_POLICY_STR=['github_repo','block_page_redirect_ports'];
+var FW_POLICY_BOOL_EXTRA=['strict_addr'];
 function fwLoadPolicy(){
   fwSend('get_policy', {}, function(r){
     var c=(r&&r.data)||{};
     FW_POLICY_BOOL.forEach(function(k){ var e=document.getElementById('s_'+k); if(e) e.checked=!!c[k]; });
+    // 新增开关（后端老版本不返回时按约定默认值兜底）：strict_addr 默认关闭
+    FW_POLICY_BOOL_EXTRA.forEach(function(k){ var e=document.getElementById('s_'+k); if(e) e.checked=(c[k]===undefined?false:!!c[k]); });
     FW_POLICY_INT.forEach(function(k){ var e=document.getElementById('s_'+k); if(e) e.value=(c[k]===undefined?'':c[k]); });
     FW_POLICY_STR.forEach(function(k){ var e=document.getElementById('s_'+k); if(e) e.value=(c[k]===undefined?'':c[k]); });
   });
@@ -1263,6 +1375,8 @@ function fwLoadPolicy(){
 function fwSavePolicy(){
   var b={};
   FW_POLICY_BOOL.forEach(function(k){ var e=document.getElementById('s_'+k); if(e) b[k]=e.checked?1:0; });
+  // 本批新增开关按接口约定提交真正的布尔值（true/false），不传 1/0 或字符串 "true"
+  FW_POLICY_BOOL_EXTRA.forEach(function(k){ var e=document.getElementById('s_'+k); if(e) b[k]=!!e.checked; });
   FW_POLICY_INT.forEach(function(k){ var e=document.getElementById('s_'+k); if(e) b[k]=parseInt(e.value||'0',10)||0; });
   FW_POLICY_STR.forEach(function(k){
     // github_repo 的输入框在「关于」页（本页可能未打开过，值为空）；保存策略时跳过它，
@@ -1322,13 +1436,65 @@ function fwUpgradeCheck(){
 function fwUpgradeApply(){
   if(!confirm('确定从 GitHub 下载并升级？升级期间服务会重启，失败会自动回滚。')) return;
   var box=document.getElementById('fwUpgradeMsg');
-  if(box) box.textContent='升级中，请稍候…';
+  if(box) box.textContent='已提交升级任务，正在下载…';
   fwSend('upgrade_apply', {}, function(r){
-    var d=(r&&r.data)||{};
-    var msg=(r&&r.msg)||'';
-    if(box) box.textContent=msg;
-    bt_tools.msg(msg, !!(d.ok));
+    if(!(r&&r.status)){                       // 提交本身失败（已有任务/未配置仓库等）
+      var m0=(r&&r.msg)||'提交失败';
+      if(box) box.textContent=m0;
+      bt_tools.msg(m0, false); return;
+    }
+    // 后台已开始，轮询取进度：升级会重启服务，期间请求会失败，要容忍
+    fwPollJob('upgrade_status', box, {title:'升级',
+      okMsgs:{}, onDone:function(d){
+        fwSend('about', {}, function(){});   // 刷新版本号
+      }});
   });
+}
+/* 通用任务轮询：提交后靠它取进度。
+   onDone(data) 在任务结束时回调一次。tolerant=true 时请求失败不当作错误
+   （升级会重启守护进程/插件自身，中间必然有几个失败请求）。 */
+function fwPollJob(method, box, opt){
+  opt = opt || {};
+  var title = opt.title || '任务';
+  var started = Date.now();
+  var MAXMS = opt.maxMs || 10*60*1000;      // 10 分钟上限，避免死循环
+  var failStreak = 0;
+  function tick(){
+    if(Date.now() - started > MAXMS){
+      if(box) box.textContent = title + '超时（已等待超过 10 分钟），请刷新页面查看结果';
+      bt_tools.msg(title + '超时，请刷新页面查看结果', false);
+      return;
+    }
+    fwSend(method, {}, function(r){
+      var d=(r&&r.data)||{};
+      if(!(r&&r.status)){
+        // 容忍短暂失败（服务重启中），连续多次失败才报错
+        failStreak++;
+        if(failStreak >= 8){
+          if(box) box.textContent = (r&&r.msg) || (title + '状态读取失败');
+          bt_tools.msg((r&&r.msg)||(title+'状态读取失败'), false);
+          return;
+        }
+        setTimeout(tick, 2000); return;
+      }
+      failStreak = 0;
+      var waited = Math.round((Date.now()-started)/1000);
+      if(box){
+        var p = (d.percent===0||d.percent) ? (' '+d.percent+'%') : '';
+        box.textContent = (d.msg||(title+'进行中')) + p + '（已等待 '+waited+' 秒）';
+      }
+      if(d.done){
+        var ok = !!d.ok;
+        var msg = d.msg || (ok ? (title+'完成') : (d.error || title+'失败'));
+        if(box) box.textContent = msg;
+        bt_tools.msg(msg, ok);
+        if(opt.onDone) opt.onDone(d);
+        return;
+      }
+      setTimeout(tick, 1500);
+    });
+  }
+  setTimeout(tick, 800);
 }
 function fwLoadAdmin(){
   fwSend('get_admin', {}, function(r){
@@ -1406,6 +1572,8 @@ function fwAiLoad(){
     document.getElementById('ai_ssh_strict').checked = (d.ai_ssh_strict===undefined?true:!!d.ai_ssh_strict);
     document.getElementById('ai_ssh_permanent_suspicious').checked = (d.ai_ssh_permanent_suspicious===undefined?true:!!d.ai_ssh_permanent_suspicious);
     document.getElementById('ai_ban_seconds').value = d.ai_ban_seconds||1800;
+    // 允许 AI 接口指向内网/回环地址：后端不返回该字段（老版本）时按约定默认值 true 兜底
+    document.getElementById('ai_allow_private').checked = (d.ai_allow_private===undefined?true:!!d.ai_allow_private);
     document.getElementById('ai_timeout').value = d.ai_timeout||120;
     var st=document.getElementById('fwAiState');
     if(d.ai_enabled){ st.className='fw-badge on'; st.textContent='已启用'; }
@@ -1418,12 +1586,12 @@ function fwAiLoad(){
   fwAiLoadResults();
 }
 function fwAiForm(){
-  return {
+  var f={
     ai_enabled: document.getElementById('ai_enabled').checked,
     ai_protocol: document.getElementById('ai_protocol').value,
     ai_base_url: document.getElementById('ai_base_url').value,
-    ai_api_key: document.getElementById('ai_api_key').value,
     ai_model: document.getElementById('ai_model').value,
+    ai_allow_private: document.getElementById('ai_allow_private').checked,
     ai_interval: document.getElementById('ai_interval').value,
     ai_window: document.getElementById('ai_window').value,
     ai_min_conns: document.getElementById('ai_min_conns').value,
@@ -1436,6 +1604,13 @@ function fwAiForm(){
     ai_ban_seconds: document.getElementById('ai_ban_seconds').value,
     ai_timeout: document.getElementById('ai_timeout').value
   };
+  // 密钥框里显示的是掩码（后端不回显明文）：用户没改就**不提交该字段**，
+  // 而不是把掩码原样传回去（后端虽然会丢弃 ******，但从源头就不该传）。
+  // 用「全星号」判定而非硬编码长度，后端掩码格式变化也不会把掩码当密钥上传。
+  var kEl=document.getElementById('ai_api_key');
+  var kv=((kEl&&kEl.value)||'').trim();
+  if(kv && !/^\*+$/.test(kv)){ f.ai_api_key=kv; }
+  return f;
 }
 function fwAiSave(){
   fwSend('ai_save_config', fwAiForm(), function(r){
@@ -1444,7 +1619,12 @@ function fwAiSave(){
 }
 function fwAiTest(){
   fwSend('ai_test', fwAiForm(), function(r){
-    bt_tools.msg((r&&r.msg)||'完成', (r&&r.status));
+    if(!(r&&r.status)){                       // 校验阶段就失败（地址非法/未填密钥/已有任务）
+      bt_tools.msg((r&&r.msg)||'提交失败', false); return;
+    }
+    bt_tools.msg('已提交测试，正在调用模型…', true);
+    // 模型调用最长 120s，轮询取结果，避免请求被 Nginx 60s 截断
+    fwPollJob('ai_test_status', null, {title:'AI 测试'});
   });
 }
 var fwAiPollTimer=null;

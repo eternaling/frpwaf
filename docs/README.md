@@ -61,7 +61,7 @@ FRP WAF 通过 frp 的 `httpPlugins` 钩子（`NewUserConn`）对**访问 frps �
 
 | 能力 | 宝塔插件端（`index.html`） | 独立 Web 端（`web/index.html`） |
 |---|---|---|
-| 登录 | 继承宝塔面板登录态，无需单独登录 | 独立登录（默认 `admin`/`123456`） |
+| 登录 | 继承宝塔面板登录态，无需单独登录 | 独立登录（默认 `admin`/`123456`，**首次登录强制改密**） |
 | 概览 / 名单 / 连接日志 / 封禁 / 归属 / 代理统计 / 设置 | ✅ | ✅ |
 | 内核封禁（状态/同步） | ✅（「IP 名单 / 封禁」页内） | ✅（「内核封禁」页） |
 | AI 审查配置与结果 | ✅（「AI 审查」页，含配置） | ✅（「AI 审查」页：结果 + 立即审查；模型/密钥配置在插件端） |
@@ -72,6 +72,7 @@ FRP WAF 通过 frp 的 `httpPlugins` 钩子（`NewUserConn`）对**访问 frps �
 | frps 集成（注入回调） | ✅（「frps 集成」页） | ❌（**无**该 UI；用插件端） |
 | 服务控制（重启/停止） | ✅ | ✅（重启/停止，二次确认 + 审计） |
 | 网页端开关 / 改端口 | ✅ | ❌ |
+| 监听与安全（允许远程访问 / 回调端口 / 并发上限） | 仅安全提示（无开关） | ✅（「设置」页） |
 | 修改管理员账号 | ✅ | ✅ |
 
 > 2026-10 起放宽：Web 端已补齐 AI 审查（结果 + 立即审查）、内核封禁（状态 + 同步）、
@@ -90,8 +91,8 @@ FRP WAF 通过 frp 的 `httpPlugins` 钩子（`NewUserConn`）对**访问 frps �
 | 宝塔插件安装位置 | `/www/server/panel/plugin/frpwaf` |
 | 服务脚本 | `/etc/init.d/frpwaf` |
 | 运行时数据 | `/opt/frpwaf/data`（`frpwaf.db` / `frpwaf.json` / `frpwaf.log` / `frpwaf.pid`） |
-| 管理面板 | `http://<服务器IP>:7080/`（默认 `admin` / `123456`） |
-| frp 回调地址 | `http://127.0.0.1:7080/frp/handler` |
+| 管理面板 | `http://127.0.0.1:7080/`（**默认仅本机**；远程需开「允许远程访问」） |
+| frp 回调地址 | `http://127.0.0.1:7082/frp/handler`（回调专用监听；`7080` 仍兼容） |
 | 内核集合 | ipset `frpwaf_block` / `frpwaf_block6`；iptables 链 `FRPWAF_BLOCK` |
 | 代码规模 | `app/*.py` + `frpwaf_main.py` + 两个 `index.html` 合计约 **8000 行** |
 

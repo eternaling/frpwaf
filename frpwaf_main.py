@@ -130,6 +130,36 @@ def _app(modname):
         return importlib.import_module(_APP_PKG + "." + modname)
 
 
+# ---------------- 日志净化 ----------------
+# 插件端与 WAF 守护进程写同一个 data/frpwaf.log（「运行日志」页原样展示）。
+# 落进日志的字段里只要带一个 \n，就能凭空插入一整行看似可信的记录（例如伪造的
+# [审计] 行），取证链被污染。日志是安全产品的取证依据，故入口统一净化。
+# _CTRL_RE 与 _log_text 的规则必须与 app/daemon.py 的同名实现保持一致：
+# 两端写同一份日志，口径不同会让「哪一端能伪造日志」成为安全强度的短板。
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_LOG_FIELD_MAX = 64          # 不可信字段（远端返回 / 外部输入）落日志的截断长度
+
+
+def _log_text(v, maxlen=0):
+    """净化一段要进日志的文本：\r \n 转义成字面量，其它控制字符丢弃。
+
+    maxlen > 0 时按字符截断（不可信字段统一用 _LOG_FIELD_MAX）。
+    """
+    s = "" if v is None else str(v)
+    s = s.replace("\r", "\\r").replace("\n", "\\n")
+    s = _CTRL_RE.sub("", s)
+    if maxlen and len(s) > maxlen:
+        s = s[:maxlen] + "..."
+    return s
+
+
+def _to_bool(v):
+    """宽松布尔解析：字符串 "false"/"0"/"off" 判为 False（bool("false") 是 True）。"""
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "on", "yes")
+    return bool(v)
+
+
 class frpwaf_main:
 
     # ---------------- 内部工具 ----------------
@@ -156,10 +186,73 @@ class frpwaf_main:
         except Exception:
             return ""
 
-    def _write(self, path, data):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(data)
+    def _fsync_dir(self, d):
+        """best-effort 同步目录项：os.replace 的元数据也要落盘，防掉电后丢文件名。"""
+        if not d or os.name != "posix":
+            return
+        try:
+            fd = os.open(d, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _backup_file(self, path):
+        """把 path 备份为 path.bak.<ts> 并返回备份路径；文件不存在返回 ""。
+
+        复制失败直接抛异常——调用方必须据此放弃写入，
+        不能出现「备份没成功就把原文件改了」。同日同时同秒的重复备份用 pid 后缀避开。
+        """
+        if not os.path.exists(path):
+            return ""
+        bak = "%s.bak.%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
+        if os.path.exists(bak):
+            bak = "%s.%d" % (bak, os.getpid())
+        shutil.copy2(path, bak)
+        return bak
+
+    def _write(self, path, data, backup=False):
+        """原子写文件：同目录临时文件 -> fsync -> 保留原 mode -> os.replace。
+
+        直接 `open(path, "w")` 会先截断再写，断电/OOM/磁盘满会留下半截文件；
+        frps.toml 半截 = frps 起不来 = 全部隧道中断（fail-closed），必须原子替换。
+        backup=True 时先做 `.bak.<ts>` 备份，**备份失败直接抛异常**（绝不无备份动原文件）。
+        """
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        if backup:
+            self._backup_file(path)
+        try:
+            mode = os.stat(path).st_mode & 0o777
+        except OSError:
+            mode = 0o644
+        tmp = "%s.tmp.%d" % (path, os.getpid())
+        try:
+            # newline="" 关闭换行转换：配置/脚本按传入字节原样落盘（不让 CRLF 混进来）
+            with open(tmp, "w", encoding="utf-8", newline="") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.chmod(tmp, mode)
+            except OSError:
+                pass
+            os.replace(tmp, path)
+            self._fsync_dir(d)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
 
     def _waf_running(self):
         res = public.ExecShell("%s status" % WAF_INIT)
@@ -206,6 +299,39 @@ class frpwaf_main:
             pass
         return cfg
 
+    # ---------------- 机密字段掩码 ----------------
+    # 掩码值 / 键清单的唯一真源在 app/config.py（MASKED_VALUE / MASKED_KEYS），
+    # 这里只做 getattr 取值 + 兜底默认，**不复制一份硬编码清单**：两处各写一份
+    # 迟早漂移（新增机密键时漏掩 = 明文回显到浏览器）。
+    def _masked_keys(self):
+        """需要掩码的机密键（优先取 app/config.py 的定义）。"""
+        try:
+            return tuple(getattr(_app("config"), "MASKED_KEYS",
+                                 ("ai_api_key", "admin_password", "secret")))
+        except Exception:
+            return ("ai_api_key", "admin_password", "secret")
+
+    def _masked_value(self):
+        """回显用的掩码值（优先取 app/config.py 的定义）。"""
+        try:
+            return str(getattr(_app("config"), "MASKED_VALUE", "******"))
+        except Exception:
+            return "******"
+
+    def _strip_masked(self, patch):
+        """丢弃等于回显掩码的机密字段。
+
+        「读配置 → 改一项 → 整体回写」的客户端会把 GET 拿到的 ****** 原样提交，
+        若照写就把真实密钥覆盖成 ******（AI 审查从此静默失效，且用户看不出异常）。
+        """
+        if not isinstance(patch, dict):
+            return patch
+        mv = self._masked_value()
+        for k in self._masked_keys():
+            if k in patch and str(patch[k]) == mv:
+                patch.pop(k, None)
+        return patch
+
     def _set_cfg(self, patch):
         """合并写入配置（patch 语义）。
 
@@ -222,6 +348,9 @@ class frpwaf_main:
         显式关闭的开关会被迁移逻辑重新打开。
         """
         p = os.path.join(WAF_HOME, "data", "frpwaf.json")
+        # 掩码回写防护（所有写配置路径的总入口）：GET 回显的 ****** 不得写回。
+        # 放在 _set_cfg 而不是各个接口里，是为了新增接口时不会漏掉这层保护。
+        patch = self._strip_masked(patch)
         cfg_mod = None
         try:
             cfg_mod = _app("config")
@@ -268,9 +397,35 @@ class frpwaf_main:
         return True
 
     # ---------------- 状态 / 安装 ----------------
+    def _password_changed(self, cfg=None):
+        """是否已改过默认口令（供面板安全提示使用）。
+
+        优先读配置键 password_changed（新版 auth 在改密码时写入）；
+        旧配置无此键时，按「口令是否仍是 DEFAULTS 默认值」推断，
+        避免两个方向的误判：已改过却仍弹告警，或仍是出厂口令却不再提示。
+        默认口令不在这里硬编码，唯一真源是 config.DEFAULTS（避免两处口径漂移）。
+        """
+        cfg = self._cfg() if cfg is None else cfg
+        v = cfg.get("password_changed")
+        if v is not None:
+            return bool(v)
+        pwd = str(cfg.get("admin_password") or "")
+        try:
+            default_pwd = str(_app("config").DEFAULTS.get("admin_password") or "")
+        except Exception:
+            default_pwd = ""
+        if not default_pwd:
+            # 拿不到出厂值就无从比较：已设置口令时按「已改过」处理，
+            # 不弹无根据的告警（宁少报噪音，也不误导用户）
+            return bool(pwd)
+        return bool(pwd) and pwd != default_pwd
+
     def get_waf_info(self, get=None):
         running = self._waf_running()
-        cfg = self._cfg()
+        # 用 _cfg_effective() 而非 _cfg()：存量机器磁盘配置缺新键时，_cfg() 读不到
+        # 默认值（历史 bug：分端口隔离因缺键回退到错误端口而失效）。
+        cfg = self._cfg_effective()
+        mv = self._masked_value()
         return {
             "status": running,
             "install_status": 1 if os.path.exists(WAF_INIT) else 0,
@@ -282,7 +437,12 @@ class frpwaf_main:
             "admin_user": cfg.get("admin_user", "admin"),
             # 密码不回显明文：仅返回掩码，展示端据此提示「已设置」；
             # 修改密码走 change_admin_pwd（需校验原密码）。
-            "admin_password": "******" if cfg.get("admin_password") else "",
+            "admin_password": mv if cfg.get("admin_password") else "",
+            # 面板安全提示：是否仍用默认口令（默认值判断带回退，见 _password_changed）
+            "password_changed": self._password_changed(cfg),
+            # 新增开关：回传实际生效值供插件页面渲染开关状态
+            "strict_addr": bool(cfg.get("strict_addr", False)),
+            "ai_allow_private": self._ai_allow_private(cfg),
         }
 
     def install_waf(self, get=None):
@@ -374,9 +534,12 @@ class frpwaf_main:
                 raise RuntimeError("WAF 停止失败")
             # 移除内核级封禁规则（ipset + iptables）
             try:
-                _app("firewall").teardown()
+                fw = _app("firewall")
+                self._fw_invalidate(fw)
+                fw.teardown()
             except Exception:
                 pass
+            self._fw_invalidate()
             if "CentOS" in public.get_os_version() or "Red" in public.get_os_version():
                 public.ExecShell("chkconfig --del frpwaf")
             else:
@@ -394,11 +557,16 @@ class frpwaf_main:
 
     # ---------------- 服务控制 ----------------
     def _audit(self, msg):
-        """操作审计：向 data/frpwaf.log 追加 [审计] 行（与 daemon 同一文件，供「运行日志」页查看）。"""
+        """操作审计：向 data/frpwaf.log 追加 [审计] 行（与 daemon 同一文件，供「运行日志」页查看）。
+
+        入口统一净化（\r \n 转义成字面量、其它控制字符丢弃），与 app/daemon.py
+        的 _log 行为一致；时间戳前缀照常生成，正常日志格式不变。
+        """
         try:
             p = os.path.join(WAF_HOME, "data", "frpwaf.log")
             with open(p, "a", encoding="utf-8") as f:
-                f.write("[%s] [审计] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+                f.write("[%s] [审计] %s\n"
+                        % (time.strftime("%Y-%m-%d %H:%M:%S"), _log_text(msg)))
         except Exception:
             pass
 
@@ -468,11 +636,58 @@ class frpwaf_main:
             except Exception:
                 pass
 
-    def _set_frps_plugin_port(self, port):
-        """把 frps.toml 中 name="frpwaf" 的 [[httpPlugins]] 块 addr 改为 127.0.0.1:port。"""
+    def _frp_handler_endpoint(self):
+        """frps 回调 WAF 的端点 `(addr, port)`，即 httpPlugins 的 addr。
+
+        新版：回调**独立监听**，取 `frp_handler_addr` / `frp_handler_port`，
+        与面板端口（http_addr/http_port）解耦——面板端口只服务管理面，
+        不再因为“回调跟着面板端口”而把面板面暴露给 frps 回调路径。
+        旧配置兼容：两个键都不存在时回退到 `http_addr` / `http_port`；
+        旧版注入值恒为 `127.0.0.1:http_port`，所以通配地址（0.0.0.0 / ::）
+        统一折算为 127.0.0.1，保证老机器升级后 frps.toml 语义不变。
+
+        返回的 addr 恒为可用的回调目标（不会是 0.0.0.0/::）。
+        """
+        # 必须用 _cfg_effective()：存量机器的磁盘配置里没有 frp_handler_port，
+        # 用 _cfg() 读原始 JSON 会拿不到默认值，静默回退成 http_port，
+        # 导致 frps 仍回调面板端口、P0-3 的分端口隔离等于没生效。
+        cfg = self._cfg_effective()
+
+        def _port(*keys):
+            for k in keys:
+                v = cfg.get(k)
+                if v is None or str(v).strip() == "":
+                    continue
+                try:
+                    p = int(str(v).strip())
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= p <= 65535:
+                    return p
+            return WAF_PORT
+
+        port = _port("frp_handler_port", "http_port")
+        addr = str(cfg.get("frp_handler_addr") or "").strip()
+        if not addr:
+            # 兼容旧配置：没有独立回调地址时，回调 = 面板地址
+            addr = str(cfg.get("http_addr") or "").strip()
+        if addr in ("", "0.0.0.0", "::", "[::]"):
+            # 通配地址对「本机回调」没有意义：frps 只会连 127.0.0.1
+            addr = "127.0.0.1"
+        return addr, port
+
+    def _set_frps_plugin_addr(self):
+        """把 frps.toml 中 name="frpwaf" 的 [[httpPlugins]] 块 addr 校正为当前回调端点。
+
+        端点由 _frp_handler_endpoint() 决定（frp_handler_addr:frp_handler_port，
+        旧配置回退 http_addr:http_port），所以面板端口变更不再影响回调地址。
+        幂等：已经是目标值时不重写（也就不会白白产生 .bak 备份）。
+        """
         content = self._read(FRPS_TOML)
         if "frpwaf" not in content:
             return False
+        addr, port = self._frp_handler_endpoint()
+        want = 'addr = "%s:%d"' % (addr, int(port))
         segments, cur, cur_is_header = [], [], None
         for ln in content.splitlines():
             s = ln.strip()
@@ -488,8 +703,11 @@ class frpwaf_main:
                 nb = []
                 for ln in body:
                     if re.match(r"\s*addr\s*=", ln):
-                        nb.append('addr = "127.0.0.1:%d"' % int(port))
-                        changed = True
+                        if ln.strip() != want:
+                            nb.append(want)
+                            changed = True
+                        else:
+                            nb.append(ln)
                     else:
                         nb.append(ln)
                 segments[i] = (header, nb)
@@ -497,11 +715,20 @@ class frpwaf_main:
             out = []
             for _, body in segments:
                 out.extend(body)
-            self._write(FRPS_TOML, "\n".join(out).strip() + "\n")
+            # 备份失败会抛异常给调用方（set_web_port 会返回错误），不无备份覆盖
+            self._write(FRPS_TOML, "\n".join(out).strip() + "\n", backup=True)
         return changed
 
+    def _set_frps_plugin_port(self, port=None):
+        """已废弃的同名入口：回调端点改由配置决定，参数 port 不再使用。
+
+        保留只是为了不打断任何旧调用方（插件端只在本文件内调用）；
+        新代码请直接用 _set_frps_plugin_addr()。
+        """
+        return self._set_frps_plugin_addr()
+
     def set_web_port(self, get=None):
-        """修改网页端监听端口：同步更新配置与 frps.toml 回调地址并重启 WAF / frps。"""
+        """修改网页端监听端口：只影响管理面，回调地址改由 frp_handler_* 决定。"""
         try:
             import time
             try:
@@ -529,14 +756,11 @@ class frpwaf_main:
 
             # 1) 写配置（守护进程重启后绑定新端口）
             self._set_cfg({"http_port": port})
-            # 2) 同步 frps.toml 回调地址
+            # 2) 校正 frps.toml 回调 addr：回调端点已与面板端口解耦（frp_handler_*），
+            #    这里只是把可能过期的 addr 校回配置口径——旧配置仍回退到 http_port，
+            #    所以老机器改面板端口后 addr 依旧跟着变（行为不变）。
             if had_plugin:
-                try:
-                    public.ExecShell("cp -a %s %s.bak.$(date +%%Y%%m%%d-%%H%%M%%S)"
-                                     % (FRPS_TOML, FRPS_TOML))
-                except Exception:
-                    pass
-                self._set_frps_plugin_port(port)
+                self._set_frps_plugin_addr()
             # 3) 重启 WAF 以绑定新端口
             public.ExecShell("%s restart" % WAF_INIT)
             host = (cfg.get("http_addr") or "127.0.0.1")
@@ -552,7 +776,7 @@ class frpwaf_main:
                 # 回滚到原端口，尽量恢复服务
                 self._set_cfg({"http_port": old})
                 if had_plugin:
-                    self._set_frps_plugin_port(old)
+                    self._set_frps_plugin_addr()
                 public.ExecShell("%s restart" % WAF_INIT)
                 if had_plugin:
                     public.ExecShell("/etc/init.d/frps restart")
@@ -585,16 +809,18 @@ class frpwaf_main:
                 return public.returnMsg(False, "未找到 frps.toml")
             if "frpwaf" in content:
                 return public.returnMsg(True, "已配置，无需重复注入")
-            # 备份
-            public.ExecShell("cp -a %s %s.bak.$(date +%%Y%%m%%d-%%H%%M%%S)" % (FRPS_TOML, FRPS_TOML))
+            # 回调端点：优先 frp_handler_addr:frp_handler_port（回调独立监听），
+            # 旧配置无该键时回退 http_addr:http_port（见 _frp_handler_endpoint）
+            addr, port = self._frp_handler_endpoint()
             block = (
                 "\n[[httpPlugins]]\n"
                 'name = "frpwaf"\n'
-                'addr = "127.0.0.1:%d"\n'
+                'addr = "%s:%d"\n'
                 'path = "/frp/handler"\n'
                 'ops = ["NewUserConn"]\n'
-            ) % int(self._cfg().get("http_port", WAF_PORT))
-            self._write(FRPS_TOML, content.rstrip() + "\n" + block)
+            ) % (addr, int(port))
+            # 备份 + 原子替换（备份失败抛异常 -> 走下方 except，原文件不动）
+            self._write(FRPS_TOML, content.rstrip() + "\n" + block, backup=True)
             public.ExecShell("/etc/init.d/frps restart")
             return public.returnMsg(True, "已注入 frp 插件配置并重启 frps")
         except Exception:
@@ -758,8 +984,34 @@ class frpwaf_main:
         except Exception:
             return public.returnMsg(False, "保存失败：" + traceback.format_exc()[-300:])
 
+    def _toml_verify_path(self, frp, kind, cand):
+        """用 frps/frpc `verify -c <cand>` 校验候选文件，返回错误串（通过/无法校验返回空）。
+
+        不改 app/frp.py：它的 verify(kind) 只认正式路径，这里复用它导出的助手定位
+        二进制与执行命令，判定口径与 frp.verify 完全一致。
+        """
+        b = ""
+        try:
+            b = str(frp._bin(kind) or "")
+        except Exception:
+            b = ""
+        if not b or not os.path.exists(b):
+            return ""     # 二进制未安装：无法校验（与 frp.verify 一致，不阻塞保存）
+        try:
+            rc, out, err = frp._run([b, "verify", "-c", cand], timeout=15)
+        except Exception as e:
+            return str(e)[:200]
+        if rc == 0:
+            return ""
+        return (err or out or "verify failed").strip()[:300]
+
     def frp_save_raw(self, get=None):
-        """按原文保存配置（编辑配置文件）。写前备份、写后校验。"""
+        """按原文保存配置：写候选文件 -> frps verify -> 通过才 os.replace 落盘。
+
+        与 app/frp.py:save_config 行为对齐：校验不过就**不落盘**（以前返回「已保存，
+        请检查」把坏配置留在盘上，用户以为存好了，等下次 frps 重启才炸）；
+        原文件全程不动，备份失败也直接放弃保存。
+        """
         try:
             frp = _app("frp")
             kind = self._kind(get)
@@ -771,15 +1023,39 @@ class frpwaf_main:
             if not text.strip():
                 return public.returnMsg(False, "内容为空")
             path = frp._toml_path(kind)
+            if not os.path.exists(path):
+                return public.returnMsg(False, "配置文件不存在：%s" % path)
             terr = frp.check_toml(text)   # 语法校验（纯标准库，不依赖第三方 toml）
             if terr:
                 return public.returnMsg(False, "TOML 语法错误：%s" % terr)
-            public.ExecShell("cp -a %s %s.bak.$(date +%%Y%%m%%d-%%H%%M%%S)" % (path, path))
-            self._write(path, text)
-            verr = frp.verify(kind)
-            if verr:
-                return public.returnMsg(False, "配置校验未通过（已保存，请检查）：%s" % verr)
-            return public.returnMsg(True, "已保存")
+            # 备份成功才动原文件
+            try:
+                self._backup_file(path)
+            except Exception as e:
+                return public.returnMsg(False, "备份失败，已放弃保存（原文件未改动）：%s"
+                                        % str(e)[:200])
+            # 候选文件必须与正式文件同目录：frp 对配置里的相对路径按配置文件位置解析，
+            # 放到 /tmp 校验会得出与线上不同的结果（假失败）。
+            cand = "%s.verify.%d" % (path, os.getpid())
+            try:
+                self._write(cand, text)
+                try:
+                    os.chmod(cand, os.stat(path).st_mode & 0o777)
+                except OSError:
+                    pass
+                verr = self._toml_verify_path(frp, kind, cand)
+                if verr:
+                    return public.returnMsg(
+                        False, "配置校验未通过，已放弃保存（原文件未改动）：%s" % verr)
+                os.replace(cand, path)
+                self._fsync_dir(os.path.dirname(path))
+            finally:
+                if os.path.exists(cand):
+                    try:
+                        os.remove(cand)
+                    except OSError:
+                        pass
+            return public.returnMsg(True, "已保存并通过校验")
         except Exception:
             return public.returnMsg(False, "保存失败：" + traceback.format_exc()[-200:])
 
@@ -980,7 +1256,7 @@ class frpwaf_main:
         try:
             store = _app("store")
             geo = _app("geo")
-            rows = store._query(
+            rows = store._query_ro(
                 "SELECT ip, COUNT(*) AS n FROM conn_log GROUP BY ip ORDER BY n DESC LIMIT ?",
                 (limit,),
             )
@@ -1006,13 +1282,64 @@ class frpwaf_main:
                "ai_auto_ban", "ai_cdn_guard", "ai_ban_seconds", "ai_suspicious_ban",
                "ai_ssh_strict", "ai_ssh_permanent_suspicious", "ai_timeout"]
 
+    def _ai_allow_private(self, cfg=None):
+        """ai_allow_private（默认 True）：AI 接口是否允许指向私有/回环地址。
+
+        AI 网关大多是内网自建（http://127.0.0.1:3000 这类），故默认放行；
+        关闭后只允许公网地址（本机可用它把内网访问面收回）。
+        """
+        cfg = self._cfg_effective() if cfg is None else cfg
+        return _to_bool(cfg.get("ai_allow_private", True))
+
+    def _ai_url_guard(self, url, allow_private=True):
+        """校验 AI 接口地址（SSRF 防护），返回 (ok, err)。
+
+        **实现直接复用 app/daemon.py 的 ai_url_guard**：它是纯函数、不依赖守护
+        进程实例状态，规则放在 daemon 侧做唯一真源，插件端再复制一份必然会与
+        daemon 漂移（评审 P1-7）。面板进程以 root 运行，ai_test 把表单地址直接
+        交给 urllib，不校验就等于「面板用户可让 root 访问任意地址」：file:// 读
+        本机文件、169.254.169.254 读云元数据、内网管理口探测。
+
+        部署里的 app/ 版本较旧（没有该校验函数）时**拒连**而不是放行：宁可提示
+        用户先更新 WAF 内置代码，也不能静默退化成「不校验就发请求」（fail-closed）。
+        """
+        try:
+            fn = getattr(_app("daemon"), "ai_url_guard", None)
+        except Exception:
+            fn = None
+        if not callable(fn):
+            return False, ("当前 WAF 内置代码版本过旧，缺少接口地址安全校验，"
+                           "请先在插件页重新「安装 / 更新」WAF 后再试")
+        try:
+            return fn(url, allow_private)
+        except Exception:
+            return False, "接口地址校验异常，已拒绝"
+
+    def _ai_err_text(self, res):
+        """把 AI 调用错误转成可回显前端的摘要：不含响应体。
+
+        直接回显 str(res) 会把内网/元数据服务的响应体带回面板——SSRF 即使被
+        拦在「访问」这一步，错误信息也能被当成读数据的通道。复用 daemon 的
+        _safe_ai_error（缺失时退化为取首行 + 转义 + 截断）。
+        """
+        try:
+            fn = getattr(_app("daemon"), "_safe_ai_error", None)
+            if callable(fn):
+                return fn(res)
+        except Exception:
+            pass
+        return (_log_text(str(res or "").strip().split("\n", 1)[0], 160)
+                or "未知错误（详见运行日志）")
+
     def ai_get_config(self, get=None):
         cfg = self._cfg()
+        masked = self._masked_keys()
+        mv = self._masked_value()
         data = {}
         for k in self.AI_KEYS:
             v = cfg.get(k)
-            if k == "ai_api_key" and v:
-                v = "******"  # 不回显密钥
+            if k in masked and v:
+                v = mv      # 机密键一律只回显掩码（当前即 ai_api_key）
             data[k] = v
         data["ai_last_run"] = cfg.get("ai_last_run", 0)
         data["ai_last_result"] = cfg.get("ai_last_result", "")
@@ -1026,24 +1353,31 @@ class frpwaf_main:
     def ai_save_config(self, get=None):
         try:
             patch = {}
+            masked = self._masked_keys()
             for k in self.AI_KEYS:
                 if not hasattr(get, k):
                     continue
                 v = getattr(get, k)
                 if k in ("ai_enabled", "ai_auto_ban", "ai_cdn_guard", "ai_suspicious_ban",
                          "ai_ssh_strict", "ai_ssh_permanent_suspicious"):
-                    patch[k] = str(v).lower() in ("1", "true", "on", "yes")
+                    patch[k] = _to_bool(v)
                 elif k in ("ai_interval", "ai_window", "ai_min_conns", "ai_max_ips",
                            "ai_ban_seconds", "ai_timeout"):
                     try:
                         patch[k] = int(v)
                     except (TypeError, ValueError):
                         pass
-                elif k == "ai_api_key":
-                    if v and v != "******":   # 未修改则不覆盖
+                elif k in masked:
+                    # 机密键：先原样收集，末尾由 _strip_masked 统一按掩码丢弃。
+                    # 空值不写入（保持旧行为：留空 = 不修改）。
+                    if v and str(v).strip():
                         patch[k] = str(v).strip()
                 else:
                     patch[k] = str(v).strip()
+            # 新增开关：AI 页可能随表单一并提交这两个键（宽松布尔解析）
+            for _k in ("strict_addr", "ai_allow_private"):
+                if hasattr(get, _k):
+                    patch[_k] = _to_bool(getattr(get, _k))
             # 约束
             if patch.get("ai_interval", 300) < 60:
                 patch["ai_interval"] = 60
@@ -1051,30 +1385,79 @@ class frpwaf_main:
                 patch["ai_window"] = 30
             if patch.get("ai_protocol") not in ("openai", "anthropic"):
                 patch["ai_protocol"] = "openai"
+            # 掩码回写防护已下沉到 _set_cfg（所有写配置路径的总入口）
+            # SSRF 防护：地址变更即校验。插件端直接写配置文件，绕过了 daemon 的
+            # /api/config 校验，不在这里拦就是一条完整的绕过路径。
+            if patch.get("ai_base_url"):
+                ok_url, err = self._ai_url_guard(
+                    patch["ai_base_url"],
+                    self._ai_allow_private(dict(self._cfg_effective(), **patch)))
+                if not ok_url:
+                    self._audit("插件端 AI 接口地址被拒（SSRF 防护）：%s -> %s"
+                                % (_log_text(patch["ai_base_url"], _LOG_FIELD_MAX), err))
+                    return public.returnMsg(False, "AI 接口地址不可用：" + err)
             self._set_cfg(patch)
             return public.returnMsg(True, "AI 配置已保存")
         except Exception:
             return public.returnMsg(False, "保存失败：" + traceback.format_exc()[-200:])
 
     def ai_test(self, get=None):
-        """测试 AI 连接（可用表单值覆盖已保存配置）。"""
+        """测试 AI 连接（可用表单值覆盖已保存配置）。
+
+        发请求前必须过 SSRF 校验：本方法以 root 直接 urlopen 表单里的地址。
+        """
         try:
             ai = _app("ai")
             cfg = self._cfg()
+            masked = self._masked_keys()
+            mv = self._masked_value()
             tmp = {k: cfg.get(k) for k in self.AI_KEYS}
             for k in ("ai_protocol", "ai_base_url", "ai_api_key", "ai_model"):
                 v = getattr(get, k, None)
-                if v and str(v).strip() and str(v) != "******":
-                    tmp[k] = str(v).strip()
+                s = "" if v is None else str(v).strip()
+                if not s:
+                    continue
+                # 掩码值 = 「未修改」：不拿它去测（否则测的是一串星号）
+                if k in masked and s == mv:
+                    continue
+                tmp[k] = s
             if not tmp.get("ai_base_url") or not tmp.get("ai_api_key"):
                 return public.returnMsg(False, "请先填写接口地址与密钥")
-            ok, res = ai.call_model(tmp, [{"ip": "8.8.8.8", "geo": "美国", "conns": 1,
-                                           "rejected": 0, "proxies": "test"}])
-            if ok:
-                return public.returnMsg(True, "连接成功，模型返回正常")
-            return public.returnMsg(False, "连接失败：" + str(res)[:300])
+            ok_url, err = self._ai_url_guard(tmp["ai_base_url"],
+                                             self._ai_allow_private(self._cfg_effective()))
+            if not ok_url:
+                self._audit("插件端 AI 接口地址被拒（SSRF 防护）：%s -> %s"
+                            % (_log_text(tmp["ai_base_url"], _LOG_FIELD_MAX), err))
+                return public.returnMsg(False, "AI 接口地址不可用：" + err)
+            # 模型调用最长 120s，放在请求里会被 Nginx 60s 超时截断（用户看到
+            # 「失败」但模型其实回过）。校验部分留在请求内（快、且要立即报错），
+            # 只把 call_model 扔到后台，前端轮询 ai_test_status 取结果。
+            job = _app("job")
+            payload = [{"ip": "8.8.8.8", "geo": "美国", "conns": 1,
+                        "rejected": 0, "proxies": "test"}]
+
+            def _worker(rep):
+                rep(percent=10, msg="正在调用模型…")
+                _ok, _res = ai.call_model(tmp, payload)
+                rep(percent=100, msg="完成")
+                if _ok:
+                    return {"ok": True, "msg": "连接成功，模型返回正常"}
+                return {"ok": False,
+                        "msg": "连接失败：" + self._ai_err_text(_res)}
+
+            _ok, _msg, st = job.start("ai_test", _worker, msg="已提交测试")
+            if not _ok:
+                return public.returnMsg(False, _msg)
+            return {"status": True, "data": st, "msg": "已提交测试任务"}
         except Exception:
             return public.returnMsg(False, "测试失败：" + traceback.format_exc()[-200:])
+
+    def ai_test_status(self, get=None):
+        """读回 AI 连接测试状态（供插件页面轮询）。"""
+        try:
+            return {"status": True, "data": _app("job").status("ai_test")}
+        except Exception:
+            return {"status": False, "msg": "读取测试状态失败"}
 
     def ai_run_now(self, get=None):
         """立即执行一次审查（异步触发，立即返回）。
@@ -1149,16 +1532,48 @@ class frpwaf_main:
         except Exception:
             return ""
 
+    def _fw_invalidate(self, fw=None):
+        """让 firewall 模块丢掉进程内的内核视图记忆，强制下次重新对账。
+
+        firewall 模块会把「当前内核规则/集合成员」记忆在进程内（避免每次同步都 fork
+        ipset/iptables）。插件进程和守护进程各自持有一份，插件端改完名单立刻同步后，
+        守护进程那份可能已过期（最长 600s），仅影响内核层视图而不会丢数据，
+        但会让「刚解封的 IP 又被旧记忆写回」。所以每次插件端触发内核同步前后
+        都 invalidate 一次，消掉双进程记忆错位的窗口。
+
+        invalidate() 在旧版 firewall 模块上不存在，用 getattr 兼容，不引入硬依赖。
+        """
+        try:
+            mod = fw if fw is not None else _app("firewall")
+        except Exception:
+            return
+        fn = getattr(mod, "invalidate", None)
+        if not callable(fn):
+            return
+        try:
+            fn()
+        except Exception:
+            pass
+
     def _fw_sync(self):
         """把黑名单/封禁同步到内核（失败静默）。
 
         sync_from_store() 内部按 fw_sync_enabled / block_page_enabled 决定
         DROP（静默丢包）、REDIRECT（展示拦截页）或清理，故统一调用它。
+        同步前后各 invalidate 一次：同步前拿最新内核视图，同步后让另一进程
+        （守护进程）的记忆失效，下次它自己重新对账。
         """
         try:
-            _app("firewall").sync_from_store()
+            fw = _app("firewall")
+        except Exception:
+            return
+        self._fw_invalidate(fw)
+        try:
+            fw.sync_from_store()
         except Exception:
             pass
+        finally:
+            self._fw_invalidate(fw)
 
     def kernban_status(self, get=None):
         """内核级封禁（ipset+iptables）状态。"""
@@ -1175,7 +1590,9 @@ class frpwaf_main:
         try:
             self._audit("插件端手动同步内核封禁")
             fw = _app("firewall")
+            self._fw_invalidate(fw)
             ok = fw.sync_from_store()
+            self._fw_invalidate(fw)
             st = fw.status()
             if ok:
                 return public.returnMsg(True, "已同步到内核防火墙")
@@ -1312,6 +1729,8 @@ class frpwaf_main:
             st.update({
                 "http_addr": cfg.get("http_addr", "0.0.0.0"),
                 "http_port": cfg.get("http_port", WAF_PORT),
+                # 是否仍用默认口令：面板安全提示据真实状态渲染（而非靠 http_addr 猜）
+                "password_changed": self._password_changed(cfg),
                 "blacklist_enabled": bool(cfg.get("blacklist_enabled", True)),
                 "whitelist_enabled": bool(cfg.get("whitelist_enabled", False)),
                 "auto_ban_enabled": bool(cfg.get("auto_ban_enabled", False)),
@@ -1321,6 +1740,9 @@ class frpwaf_main:
                 "rate_limit_enabled": bool(cfg.get("rate_limit_enabled", False)),
                 "proxy_cool_enabled": bool(cfg.get("proxy_cool_enabled", False)),
                 "ai_enabled": bool(cfg.get("ai_enabled", False)),
+                # 新增开关：概览页也要能看到当前实际生效值
+                "strict_addr": bool(cfg.get("strict_addr", False)),
+                "ai_allow_private": self._ai_allow_private(cfg),
             })
             return {"status": True, "data": st}
         except Exception:
@@ -1574,7 +1996,14 @@ class frpwaf_main:
                    "auto_ban_cc_enabled", "auto_ban_scan_enabled", "auto_ban_ssh_enabled",
                    "proxy_cool_enabled",
                    "block_page_enabled", "block_page_404_enabled",
-                   "block_page_ban_enabled", "block_page_risk_enabled"]
+                   "block_page_ban_enabled", "block_page_risk_enabled",
+                   # 地址解析失败时拒连（fail-closed）；默认 False = 保持现状放行
+                   "strict_addr",
+                   # AI 接口是否允许私有/回环地址；默认 True（AI 网关常是内网自建）
+                   "ai_allow_private"]
+    # 默认值为 True 的开关：cfg 缺键时必须回显 true，不能笼统按 False 处理
+    # （否则存量配置升级后设置页会把「实际允许」显示成「已禁止」）。
+    POLICY_BOOL_DEFAULT = {"ai_allow_private": True}
     POLICY_INT = ["auto_ban_window", "auto_ban_threshold", "auto_ban_seconds",
                   "rate_limit_per_sec", "log_max_rows",
                   "auto_ban_cc_window", "auto_ban_cc_threshold", "auto_ban_cc_seconds",
@@ -1590,7 +2019,8 @@ class frpwaf_main:
         cfg = self._cfg_effective()
         data = {}
         for k in self.POLICY_BOOL:
-            data[k] = bool(cfg.get(k, False))
+            # 宽松布尔 + 逐键默认值："false" 字符串不会误显为开，缺键也不会误显为关
+            data[k] = _to_bool(cfg.get(k, self.POLICY_BOOL_DEFAULT.get(k, False)))
         for k in self.POLICY_INT:
             data[k] = cfg.get(k, 0)
         for k in self.POLICY_STR:
@@ -1602,7 +2032,7 @@ class frpwaf_main:
             patch = {}
             for k in self.POLICY_BOOL:
                 if hasattr(get, k):
-                    patch[k] = str(getattr(get, k)).lower() in ("1", "true", "on", "yes")
+                    patch[k] = _to_bool(getattr(get, k))
             for k in self.POLICY_INT:
                 if hasattr(get, k):
                     try:
@@ -1645,7 +2075,7 @@ class frpwaf_main:
 
     # ---------------- 静态拦截页 / GitHub 在线升级 / 关于 ----------------
     def _upgrade_repo(self, get=None):
-        """升级仓库：请求参数 repo 优先，否则取配置 github_repo。"""
+        """升级仓库：请求参数 repo 优先，否则取配置 github_repo（仅用于只读的「检查更新」）。"""
         repo = ""
         try:
             repo = (get.repo or "").strip()
@@ -1654,6 +2084,13 @@ class frpwaf_main:
         if not repo:
             repo = str(self._cfg().get("github_repo") or "").strip()
         return repo
+
+    def _cfg_repo(self):
+        """升级仓库（写操作口径）：只认配置 github_repo，请求参数不得决定覆盖对象。"""
+        try:
+            return str(self._cfg().get("github_repo") or "").strip()
+        except Exception:
+            return ""
 
     def upgrade_check(self, get=None):
         """检查 GitHub 更新（无网/无仓库返回中文错误，不抛异常）。"""
@@ -1665,14 +2102,58 @@ class frpwaf_main:
             return {"status": False, "msg": "检查更新失败：" + traceback.format_exc()[-200:]}
 
     def upgrade_apply(self, get=None):
-        """执行 GitHub 在线升级（检查→下载→备份→覆盖→重启→失败回滚）。"""
+        """提交 GitHub 在线升级（异步：立即返回 job_id，前端轮询进度）。
+
+        为什么不在请求里同步跑：下载 tarball 最长 60s + 解包 + 覆盖几百个文件，
+        而宝塔 Nginx 默认 60s 超时 —— 用户会看到「失败」但后台其实已升级成功，
+        然后反复点击。改成提交后台任务后，前端轮询 upgrade_status 取进度。
+
+        仓库地址**只取自配置**：请求参数 repo 不再能指定覆盖来源（否则等于把
+        「以 root 覆盖 /opt/frpwaf」的控制权交给一个可伪造的请求字段）。
+        """
         try:
-            self._audit("插件端触发 GitHub 在线升级")
-            res = _app("upgrade").apply(self._upgrade_repo(get))
-            return {"status": bool(res.get("ok")), "data": res,
-                    "msg": res.get("error") or res.get("msg") or "升级完成"}
+            repo = self._cfg_repo()
+            job = _app("job")
+
+            def _worker(rep):
+                rep(percent=5, msg="开始升级")
+                # 阶段进度（检查/下载/校验/解包/结构校验/备份/覆盖/重启）由
+                # upgrade.apply() 通过同一个回调上报，插件端轮询即可看到中间态
+                res = _app("upgrade").apply(repo, progress=rep)
+                # 结果字段来自远端仓库返回（不可信）：转义 + 截断后再落日志
+                self._audit("插件端在线升级结果：%s -> %s，包 %s，sha256 %s，%s"
+                            % (_log_text(res.get("from") or "-", _LOG_FIELD_MAX),
+                               _log_text(res.get("to") or "-", _LOG_FIELD_MAX),
+                               _log_text(res.get("pkg") or "-", _LOG_FIELD_MAX),
+                               _log_text(res.get("sha256") or "-", _LOG_FIELD_MAX),
+                               _log_text(res.get("msg") or res.get("error") or "未知",
+                                         _LOG_FIELD_MAX)))
+                rep(percent=100, msg="升级完成" if res.get("ok") else "升级失败")
+                return {"ok": bool(res.get("ok")),
+                        "msg": res.get("msg") or "升级完成",
+                        "error": res.get("error") or "",
+                        "from": res.get("from") or "",
+                        "to": res.get("to") or ""}
+
+            self._audit("插件端触发 GitHub 在线升级（仓库 %s）"
+                        % (_log_text(repo or "未配置", _LOG_FIELD_MAX),))
+            ok, msg, st = job.start("upgrade", _worker, msg="准备升级…")
+            if not ok:
+                return {"status": False, "msg": msg, "data": st}
+            return {"status": True, "data": st, "msg": "已提交升级任务"}
         except Exception:
-            return {"status": False, "msg": "升级失败：" + traceback.format_exc()[-200:]}
+            return {"status": False, "msg": "升级提交失败：" + traceback.format_exc()[-200:]}
+
+    def upgrade_status(self, get=None):
+        """读回升级任务状态（供插件页面轮询）。
+
+        `app/job.py` 把状态写在 `data/` 下的一个 JSON 文件里，所以
+        插件进程（与守护进程是两个线程/进程）可以直接读，不需要 IPC。
+        """
+        try:
+            return {"status": True, "data": _app("job").status("upgrade")}
+        except Exception:
+            return {"status": False, "msg": "读取升级状态失败"}
 
     def about(self, get=None):
         """关于页信息：版本、署名、仓库、许可、运行时说明。"""
@@ -1684,7 +2165,8 @@ class frpwaf_main:
                 "author": _app("__init__").__author__,
                 "repo": str(cfg.get("github_repo") or ""),
                 "license": "MIT",
-                "runtime": "Python 3 标准库 + SQLite + 原生 JS（零第三方依赖）",
+                "runtime": "Python 3 标准库 + SQLite + 原生 JS（核心零第三方依赖；"
+                           "IP 归属地为可选增强，依赖面板自带的 maxminddb）",
             }}
         except Exception:
             return {"status": False, "msg": "读取失败"}
@@ -1699,7 +2181,7 @@ class frpwaf_main:
         cfg = self._cfg()
         return {"status": True, "data": {
             "user": cfg.get("admin_user", "admin"),
-            "password": "******" if cfg.get("admin_password") else "",
+            "password": self._masked_value() if cfg.get("admin_password") else "",
         }}
 
     def change_admin_pwd(self, get=None):

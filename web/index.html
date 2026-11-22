@@ -33,15 +33,17 @@
   tr:hover td{background:var(--panel2)}
   .wrap{max-width:1180px;margin:0 auto;padding:18px}
   .hide{display:none!important}
-  /* 登录 */
-  #login{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
-         background:radial-gradient(1200px 600px at 50% 0%,#1e293b,#0f172a)}
-  #login .card{background:var(--panel);padding:34px 30px;border-radius:14px;width:340px;
+  /* 登录 / 强制改密 */
+  #login,#pwdGate{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+         background:radial-gradient(1200px 600px at 50% 0%,#1e293b,#0f172a);z-index:60}
+  #login .card,#pwdGate .card{background:var(--panel);padding:34px 30px;border-radius:14px;width:360px;
          border:1px solid var(--line);box-shadow:0 20px 50px rgba(0,0,0,.4)}
-  #login h1{font-size:19px;margin:0 0 4px}
-  #login p{color:var(--muted);margin:0 0 20px;font-size:12px}
-  #login input{width:100%;margin-bottom:12px}
-  #login button{width:100%;padding:10px}
+  #pwdGate .card{border-color:var(--warn)}
+  #login h1,#pwdGate h1{font-size:19px;margin:0 0 4px}
+  #pwdGate h1{color:var(--warn)}
+  #login p,#pwdGate p{color:var(--muted);margin:0 0 20px;font-size:12px;line-height:1.6}
+  #login input,#pwdGate input{width:100%;margin-bottom:12px}
+  #login button,#pwdGate button{width:100%;padding:10px}
   /* 布局 */
   header{display:flex;align-items:center;gap:16px;padding:14px 18px;background:var(--panel);
          border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20}
@@ -85,6 +87,44 @@
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
   .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
   .stat-badge{font-size:11px;color:var(--muted)}
+  /* 安全水位：正常是常态，只占一行小徽标；warn/bad 才上色，逐项明细默认收起 */
+  .health-badge{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:600;
+         padding:3px 10px;border-radius:20px;white-space:nowrap;
+         border:1px solid var(--line);background:var(--panel2);color:var(--muted)}
+  .health-badge.ok{color:var(--ok);border-color:rgba(34,197,94,.4);background:rgba(34,197,94,.12)}
+  .health-badge.warn{color:var(--warn);border-color:rgba(245,158,11,.45);background:rgba(245,158,11,.12)}
+  .health-badge.err{color:var(--err);border-color:rgba(239,68,68,.5);background:rgba(239,68,68,.14)}
+  .health-badge.na{color:var(--muted);border-style:dashed}
+  .health-badge.clickable{cursor:pointer}
+  .health-badge.clickable:hover{filter:brightness(1.15)}
+  .hb-dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:0 0 auto}
+  .hb-caret{font-size:11px;font-weight:400;opacity:.85}
+  .health-since{color:var(--muted);font-size:12px;line-height:1.65;margin:0 0 10px}
+  .health-sum{font-size:13px;line-height:1.6;margin:0 0 10px;padding:8px 10px;border-radius:8px;
+         background:rgba(239,68,68,.1);border-left:3px solid var(--err);overflow-wrap:anywhere}
+  .health-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+  .health-list li{background:var(--panel2);border:1px solid var(--line);
+         border-left:3px solid var(--line);border-radius:8px;padding:9px 12px}
+  .health-list li.warn{border-left-color:var(--warn)}
+  .health-list li.bad{border-left-color:var(--err)}
+  .health-list li.zero{border-left-color:var(--line);opacity:.6}
+  .health-list li.warn .hb-dot{background:var(--warn)}
+  .health-list li.bad .hb-dot{background:var(--err)}
+  .health-list li.zero .hb-dot{background:var(--muted)}
+  .hh{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .hh b{font-weight:600}
+  .hh .hv{font-weight:700;font-variant-numeric:tabular-nums}
+  .health-list li.warn .hv{color:var(--warn)}
+  .health-list li.bad .hv{color:var(--err)}
+  .hd{color:var(--muted);font-size:12px;line-height:1.65;margin-top:5px;overflow-wrap:anywhere}
+  .tag.warn{background:rgba(245,158,11,.15);color:var(--warn)}
+  .health-list details.hact{margin-top:6px}
+  .health-list details.hact>summary{cursor:pointer;color:var(--pri);font-size:12px}
+  .health-list details.hact>div{font-size:12px;line-height:1.7;margin-top:6px;padding:7px 9px;
+         background:#0b1220;border-radius:6px;overflow-wrap:anywhere}
+  .health-zero{margin-top:10px}
+  .health-zero>summary{cursor:pointer;color:var(--muted);font-size:12px}
+  .health-zero-list{margin-top:8px}
   code{background:#0b1220;padding:1px 6px;border-radius:4px;color:var(--pri)}
 </style>
 </head>
@@ -99,6 +139,20 @@
     <input id="lp" type="password" placeholder="密码" autocomplete="current-password">
     <button onclick="doLogin()">登 录</button>
     <p id="lerr" style="color:var(--err);margin:12px 0 0;min-height:16px"></p>
+  </div>
+</div>
+
+<!-- 首次登录强制改密门禁（默认口令未改时阻断全部功能） -->
+<div id="pwdGate" class="hide">
+  <div class="card">
+    <h1>需先修改默认口令</h1>
+    <p>面板仍在使用默认口令 <code>admin / 123456</code>。改密完成前，除本接口外的所有功能都会返回
+      <code>403</code>（默认口令 = 任何人拿到面板即可改防火墙/停服务）。</p>
+    <input id="pgOld" type="password" placeholder="原密码（默认 123456）" autocomplete="current-password">
+    <input id="pgNew" type="password" placeholder="新密码（至少 4 位，不可用 123456）" autocomplete="new-password">
+    <input id="pgNew2" type="password" placeholder="确认新密码" autocomplete="new-password">
+    <button onclick="pwdGateSubmit()">立即修改</button>
+    <p id="pgErr" style="color:var(--err);margin:12px 0 0;min-height:16px"></p>
   </div>
 </div>
 
@@ -130,8 +184,13 @@
     <section id="tab-dash">
       <div class="cards" id="statCards"></div>
       <div class="box">
-        <h2>运行信息</h2>
+        <h2>运行信息
+          <span class="grow"></span>
+          <!-- 安全水位：ok 时只是一行小徽标，点开才展开逐项明细 -->
+          <span id="healthBadge" class="health-badge hide"></span>
+        </h2>
         <div id="sysInfo" class="grid3"></div>
+        <div id="healthDetail" class="hide"></div>
       </div>
       <div class="box">
         <h2>最近连接 <span class="stat-badge">最新 15 条</span></h2>
@@ -163,8 +222,13 @@
       <div class="box">
         <h2>名单列表 <span class="stat-badge" id="listCount"></span>
           <span class="grow"></span>
+          <button class="ghost sm" id="btnExport" onclick="doExport()">导出数据（JSON）</button>
           <button class="danger sm" onclick="clearBlack()">解封全部黑名单</button>
         </h2>
+        <p class="muted" style="margin:0 0 10px;font-size:12px">
+          导出内容：IP 名单、临时封禁与封禁历史、配置快照（JSON），可直接当备份或迁移用。
+          配置文件中的机密字段（AI 密钥 / 管理员口令 / secret）由后端掩码为 <code>******</code>，<b>不会</b>写进导出文件。
+        </p>
         <div class="row">
           <button class="ghost sm" onclick="loadList('black')" id="btnBlack">黑名单</button>
           <button class="ghost sm" onclick="loadList('white')" id="btnWhite">白名单</button>
@@ -290,10 +354,22 @@
       <div class="box">
         <h2>AI 自动 IP 审查 <span class="stat-badge" id="aiState">-</span>
           <span class="grow"></span>
+          <span class="muted" id="aiTestMsg" style="font-size:12px;margin-right:8px"></span>
+          <button class="sm" id="aiTestBtn" onclick="aiTest()">测试连接</button>
           <button class="danger sm" onclick="aiRunNow()">立即审查</button>
         </h2>
         <p class="muted" style="margin:0 0 10px">AI 审查的模型/密钥/调度配置在插件端「AI 审查」页维护；此处可查看最近审查记录并手动触发。</p>
         <div class="scroll" style="max-height:420px"><table id="aiTable"><tbody></tbody></table></div>
+      </div>
+      <div class="box" style="margin-top:14px">
+        <h2>AI 接口安全 <span class="stat-badge">默认允许内网地址</span></h2>
+        <div class="switch"><input type="checkbox" id="s_ai_allow_private" checked><label for="s_ai_allow_private">允许 AI 接口访问内网/本机地址</label></div>
+        <p class="muted" style="margin:10px 0 0;font-size:12px">
+          默认开启：AI 网关常是内网自建（如 <code>http://127.0.0.1:3000</code>），开启即可直接使用。
+          <b>关闭后 AI 接口只能访问公网地址，内网自建的 AI 网关将不可用</b>（指向本机/内网的接口地址会保存被拒、测试连接失败）。
+          无论开关如何，链路本地与云元数据地址（<code>169.254.0.0/16</code>、<code>fe80::/10</code>）始终拒绝。
+        </p>
+        <div class="row" style="margin-top:12px"><button onclick="saveAiNet()">保存</button></div>
       </div>
     </section>
 
@@ -344,8 +420,8 @@
             <div class="field grow"><label>仓库地址 owner/repo</label>
               <input id="upRepo" placeholder="默认 eternaling/frpwaf"></div>
             <button onclick="upSave()" style="margin-top:18px">保存仓库</button>
-            <button class="sm" style="margin-top:18px" onclick="upCheck()">检查更新</button>
-            <button class="danger sm" style="margin-top:18px" onclick="upApply()">一键升级</button>
+            <button class="sm" id="upCheckBtn" style="margin-top:18px" onclick="upCheck()">检查更新</button>
+            <button class="danger sm" id="upApplyBtn" style="margin-top:18px" onclick="upApply()">一键升级</button>
           </div>
           <p class="muted" id="upMsg" style="margin:10px 0 0">流程：检查最新版本 → 下载 → 校验 → 备份 → 覆盖程序 → 重启；失败自动回滚，不覆盖 data/。</p>
         </div>
@@ -362,7 +438,9 @@
           <div class="switch"><input type="checkbox" id="s_auto_ban_enabled"><label for="s_auto_ban_enabled">启用自动封禁</label></div>
           <div class="switch"><input type="checkbox" id="s_rate_limit_enabled"><label for="s_rate_limit_enabled">启用单 IP 限速</label></div>
           <div class="switch"><input type="checkbox" id="s_fw_sync_enabled"><label for="s_fw_sync_enabled">内核级封禁（ipset+iptables 直接丢包）</label></div>
+          <div class="switch"><input type="checkbox" id="s_strict_addr"><label for="s_strict_addr">地址解析失败时拒连（更安全，但可能误伤）</label></div>
         </div>
+        <p class="muted" style="margin:8px 0 0;font-size:12px">「地址解析失败时拒连」= fail-closed：开启后，无法解析出来源地址的连接（回调缺少 <code>remote_addr</code> 或格式不合法）会被<b>直接拒绝</b>，更安全，但极端情况下可能误伤合法连接；关闭时保持现状——放行并计入「地址解析失败」计数，便于先观察再决定是否收紧。默认关闭。</p>
         <div class="grid3" style="margin-top:14px">
           <div class="field"><label>自动封禁窗口（秒）</label><input id="s_auto_ban_window" type="number"></div>
           <div class="field"><label>窗口内连接数阈值</label><input id="s_auto_ban_threshold" type="number"></div>
@@ -401,6 +479,22 @@
         </div>
         <p class="muted" style="margin:10px 0 0;font-size:12px">误伤提示：出口 IP 变化的真实用户（移动网络切换、动态 IP、CDN 回源）可能被拒。建议先在「连接日志 → 突发观测」观察 1-2 天，确认流量性质且可接受偶发误伤后再启用；白名单 IP 不受影响。</p>
         <div class="row" style="margin-top:14px"><button onclick="saveSettings()">保存策略</button></div>
+      </div>
+      <div class="box">
+        <h2>监听与安全 <span class="stat-badge">改地址/端口后立即切换监听，无需重启</span></h2>
+        <div class="switch"><input type="checkbox" id="s_remote_access"><label for="s_remote_access">允许远程访问（监听 0.0.0.0，不加则为仅本机 127.0.0.1）</label></div>
+        <div class="grid3" style="margin-top:14px">
+          <div class="field"><label>面板端口</label><input id="s_http_port" type="number"></div>
+          <div class="field"><label>回调端口（frps httpPlugins addr）</label><input id="s_frp_handler_port" type="number"></div>
+          <div class="field"><label>面板并发上限</label><input id="s_max_concurrent" type="number"></div>
+          <div class="field"><label>回调并发上限</label><input id="s_handler_max_concurrent" type="number"></div>
+        </div>
+        <p class="muted" style="margin:10px 0 0;font-size:12px">
+          面板默认只绑 <code>127.0.0.1</code>：需要从外网打开面板时必须显式勾选「允许远程访问」，且请先改掉默认口令。
+          frps 回调使用独立的监听与并发配额（默认 <code>127.0.0.1:7082</code>），因此面板被慢连接/扫描打满时
+          回调仍有自己的额度，不会连带让 frps 因回调失败而 fail-closed 拒绝全部隧道。
+          并发上限是硬闸门（每连接一个线程 = 一个 fd），超限的新连接直接被断开而不排队；改完若监听地址变了，请用新地址访问。
+        </p>
       </div>
       <div class="box">
         <h2>修改管理员账号</h2>
@@ -452,25 +546,94 @@ function toast(msg, type='') {
   document.body.appendChild(t);
   setTimeout(()=>t.remove(), 2600);
 }
+
+/* ---- 后台任务轮询（提交 + 轮询）----
+   在线升级 / AI 连接测试这类操作会超过反向代理的 60s 超时，若同步等结果，
+   用户看到的是「失败」，而后台其实已经成功（于是反复点 → 重复升级 / 反复打模型）。
+   现在接口只负责提交（立即返回 job_id），具体进度靠这里轮询：
+     状态结构 {job_id,running,percent,msg,done,ok,error}（后端见 app/job.py）。
+   两个专门的坑：
+     1) 升级末尾会重启服务，重启窗口内轮询必然失败 —— 按「重启中」提示并容忍，
+        连续多次失败才判定为网络故障（否则会在升级成功的瞬间报「失败」）；
+     2) 必须有最大等待时长，否则后端一旦停掉一个任务，页面就无限转圈。 */
+const JOB_POLL_MS = 1500;                 // 轮询间隔
+const JOB_TIMEOUT_MS = 10 * 60 * 1000;    // 最长等待 10 分钟
+const JOB_MAX_ERR = 20;                   // 连续取不到状态的上限（约 30 秒）
+const sleepMs = ms => new Promise(r => setTimeout(r, ms));
+async function pollJob(statusPath, onTick){
+  const t0 = Date.now();
+  let errs = 0;
+  for(;;){
+    await sleepMs(JOB_POLL_MS);
+    if(Date.now() - t0 > JOB_TIMEOUT_MS){
+      throw new Error('任务超时：已等待 ' + Math.round(JOB_TIMEOUT_MS/60000) +
+        ' 分钟仍未结束，请刷新页面查看最终状态');
+    }
+    let st;
+    try{
+      const r = await api(statusPath); st = r.data || {}; errs = 0;
+    }catch(e){
+      // 会话过期：交给 api() 的统一跳登录，这里不再重试
+      if(e && e.message === 'unauthorized') throw e;
+      errs++;
+      if(onTick) onTick(null, '服务暂时不可达（可能正在重启），继续等待…（第 ' + errs + ' 次）');
+      if(errs >= JOB_MAX_ERR){
+        throw new Error('已连续 ' + errs + ' 次取不到任务状态，停止等待：' +
+          ((e && e.message) || '网络错误'));
+      }
+      continue;
+    }
+    if(onTick) onTick(st);
+    if(st.done) return st;
+    if(!st.running) return st;   // 既没在跑也没标完成：交给调用方按失败处理
+  }
+}
 function fmtTime(ts){ if(!ts) return '-'; const d=new Date(ts*1000);
   const p=n=>String(n).padStart(2,'0');
   return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; }
 function fmtDur(s){ s=+s||0; if(s<60)return s+'秒'; if(s<3600)return (s/60).toFixed(0)+'分'; if(s<86400)return (s/3600).toFixed(1)+'时'; return (s/86400).toFixed(1)+'天'; }
 
-/* ---- 登录 ---- */
+/* ---- 登录 / 强制改密 ---- */
 async function doLogin(){
   const u=$('#lu').value, p=$('#lp').value;
   try{
     const r = await api('/api/login','POST',{username:u,password:p});
-    if(r.code===0){ showApp(); toast('登录成功','ok'); }
+    if(r.code===0){
+      // 默认口令未改：先引导改密，否则除改密外的 API 全部 403
+      if(r.password_change_required){ showPwdGate(); }
+      else { showApp(); toast('登录成功','ok'); }
+    }
     else { $('#lerr').textContent = r.msg||'登录失败'; }
   }catch(e){ $('#lerr').textContent = (e && e.message!=='unauthorized') ? (e.message||'登录失败') : '登录失败'; }
 }
-async function doLogout(){ await api('/api/logout','POST'); showLogin(); }
-function showLogin(){ $('#login').classList.remove('hide'); $('#app').classList.add('hide'); $('#lp').value=''; }
+async function doLogout(){ try{ await api('/api/logout','POST'); }catch(e){} showLogin(); }
+function showLogin(){ $('#login').classList.remove('hide'); $('#pwdGate').classList.add('hide');
+  $('#app').classList.add('hide'); $('#lp').value=''; }
 function showApp(){
-  $('#login').classList.add('hide'); $('#app').classList.remove('hide');
+  $('#login').classList.add('hide'); $('#pwdGate').classList.add('hide'); $('#app').classList.remove('hide');
   loadTab('dash');
+}
+/* 强制改密门禁：后端对默认口令同样返回 403，这里是引导层（非唯一防护） */
+function showPwdGate(){
+  $('#login').classList.add('hide'); $('#app').classList.add('hide');
+  $('#pwdGate').classList.remove('hide');
+  $('#pgErr').textContent='';
+}
+async function pwdGateSubmit(){
+  const old=$('#pgOld').value, nw=$('#pgNew').value, nw2=$('#pgNew2').value;
+  const err=t=>{ $('#pgErr').textContent=t; };
+  if(!old) return err('请填写原密码（默认 123456）');
+  if(!nw || nw.length<4) return err('新密码至少 4 位');
+  if(nw==='123456') return err('新密码不能继续使用默认值 123456');
+  if(nw!==nw2) return err('两次输入的新密码不一致');
+  try{
+    const r = await api('/api/password','POST',{old,new:nw});
+    if(r.code!==0) return err(r.msg||'修改失败');
+    $('#pgOld').value=''; $('#pgNew').value=''; $('#pgNew2').value='';
+    // 改密会轮换会话密钥，旧会话立即失效 → 回到登录页用新口令登录
+    showLogin();
+    toast('口令已修改，请用新口令重新登录','ok');
+  }catch(e){ err(e.message||'修改失败'); }
 }
 
 /* ---- Tab ---- */
@@ -479,6 +642,8 @@ document.querySelectorAll('nav a').forEach(a=>a.onclick=()=>{
   a.classList.add('active'); loadTab(a.dataset.tab);
 });
 function loadTab(tab){
+  // 离开概览就停掉水位补取，别在别的页面里空转
+  if(tab!=='dash') clearHealthPoll();
   document.querySelectorAll('section[id^=tab-]').forEach(s=>s.classList.add('hide'));
   $('#tab-'+tab).classList.remove('hide');
   ({dash:loadDash, list:()=>loadList(curListType), logs:()=>{loadLogProxies();loadLogs(0);loadBurst();},
@@ -498,7 +663,10 @@ async function loadDash(){
     ].map(([k,v,c])=>`<div class="card"><div class="k">${esc(k)}</div><div class="v ${c}">${esc(v)}</div></div>`).join('');
     $('#sysInfo').innerHTML = [
       ['版本', d.version], ['运行时长', fmtDur(d.uptime)],
-      ['回调地址', (d.http_addr||'')+':'+(d.http_port||'')],
+      ['面板地址', (d.http_addr||'')+':'+(d.http_port||'')],
+      ['回调端口（frps）', (d.frp_handler_addr||'')+':'+(d.frp_handler_port||'')],
+      ['并发上限', (d.max_concurrent||'-')+' / 回调 '+(d.handler_max_concurrent||'-')],
+      ['远程访问', d.remote_access?'已开启（0.0.0.0）':'未开启（仅本机）'],
       ['黑名单', d.blacklist_enabled?'已启用':'关闭'],
       ['白名单', d.whitelist_enabled?'已启用':'关闭'],
       ['自动封禁', d.auto_ban_enabled?'已启用':'关闭'],
@@ -506,6 +674,8 @@ async function loadDash(){
       ['扫描封禁', d.auto_ban_scan_enabled?'已启用':'关闭'],
       ['爆破封禁', d.auto_ban_ssh_enabled?'已启用':'关闭'],
     ].map(([k,v])=>`<div class="field"><label>${esc(k)}</label><div>${esc(v)}</div></div>`).join('');
+    // 安全水位独立取数：不 await，接口慢或不可用都不拖累概览其余部分
+    loadHealth();
     const lr = await api('/api/logs?limit=15');
     $('#dashLogs tbody').innerHTML = (lr.data||[]).map(logRow).join('')
       || '<tr><td class="muted" colspan="6">暂无记录</td></tr>';
@@ -515,6 +685,136 @@ function logRow(x){
   return `<tr><td class="muted">${fmtTime(x.ts)}</td><td>${esc(x.ip)}</td><td class="muted">${esc(x.geo||'-')}</td><td>${esc(x.proxy_name||'-')}</td>
     <td><span class="tag ${x.action==='allow'?'allow':'reject'}">${esc(x.action)}</span></td>
     <td class="muted">${esc(x.reason||'')}</td></tr>`;
+}
+
+/* ---- 安全水位（GET /api/health）----
+   数据是守护进程内存里的失败计数（app/daemon.py 的 _mem），服务重启即清零——
+   所以界面必须写明「自服务启动以来累计」，否则运维会把重启后归零误读成
+   「问题自己好了」。这是本区块最容易误读的一点。
+   取数节奏：概览加载时取一次；只有 level=bad 才每 60 秒补一次，且仅在页面
+   可见、仍停在概览页时发请求（后台标签页不空转）。
+   兜底：老版本后端没有该接口（404）、结构缺失或字段异常时，一律降级成
+   「安全水位不可用」，不报错、不白屏、不弹提示。 */
+const HEALTH_LEVELS = {
+  ok:   {text:'安全水位正常', cls:'ok',   tip:'各项失败计数均在阈值内'},
+  warn: {text:'需要注意',     cls:'warn', tip:'存在非零失败计数，建议展开明细确认'},
+  bad:  {text:'需要处理',     cls:'err',  tip:'存在失败项，相关功能可能已受损'},
+};
+const HEALTH_POLL_MS = 60000;
+let healthData=null, healthItems=[], healthOpen=false, healthTouched=false, healthTimer=null;
+
+/* 计数起点：把 since / uptime_s 明确写进界面文案 */
+function healthSinceText(d){
+  const up = (d && d.uptime_s!==null && d.uptime_s!==undefined) ? fmtDur(d.uptime_s) : '';
+  const since = (d && d.since) ? fmtTime(d.since) : '';
+  if(up && since) return '自服务启动（已运行 '+up+'，起点 '+since+'）以来累计';
+  if(up) return '自服务启动（已运行 '+up+'）以来累计';
+  if(since) return '自服务启动（起点 '+since+'）以来累计';
+  return '自服务启动以来累计';
+}
+/* 单项：label + 当前值 + 等级色点 + detail；建议文案折进可折叠块，不直接堆在卡片里 */
+function healthItemHtml(it){
+  it = it || {};
+  const lv = (it.level==='bad' || it.level==='warn') ? it.level : 'ok';
+  const zero = lv === 'ok';
+  const val = (it.value===null || it.value===undefined) ? 0 : it.value;
+  const tagCls = lv==='bad' ? 'reject' : (lv==='warn' ? 'warn' : 'allow');
+  const tagTxt = lv==='bad' ? '需处理' : (lv==='warn' ? '需注意' : '正常');
+  let h = '<li class="'+(zero?'zero':lv)+'">'
+    + '<div class="hh"><span class="hb-dot"></span>'
+    + '<b>'+esc(it.label||it.key||'未命名项')+'</b>'
+    + '<span class="hv">'+esc(val)+'</span>'
+    + '<span class="tag '+tagCls+'">'+tagTxt+'</span></div>';
+  if(it.detail) h += '<div class="hd">'+esc(it.detail)+'</div>';
+  if(!zero && it.action){
+    h += '<details class="hact"><summary>处理建议</summary><div>'+esc(it.action)+'</div></details>';
+  }
+  return h + '</li>';
+}
+function renderHealth(){
+  const badge = $('#healthBadge'), det = $('#healthDetail');
+  if(!badge || !det) return;
+  const d = healthData || {};
+  const lv = HEALTH_LEVELS[d.level] ? d.level : 'ok';
+  const meta = HEALTH_LEVELS[lv];
+  const items = healthItems;
+  const badN = items.filter(it=>it.level==='bad').length;
+  const warnN = items.filter(it=>it.level==='warn').length;
+  const hot = items.filter(it=>it.level==='bad' || it.level==='warn');
+  const quiet = items.filter(it=>it.level!=='bad' && it.level!=='warn');
+  // ok 只有一行小字；warn/bad 把「几项」补进徽标，不展开也知道规模
+  const sub = lv==='ok' ? ''
+    : (badN ? ' · '+badN+' 项需处理' : '') + (warnN ? ' · '+warnN+' 项需注意' : '');
+  const canOpen = items.length > 0;
+  badge.className = 'health-badge ' + meta.cls + (canOpen ? ' clickable' : '');
+  badge.innerHTML = '<span class="hb-dot"></span>'+esc(meta.text)+esc(sub)
+    + (canOpen ? '<span class="hb-caret">'+(healthOpen?'收起':'明细')+'</span>' : '');
+  badge.setAttribute('title', (d.summary ? String(d.summary)+'｜' : '') + meta.tip
+    + '；' + healthSinceText(d) + '，服务重启后清零');
+  badge.onclick = canOpen ? toggleHealth : null;
+  if(!canOpen || !healthOpen){ det.classList.add('hide'); det.innerHTML=''; return; }
+  let html = '<div class="health-since">'+esc(healthSinceText(d))
+    + '的失败计数，服务重启后清零（归零只代表重新开始计数，不代表问题已修复）。</div>';
+  if(d.summary && lv!=='ok') html += '<div class="health-sum">'+esc(d.summary)+'</div>';
+  if(hot.length) html += '<ul class="health-list">'+hot.map(healthItemHtml).join('')+'</ul>';
+  // 计数为 0 的项默认折叠，避免一排「0」占满视野
+  if(quiet.length){
+    html += '<details class="health-zero"><summary>其余 '+quiet.length+' 项计数为 0</summary>'
+      + '<ul class="health-list health-zero-list">'+quiet.map(healthItemHtml).join('')+'</ul></details>';
+  }
+  if(!hot.length && !quiet.length){
+    html += '<div class="muted" style="font-size:12px">后端未返回任何水位项。</div>';
+  }
+  det.innerHTML = html;
+  det.classList.remove('hide');
+}
+function toggleHealth(){ healthTouched=true; healthOpen=!healthOpen; renderHealth(); }
+function clearHealthPoll(){ if(healthTimer){ clearInterval(healthTimer); healthTimer=null; } }
+function scheduleHealthPoll(){
+  clearHealthPoll();
+  if(!healthData || healthData.level!=='bad') return;   // 只有需要处理时才自动补取
+  healthTimer = setInterval(function(){
+    if(document.visibilityState === 'hidden') return;
+    const dash = document.getElementById('tab-dash');
+    if(!dash || dash.classList.contains('hide')) return;
+    loadHealth();
+  }, HEALTH_POLL_MS);
+}
+/* 降级态：老版本后端 / 接口异常时只显示这一行灰度提示 */
+function healthUnavailable(reason){
+  healthData=null; healthItems=[]; healthOpen=false; clearHealthPoll();
+  const badge = $('#healthBadge'), det = $('#healthDetail');
+  if(!badge || !det) return;
+  badge.className = 'health-badge na';
+  badge.textContent = '安全水位不可用';
+  badge.setAttribute('title', '取不到安全水位数据（'+(reason||'接口异常')+'）；不影响其他功能使用');
+  badge.onclick = null;
+  det.classList.add('hide'); det.innerHTML='';
+}
+async function loadHealth(){
+  if(!$('#healthBadge')) return;
+  try{
+    const r = await api('/api/health');
+    const d = (r && r.data) || null;
+    // 结构兜底：items 必须是数组，否则整块降级；level 缺失时按最差项推算
+    if(!d || !Array.isArray(d.items)) return healthUnavailable('接口返回结构不完整');
+    healthData = d;
+    healthItems = d.items.filter(it=>it && typeof it==='object');
+    // level 兜底：声明值缺失、或与 items 实际最差项不一致时，一律取最差值，
+    // 避免「徽标写着正常、明细里却有 bad 项」这种自相矛盾的展示。
+    const derived = healthItems.reduce((acc,it)=>
+      it.level==='bad' ? 'bad' : (it.level==='warn' && acc!=='bad' ? 'warn' : acc), 'ok');
+    const declared = HEALTH_LEVELS[d.level] ? d.level : 'ok';
+    healthData.level = (declared==='bad' || derived==='bad') ? 'bad'
+      : ((declared==='warn' || derived==='warn') ? 'warn' : 'ok');
+    // 只有 ok 收起（正常是常态）；warn/bad 首次默认展开，用户手动收起后不再抢焦点
+    if(!healthTouched) healthOpen = healthData.level !== 'ok';
+    renderHealth();
+    scheduleHealthPoll();
+  }catch(e){
+    if(e && e.message==='unauthorized') return;   // 会话过期交给 api() 统一跳登录
+    healthUnavailable((e && e.message) || '请求失败');
+  }
 }
 
 /* ---- IP 名单 ---- */
@@ -557,6 +857,44 @@ async function batchImport(){
       list_type:$('#ipType').value});
     toast(r.msg,'ok'); $('#ipBatch').value=''; loadList(curListType);
   }catch(e){ toast(e.message,'err'); }
+}
+/* 导出名单与封禁（GET /api/export，只读；机密字段后端已掩码）。
+   这里用 fetch + Blob 而不是 location.href='/api/export'：后者在会话过期时
+   会把 401 的 JSON 顶掉整个 SPA，用户既看不到提示也回不到面板。
+   文件名取自后端 Content-Disposition，前端不拼任何路径/文件名。 */
+let exporting = false;
+async function doExport(){
+  if(exporting) return;
+  const btn = $('#btnExport');
+  exporting = true;
+  if(btn){ btn.disabled = true; btn.textContent = '正在导出…'; }
+  toast('正在导出，名单较大时可能需要几秒…');
+  try{
+    const r = await fetch('/api/export', {method:'GET', headers:{'Accept':'application/json'}});
+    if(r.status === 401){ showLogin(); throw new Error('登录状态已过期，请重新登录后再导出'); }
+    if(!r.ok){
+      // 403：默认口令未改时的门禁；其它 4xx/5xx 一律把后端的 msg 透出来
+      let j = null;
+      try{ j = await r.json(); }catch(e){}
+      if(j && j.password_change_required){ showPwdGate(); throw new Error('请先修改默认口令再导出'); }
+      throw new Error((j && j.msg) || ('导出失败（HTTP '+r.status+'）'));
+    }
+    const blob = await r.blob();
+    const cd = r.headers.get('Content-Disposition') || '';
+    const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(cd);
+    const name = (m && m[1]) ? m[1].trim() : 'frpwaf-export.json';
+    const href = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = href; a.download = name; a.style.display = 'none';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(href), 10000);
+    toast('已导出：'+name,'ok');
+  }catch(e){
+    toast('导出失败：'+((e && e.message) || '未知错误'),'err');
+  }finally{
+    exporting = false;
+    if(btn){ btn.disabled = false; btn.textContent = '导出数据（JSON）'; }
+  }
 }
 
 /* ---- 日志 ---- */
@@ -743,7 +1081,7 @@ async function loadProxies(){
 
 /* ---- 设置 ---- */
 const SET_BOOL = ['blacklist_enabled','whitelist_enabled','auto_ban_enabled','rate_limit_enabled','fw_sync_enabled',
-  'auto_ban_cc_enabled','auto_ban_scan_enabled','auto_ban_ssh_enabled','proxy_cool_enabled'];
+  'auto_ban_cc_enabled','auto_ban_scan_enabled','auto_ban_ssh_enabled','proxy_cool_enabled','strict_addr'];
 const SET_INT = ['auto_ban_window','auto_ban_threshold','auto_ban_seconds','rate_limit_per_sec','log_max_rows',
   'auto_ban_cc_window','auto_ban_cc_threshold','auto_ban_cc_seconds',
   'auto_ban_scan_window','auto_ban_scan_threshold','auto_ban_scan_seconds',
@@ -755,7 +1093,32 @@ async function loadSettings(){
     SET_BOOL.forEach(k=>$('#s_'+k).checked=!!c[k]);
     SET_INT.forEach(k=>$('#s_'+k).value=c[k]);
     loadCurUser();
+    loadListen(c);
   }catch(e){ if(e.message!=='unauthorized') toast('设置加载失败：'+e.message,'err'); }
+}
+/* 监听与安全（P0-1 允许远程访问 / P0-3 回调分端口与并发闸门） */
+const LISTEN_INT = ['http_port','frp_handler_port','max_concurrent','handler_max_concurrent'];
+function loadListen(c){
+  if(!c){ return; }
+  // 非回环地址统一按「允许远程访问」展示（手改的 ::/::1 也归入两侧）
+  const a = String(c.http_addr||'127.0.0.1');
+  $('#s_remote_access').checked = !(a==='127.0.0.1' || a==='::1');
+  LISTEN_INT.forEach(k=>{ if($('#s_'+k)) $('#s_'+k).value = (c[k]===undefined?'':c[k]); });
+}
+async function saveListen(){
+  const b = {http_addr: $('#s_remote_access').checked ? '0.0.0.0' : '127.0.0.1'};
+  LISTEN_INT.forEach(k=>b[k]=+($('#s_'+k).value||0));
+  for (const k of LISTEN_INT){
+    if(!(b[k]>=1)){ return toast('端口/并发上限需为正整数','err'); }
+  }
+  if(b.http_port===b.frp_handler_port){ return toast('面板端口与回调端口不能相同','err'); }
+  if(b.http_addr==='0.0.0.0' && !confirm('「允许远程访问」会把管理面板暴露到全部网络接口。\n请确认已修改默认口令、且确有必要（否则任何人扫到 7080 就能尝试登录）。继续？')) return;
+  try{
+    const r = await api('/api/config','POST',b);
+    toast(r.msg||'已保存','ok');
+    loadCurUser();
+    try{ loadListen((await api('/api/config')).data); }catch(e){}
+  }catch(e){ toast(e.message,'err'); }
 }
 async function loadCurUser(){
   try{ const r=await api('/api/overview'); const u=r.data.admin_user||'-';
@@ -777,12 +1140,15 @@ async function changePwd(){
     const r=await api('/api/password','POST',{old,new:nw,new_user:nu,old_user:ou});
     toast(r.msg,'ok');
     $('#pwOld').value=''; $('#pwNew').value=''; $('#pwNewUser').value=''; $('#pwOldUser').value='';
+    // 改账号/口令会轮换会话密钥，旧会话立即失效 → 回登录页用新凭据重登
+    if(nw || nu){ showLogin(); toast('凭据已更新，请重新登录','ok'); return; }
     loadCurUser();
   }catch(e){ toast(e.message,'err'); }
 }
 
 /* ---- AI 审查 ---- */
 async function loadAI(){
+  loadAiNet();
   try{
     const r = await api('/api/ai/review');
     const rows = r.data||[];
@@ -793,10 +1159,85 @@ async function loadAI(){
       : '<tbody><tr><td class="muted">暂无审查记录</td></tr></tbody>';
   }catch(e){ toast(e.message||'加载失败','err'); }
 }
+/* AI 接口安全：是否允许 AI 接口指向内网/回环地址（ai_allow_private，默认允许） */
+async function loadAiNet(){
+  try{
+    const c = (await api('/api/config')).data || {};
+    // 后端不返回该字段（老版本）时按约定默认值 true 兜底，避免开关被误显示成「关闭」
+    $('#s_ai_allow_private').checked = (c.ai_allow_private === undefined ? true : !!c.ai_allow_private);
+  }catch(e){ /* 读配置失败时保留上次渲染值，不打扰用户 */ }
+}
+async function saveAiNet(){
+  // 只提交本项：布尔值 true/false，不夹带其它字段（避免误覆盖）
+  const b = {ai_allow_private: $('#s_ai_allow_private').checked};
+  try{ const r = await api('/api/config','POST',b); toast(r.msg||'已保存','ok'); }
+  catch(e){ toast(e.message,'err'); }
+}
 async function aiRunNow(){
   if(!confirm('立即执行一次 AI 审查？将调用已配置的大模型接口（高危操作，写入审计日志）。')) return;
-  try{ const r = await api('/api/ai/review','POST',{}); toast(r.msg||'已触发','ok'); loadAI(); }
-  catch(e){ toast(e.message||'执行失败','err'); }
+  try{
+    const r = await api('/api/ai/review','POST',{});
+    if(r.code){ toast(r.msg||'已有审查在进行中','err'); return; }
+    toast(r.msg||'已提交审查','ok');
+    // 一次审查要等模型回包，可能远超 60s：轮询状态而不是干等
+    pollAiReview();
+  }catch(e){ toast(e.message||'执行失败','err'); }
+}
+/* 轮询手动审查是否结束：后端用 ai.review() 写的 ai_last_run/ai_last_ok 判断，
+   不另建状态文件。超时/连续失败要有明确提示，不能静默转圈。 */
+function pollAiReview(){
+  const started = Date.now();
+  const MAXMS = 10*60*1000;
+  let fails = 0;
+  const step = async () => {
+    if(Date.now() - started > MAXMS){
+      toast('审查超时（超过 10 分钟），请刷新查看结果','err'); loadAI(); return;
+    }
+    try{
+      const r = await api('/api/ai/review/status');
+      fails = 0;
+      const d = r.data || {};
+      if(d.running){ setTimeout(step, 2000); return; }
+      toast(d.last_ok ? '审查完成' : ('审查结束：' + (d.last_result || '未返回原因')), !!d.last_ok);
+      loadAI();
+    }catch(e){
+      if(++fails >= 8){ toast('审查状态读取失败：' + (e.message||''), 'err'); loadAI(); return; }
+      setTimeout(step, 2000);
+    }
+  };
+  setTimeout(step, 1500);
+}
+/* 测试连接（用已保存的模型配置）：模型调用最长 120s，故同样是
+   「提交任务 + 轮询状态」，不再让请求线程一直挂着等回包。 */
+let aiTestBusy = false;
+async function aiTest(){
+  if(aiTestBusy) return;
+  const btn = $('#aiTestBtn'), el = $('#aiTestMsg');
+  aiTestBusy = true;
+  if(btn){ btn.disabled = true; btn.textContent = '测试中…'; }
+  const t0 = Date.now();
+  const show = txt => { if(el) el.textContent = txt + '（已等待 ' +
+    Math.round((Date.now()-t0)/1000) + ' 秒）'; };
+  show('提交测试任务…');
+  try{
+    await api('/api/ai/test','POST',{});
+    show('正在调用模型');
+    const st = await pollJob('/api/ai/test/status', (s, note)=>{
+      if(!s){ if(note) show(note); return; }
+      show(s.msg || '正在调用模型…');
+    });
+    if(st && st.ok){ show(st.msg || '连接成功，模型返回正常'); toast(st.msg||'连接成功','ok'); }
+    else {
+      const err = (st && (st.error || st.msg)) || '测试失败（未返回原因，请查看运行日志）';
+      show(err); toast(err,'err');
+    }
+  }catch(e){
+    const msg = (e && e.message) || '测试请求失败';
+    show(msg); toast(msg,'err');
+  }finally{
+    aiTestBusy = false;
+    if(btn){ btn.disabled = false; btn.textContent = '测试连接'; }
+  }
 }
 /* ---- 内核封禁 ---- */
 async function loadKernban(){
@@ -865,23 +1306,76 @@ async function upCheck(){
     $('#upMsg').textContent = d.ok ? ('当前 '+d.current+'，最新 '+d.latest+(d.has_update?'（可升级）':'（已是最新）')) : (r.msg||'检查失败');
   }catch(e){ $('#upMsg').textContent = e.message||'检查失败'; }
 }
+let upBusy = false;   // 升级进行中：按钮禁用 + 忽略重复提交（与后端并发保护双保险）
+/* 升级成功后的静默验活：服务重启期间 /api/about 会暂时不可达，
+   这里失败就安静等待（不弹错误 toast，否则「升级成功」和「加载失败」会同时出现），
+   一旦可达就更新版本号并把关于页数据刷新到最新。 */
+async function quietVersionCheck(){
+  try{
+    const r = await api('/api/about'); const d = r.data || {};
+    $('#upMsg').textContent = '升级完成，当前版本 ' + (d.version||'-') + '；服务已恢复';
+    loadAbout();
+  }catch(e){ /* 仍在重启：保持原提示 */ }
+}
 async function upApply(){
+  if(upBusy) return;                     // 已在升级：忽略重复点击
   if(!confirm('确定从 GitHub 下载并升级？升级期间服务会重启，失败会自动回滚（高危操作，写入审计日志）。')) return;
-  $('#upMsg').textContent='升级中，请稍候…';
-  try{ const r = await api('/api/upgrade/apply','POST',{}); const d=r.data||{};
-    $('#upMsg').textContent = r.msg || '完成'; toast(r.msg||'完成', d.ok?'ok':'err');
-  }catch(e){ $('#upMsg').textContent = e.message||'升级失败'; toast(e.message||'升级失败','err'); }
+  const btn = $('#upApplyBtn'), chk = $('#upCheckBtn');
+  upBusy = true;
+  if(btn){ btn.disabled = true; btn.textContent = '升级中…'; }
+  if(chk) chk.disabled = true;
+  const t0 = Date.now();
+  // 带上「已等待 N 秒」：后端只有粗粒度进度，靠它区分「在跑」与「卡死」
+  const show = txt => { $('#upMsg').textContent = txt + '（已等待 ' +
+    Math.round((Date.now()-t0)/1000) + ' 秒）'; };
+  show('提交升级任务…');
+  try{
+    const r = await api('/api/upgrade/apply','POST',{});
+    const d = r.data || {};
+    show('任务已提交' + (d.job_id ? ('（' + d.job_id + '）') : '') +
+      '，下载与覆盖期间进度不变属正常');
+    const st = await pollJob('/api/upgrade/status', (s, note)=>{
+      if(!s){ if(note) show(note); return; }     // 重启窗口：只换提示，不打断
+      show((s.msg || '升级进行中…') +
+        (typeof s.percent === 'number' ? ' ' + s.percent + '%' : ''));
+    });
+    if(st && st.ok){
+      $('#upMsg').textContent = (st.msg || '升级完成') +
+        '；服务正在重启，稍后自动重新读取版本信息…';
+      toast(st.msg || '升级完成','ok');
+      // 重启后接口才会回来：分两次静默验活，避免刚成功就弹一个「加载失败」
+      setTimeout(()=>{ quietVersionCheck(); }, 6000);
+      setTimeout(()=>{ quietVersionCheck(); }, 20000);
+    }else{
+      const err = (st && (st.error || st.msg)) || '升级失败（未返回原因，请查看运行日志）';
+      $('#upMsg').textContent = '升级失败：' + err;
+      toast('升级失败：' + err,'err');
+    }
+  }catch(e){
+    const msg = (e && e.message) || '升级请求失败';
+    $('#upMsg').textContent = '升级未完成：' + msg;
+    toast(msg,'err');
+  }finally{
+    upBusy = false;
+    if(btn){ btn.disabled = false; btn.textContent = '一键升级'; }
+    if(chk) chk.disabled = false;
+  }
 }
 
 /* ---- 启动 ---- */
 (async ()=>{
   try{
+    // 这里不能用 api()：未登录/门禁时它会抛异常，而我们要按状态分流
     const r = await fetch('/api/overview');
-    if(r.ok) showApp(); else showLogin();
+    if(!r.ok) return showLogin();
+    let d = {};
+    try{ d = ((await r.json())||{}).data || {}; }catch(e){ d = {}; }
+    if(d.password_change_required) showPwdGate(); else showApp();
   }catch(e){ showLogin(); }
 })();
 $('#lp').addEventListener('keydown',e=>{ if(e.key==='Enter') doLogin(); });
 $('#lu').addEventListener('keydown',e=>{ if(e.key==='Enter') doLogin(); });
+$('#pgNew2').addEventListener('keydown',e=>{ if(e.key==='Enter') pwdGateSubmit(); });
 </script>
 </body>
 </html>

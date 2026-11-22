@@ -3,6 +3,8 @@
 """FRP WAF - 决策引擎
 
 决策顺序：
+  0. 地址归一化（::ffff:1.2.3.4 -> 1.2.3.4）；无法解析时按 strict_addr
+     决定放行（invalid-ip-pass）还是拒连（invalid-ip-strict）
   1. 白名单命中 -> allow（白名单优先，直接放行）
   2. 黑名单命中 -> reject
   3. 自动封禁（ban_log 未过期）-> reject
@@ -20,7 +22,8 @@ import time
 from . import config, store
 
 # 内存规则缓存
-_cache = {"black": [], "white": [], "loaded_at": 0}
+_cache = {"black": [], "white": [], "loaded_at": 0,
+          "black_v4": [], "black_v6": [], "white_v4": [], "white_v6": []}
 _cache_lock = threading.Lock()
 CACHE_TTL = 3  # 秒
 
@@ -246,7 +249,7 @@ def cool_check():
                 c["conns"] = 0
     # 续期证据：冷却期内累计连接数达到下限 -> 续期（覆盖观测窗口滚动场景）
     with _cool_lock:
-        for k, c in _cool.items():
+        for c in _cool.values():
             if c["until"] > now and c.get("conns", 0) >= min_conns:
                 c["until"] = now + secs
                 c["conns"] = 0
@@ -269,9 +272,7 @@ def _cool_active(proxy_name):
             c = _cool.get(proxy_name)
             if c is None:
                 return False
-            if c["until"] <= time.time():
-                return False
-            return True
+            return c["until"] > time.time()
     except Exception:
         return False   # 判定异常放行（fail-open，与引擎整体一致）
 
@@ -292,8 +293,42 @@ def _rules():
             blacks, whites = store.load_rules()
             _cache["black"] = blacks
             _cache["white"] = whites
+            # 载入时把名单折叠合并并按版本分桶（P2-3.3）：
+            # collapse 只合并相邻/重叠网段，覆盖的地址集合完全不变，
+            # 所以匹配语义不变；分桶后 _ip_in 只比对应版本，比较次数大减。
+            _cache["black_v4"], _cache["black_v6"] = _bucket(blacks)
+            _cache["white_v4"], _cache["white_v6"] = _bucket(whites)
             _cache["loaded_at"] = now
         return _cache["black"], _cache["white"]
+
+
+def _bucket(nets):
+    """把网段列表折叠合并后按版本分桶 -> (v4_list, v6_list)。
+
+    collapse_addresses 对相邻/重叠的网段做数学等价合并（例如 10.0.0.0/25 与
+    10.0.0.128/25 变成 10.0.0.0/24），覆盖的地址集合不变，故判定结果不变。
+    无法折叠成同一版本时按版本各自处理；输入含非法项时退回原列表，
+    宁可比得慢也不要抛异常。
+    """
+    v4, v6 = [], []
+    try:
+        groups = {}
+        for n in nets or ():
+            groups.setdefault(getattr(n, "version", 0), []).append(n)
+        for ver in (4, 6):
+            items = groups.get(ver) or []
+            if not items:
+                continue
+            collapsed = list(ipaddress.collapse_addresses(items))
+            if ver == 4:
+                v4 = collapsed
+            else:
+                v6 = collapsed
+    except Exception:
+        # 任何意外（非法/混版）都退回未折叠的原始列表，保证可用性
+        return ([n for n in (nets or ()) if getattr(n, "version", 0) == 4],
+                [n for n in (nets or ()) if getattr(n, "version", 0) == 6])
+    return v4, v6
 
 
 def invalidate_cache():
@@ -301,14 +336,87 @@ def invalidate_cache():
         _cache["loaded_at"] = 0
 
 
-def _ip_in(ip_obj, nets):
-    for n in nets:
+# ---- 地址归一化 ----
+# IPv4-mapped IPv6（::ffff:1.2.3.4）在 ipaddress 里是 IPv6Address，与
+# IPv4Address("1.2.3.4") 不相等，且 `IPv4Address in IPv6Network` 直接抛 TypeError。
+# 不归一化时：名单里写 1.2.3.4 命中不了映射形态的连接 → 黑名单对它静默失效。
+# 统一规则：**先归一化、再比较/存储**（decide 归一化一次，下游一律用归一化值）。
+def _norm_ip(value):
+    """解析地址并归一化：IPv4-mapped IPv6 折叠为 IPv4。
+
+    返回 IPv4Address / IPv6Address；无法解析返回 None（由调用方决定放行或拒连）。
+    容忍首尾空白与 IPv6 方括号（'[::1]'），避免调用方各自实现拆壳。
+    """
+    text = "" if value is None else str(value).strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    if not text:
+        return None
+    try:
+        ip_obj = ipaddress.ip_address(text)
+    except ValueError:
+        return None
+    # IPv4Address 没有 ipv4_mapped 属性（getattr 兜底），IPv6 非映射形态返回 None
+    return getattr(ip_obj, "ipv4_mapped", None) or ip_obj
+
+
+_MAPPED_V6_NET = ipaddress.ip_network("::ffff:0:0/96")
+
+
+def _match_cands(ip_obj, net):
+    """该 ip 相对某个网段的候选表示（避免因写法不同漏匹配）。
+
+    IPv4 地址除自身外，还追加 v4-mapped 表示，这样名单里写成
+    ::ffff:1.2.3.0/120 也能命中；但**仅限 v4-mapped 区段内**（::ffff:0:0/96
+    及更具体的前缀）——否则 ::/0 这类「整个 IPv6」网段会把 IPv4 连接一并拦下。
+    """
+    cands = [ip_obj]
+    # 不用 net.subnet_of()：那是 Python 3.7+ 的 API，本项目目标环境为 3.6+。
+    # /96 及更具体、且网络地址落在 ::ffff:0:0/96 内的网段，必然是该段子集。
+    if getattr(ip_obj, "version", 0) == 4 and net.version == 6 \
+            and net.prefixlen >= 96 and net.network_address in _MAPPED_V6_NET:
         try:
-            if ip_obj in n:
-                return True
-        except TypeError:
-            continue
+            cands.append(ipaddress.IPv6Address("::ffff:%s" % ip_obj))
+        except ValueError:
+            pass
+    return cands
+
+
+def _ip_in(ip_obj, nets):
+    """ip 是否落在任一网段内（IPv4 / IPv6 混合时不因版本不同抛异常）。"""
+    for n in nets:
+        for c in _match_cands(ip_obj, n):
+            try:
+                if c in n:
+                    return True
+            except TypeError:
+                continue   # 版本不同的地址与网段做 in 判断会抛 TypeError
     return False
+
+
+def _ip_in_fast(ip_obj, kind):
+    """按版本分桶后的快速匹配（P2-3.3）。
+
+    用 `_rules()` 载入时折叠合并好的名单：先按地址版本选桶，只比可能命中的
+    那一个版本，避免 5000 条名单逐条比较、也不想每次拼两个版本列表。
+    分桶未就绪（理论上仅在 _rules 刚失效的瞬间）时回退原始列表，
+    保证行为不变。
+
+    语义与 `_ip_in` 完全一致：collapse 是等价变换，且 v4 地址仍会额外
+    尝试 v4-mapped 候选（`_match_cands` 负责），所以名单里写
+    `::ffff:1.2.3.0/120` 这类条目依旧能命中。
+    """
+    ver = getattr(ip_obj, "version", 0)
+    with _cache_lock:
+        v4 = _cache.get("black_v4" if kind == "black" else "white_v4") or []
+        v6 = _cache.get("black_v6" if kind == "black" else "white_v6") or []
+    # v4 地址：先看 v4 桶；还要看 v6 桶，因为名单里可能有 ::ffff:a.b.c.d/N 写法
+    # v6 地址：只看 v6 桶（v4 桶里的网段不可能是 v6 地址的父段）
+    if ver == 4:
+        if _ip_in(ip_obj, v4):
+            return True
+        return bool(v6) and _ip_in(ip_obj, v6)
+    return bool(v6) and _ip_in(ip_obj, v6)
 
 
 def _rate_limited(ip, per_sec):
@@ -332,9 +440,14 @@ def _rate_limited(ip, per_sec):
 
 
 def _is_banned(ip):
-    # 复用 store 的封禁缓存集合判断（单 IP / CIDR），避免每次连接全表扫描
+    # 复用 store 的封禁缓存集合判断（单 IP / CIDR），避免每次连接全表扫描。
+    # 先归一化：store.is_banned 把入参解析成地址后与网段列表比较，传未归一化的
+    # v4-mapped 地址（IPv6Address）永远命中不了 IPv4 网段，会漏封。
     try:
-        return store.is_banned(ip)
+        ip_obj = _norm_ip(ip)
+        if ip_obj is None:
+            return False
+        return store.is_banned(str(ip_obj))
     except Exception:
         return False
 
@@ -465,6 +578,12 @@ def _attack_ban(ip, reason, kind):
     返回 True 表示已写入（或已存在于黑名单），False 表示写库失败。
     """
     cfg = config.get()
+    # 写入前再归一化一次：名单（ip_list）与封禁（ban_log）都以归一化形态落库，
+    # 避免同一条记录出现 ::ffff:1.2.3.4 与 1.2.3.4 两份、且映射形态落在库里
+    # 之后无法命中 IPv4 网段（store 侧归一化见交付报告）。
+    ip_obj = _norm_ip(ip)
+    if ip_obj is not None:
+        ip = str(ip_obj)
     try:
         if kind == "ssh":
             if cfg.get("blacklist_enabled", True):
@@ -500,21 +619,31 @@ def _attack_ban(ip, reason, kind):
 
 
 def decide(remote_ip, remote_port, proxy_name, proxy_type, user):
-    """返回 (allow: bool, reason: str)。"""
+    """返回 (allow: bool, reason: str)。
+
+    地址无法解析时的策略由配置 strict_addr 决定（键由 config.DEFAULTS 提供，
+    缺键按 False 处理，保持向后兼容）：
+      - False（默认）：放行，reason="invalid-ip-pass"（上层 daemon 计数告警）
+      - True        ：拒连，reason="invalid-ip-strict"（fail-closed）
+    """
     cfg = config.get()
-    try:
-        ip_obj = ipaddress.ip_address(remote_ip)
-    except ValueError:
+    ip_obj = _norm_ip(remote_ip)
+    if ip_obj is None:
+        if bool(cfg.get("strict_addr", False)):
+            return False, "invalid-ip-strict"
         return True, "invalid-ip-pass"
+    # 归一化后的形态贯穿后续全部比较、计数与写库：黑名单/封禁/限速/自动封禁
+    # 对 ::ffff:a.b.c.d 与 a.b.c.d 口径一致（评审 P1-11 的核心修复）。
+    remote_ip = str(ip_obj)
 
     blacks, whites = _rules()
 
     # 1. 白名单优先
-    if cfg.get("whitelist_enabled") and _ip_in(ip_obj, whites):
+    if cfg.get("whitelist_enabled") and _ip_in_fast(ip_obj, "white"):
         return True, "whitelist"
 
     # 2. 黑名单
-    if cfg.get("blacklist_enabled") and _ip_in(ip_obj, blacks):
+    if cfg.get("blacklist_enabled") and _ip_in_fast(ip_obj, "black"):
         return False, "blacklist"
 
     # 3. 自动封禁中
@@ -606,8 +735,24 @@ def _attack_detect(cfg, ip, proxy_name, proxy_type):
 
 
 def auto_release():
-    """释放已到期的封禁（由后台线程周期调用）。返回被释放的记录列表。"""
+    """释放已到期的封禁（由后台线程周期调用）。返回被释放的记录列表。
+
+    P2-3.8：改成批量一次提交。一批 600 秒临时封禁同时到点时会连开 N 次事务，
+    `store.release_bans(ids)` 用一条 UPDATE 搞定。
+    该函数可能尚未存在于旧版 store（前向兼容），缺失时回退逐条。
+    """
     released = store.expired_bans()
-    for b in released:
-        store.release_ban(b["id"])
+    if not released:
+        return released
+    ids = [b["id"] for b in released]
+    batch = getattr(store, "release_bans", None)
+    if callable(batch):
+        try:
+            batch(ids)
+            return released
+        except Exception:  # noqa: BLE001
+            # 批量失败不丢数据：落到下面的逐条路径再试一次
+            pass
+    for bid in ids:
+        store.release_ban(bid)
     return released

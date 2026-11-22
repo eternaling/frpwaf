@@ -1,0 +1,33 @@
+[Unit]
+Description=FRP WAF manager (frpwaf)
+Documentation=https://github.com/nightvault/frpwaf
+# 等网络就绪再起：daemon 起来后立即要监听回调端口，过早启动会与 frps 抢时序。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=simple：exec 直接把 sh 换成 python，主进程 PID 就是守护进程 PID，
+# 不需要 pidfile 参与 systemd 的存活判定（pidfile 仍由进程自己写，供 init 脚本用）。
+Type=simple
+WorkingDirectory=/opt/frpwaf
+
+# 解释器选择与 frpwaf.init 保持一致：面板自带的 python 优先，缺失时回退 python3。
+# 用 /bin/sh -c 包一层是因为 unit 里没法写 `[ -x ... ] || ...`；`$$` 是 systemd 的
+# 字面 `$` 转义。日志重定向也与 init 脚本一致（追加写 $LOGFILE，不走 journal，
+# 避免 CentOS 7 的 systemd 219 不支持 `StandardOutput=append:` 的问题）。
+ExecStart=/bin/sh -c 'PY=/www/server/panel/pyenv/bin/python; [ -x "$$PY" ] || PY=python3; exec "$$PY" -m app.daemon >>/opt/frpwaf/data/frpwaf.log 2>&1'
+
+# 自愈：OOM / 异常退出后 2 秒内重启，替代 cron 看护
+Restart=always
+RestartSec=2
+
+# 与 frpwaf.init 的 `ulimit -n 8192` 对齐（每连接一线程 = 一个 fd）
+LimitNOFILE=8192
+
+# 停服务时先给主进程 TERM（让它走 finally 分支记日志），超时后再对整个 cgroup KILL，
+# 避免残留子线程/子进程。显式 stop 不会触发 Restart=always。
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

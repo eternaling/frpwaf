@@ -31,7 +31,7 @@ _PAGES = {
 }
 _DEFAULT = "/blocked"
 
-_state = {"server": None, "thread": None, "port": 0}
+_state = {"server": None, "thread": None, "port": 0, "addr": ""}
 _lock = threading.Lock()
 # 静态页缓存：{文件名: (mtime, html)}；文件被替换后自动重载（便于升级/调试）
 _page_cache = {}
@@ -107,7 +107,7 @@ def _start_locked(addr, port):
     srv.daemon_threads = True
     t = threading.Thread(target=srv.serve_forever, name="frpwaf-blockpage", daemon=True)
     t.start()
-    _state.update(server=srv, thread=t, port=port)
+    _state.update(server=srv, thread=t, port=port, addr=addr)
 
 
 def _stop_locked():
@@ -121,7 +121,7 @@ def _stop_locked():
             srv.server_close()
         except Exception:
             pass
-    _state.update(server=None, thread=None, port=0)
+    _state.update(server=None, thread=None, port=0, addr="")
 
 
 def ensure():
@@ -133,12 +133,16 @@ def ensure():
         port = int(cfg.get("block_page_port") or 7081)
     except (TypeError, ValueError):
         port = 7081
-    addr = cfg.get("http_addr") or "0.0.0.0"
+    # 拦截页是**对外**服务的（404/封禁/风控页要给访客看），所以监听地址单独用
+    # block_page_addr（默认 0.0.0.0）；不能跟着 http_addr——面板监听收到 127.0.0.1
+    # 后若继续复用 http_addr，拦截页就只在环回可用，外网访客直接连接超时。
+    addr = cfg.get("block_page_addr") or "0.0.0.0"
     with _lock:
         if not enabled:
             _stop_locked()
             return False
-        if _state["server"] is not None and _state["port"] == port:
+        if (_state["server"] is not None and _state["port"] == port
+                and _state.get("addr") == addr):
             return True
         _stop_locked()
         try:
@@ -163,5 +167,6 @@ def status():
     with _lock:
         running = _state["server"] is not None
         port = _state["port"] or cfg_port
+        addr = _state.get("addr") or (cfg.get("block_page_addr") or "0.0.0.0")
     return {"enabled": bool(cfg.get("block_page_enabled", True)),
-            "running": running, "port": port}
+            "running": running, "port": port, "addr": addr}
