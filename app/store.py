@@ -101,6 +101,19 @@ CREATE TABLE IF NOT EXISTS ai_review (
     model TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_ai_review_ts ON ai_review(ts);
+-- 自动学习到的「可信回源网段」：AI 判定某 IP 为 CDN 回源（或同段熔断触发）时
+-- 记下它，以后同类 IP 直接跳过自动封禁。
+-- 为什么需要：站点前置 CDN/WAF 时，回源 IP 属于共享边缘节点，封一个等于封
+-- 一片真实用户（2026-11 封掉阿里云 ESA 回源段 → 整站 522）。回源 IP 段不是
+-- 固定公开列表，无法预先写死，只能“遇到过就记住”。
+CREATE TABLE IF NOT EXISTS trusted_cidr (
+    cidr TEXT PRIMARY KEY,          -- 单 IP 存 /32，段存 /24 等
+    reason TEXT DEFAULT '',
+    hits INTEGER NOT NULL DEFAULT 1, -- 命中次数（重复学到同一段时累加）
+    created_at INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trusted_cidr_seen ON trusted_cidr(last_seen);
 """
 
 
@@ -573,6 +586,74 @@ def add_ip(cidr, list_type="black", remark=""):
 def del_ip(entry_id):
     _exec("DELETE FROM ip_list WHERE id=?", (entry_id,))
     return True
+
+
+# ---------------- 自动学习的可信回源网段 ----------------
+
+def add_trusted_cidr(cidr, reason="", hits=1):
+    """记下一条「可信回源网段」（已存在则累加命中次数）。
+
+    cidr 会被规范化（单 IP 归一为 /32）。非法值抛 ValueError，由调用方决定怎么处理。
+    """
+    net = ipaddress.ip_network((cidr or "").strip(), strict=False)
+    cidr = str(net)
+    now = int(time.time())
+    _exec(
+        "INSERT INTO trusted_cidr(cidr, reason, hits, created_at, last_seen) "
+        "VALUES(?,?,?,?,?) "
+        "ON CONFLICT(cidr) DO UPDATE SET hits=hits+excluded.hits, "
+        "reason=excluded.reason, last_seen=excluded.last_seen",
+        (cidr, (reason or "")[:200], int(hits), now, now))
+    return cidr
+
+
+def list_trusted_cidrs(limit=0):
+    """已学习的可信网段列表（按命中次数降序）。只读。"""
+    lim = int(limit or 0)
+    if lim > 0:
+        return _query_ro(
+            "SELECT * FROM trusted_cidr ORDER BY hits DESC, last_seen DESC LIMIT ?", (lim,))
+    return _query_ro("SELECT * FROM trusted_cidr ORDER BY hits DESC, last_seen DESC")
+
+
+def list_trusted_cidr_strings():
+    """只取 cidr 字段（匹配用，避免多传无关列）。只读。"""
+    return [r["cidr"] for r in _query_ro("SELECT cidr FROM trusted_cidr")]
+
+
+def count_trusted_in_subnet(prefix):
+    """已学习表里落在给定 /24 内的条目数（用于判断是否升级为整段可信）。只读。
+
+    prefix 传 `a.b.c.0/24`；用 LIKE 前缀近似（trusted_cidr 里存的是单 IP 或少数 CIDR），
+    不会把 /16 之类的宽条目算进来 —— 这里只想知道「同段有几个具体回源 IP 被学到」。
+    """
+    try:
+        base = str(prefix).split("/")[0].rsplit(".", 1)[0] + "."
+    except (AttributeError, IndexError):
+        return 0
+    rows = _query_ro(
+        "SELECT COUNT(*) AS n FROM trusted_cidr WHERE cidr LIKE ? AND cidr LIKE '%/32'",
+        (base + "%",))
+    try:
+        return int((rows[0] or {}).get("n") or 0)
+    except (IndexError, TypeError, ValueError):
+        return 0
+
+
+def del_trusted_cidr(cidr):
+    """移除一条学习的可信网段（运维误学时用）。"""
+    try:
+        cidr = str(ipaddress.ip_network((cidr or "").strip(), strict=False))
+    except ValueError:
+        return 0
+    cur = _exec("DELETE FROM trusted_cidr WHERE cidr=?", (cidr,))
+    return cur.rowcount
+
+
+def clear_trusted_cidrs():
+    """清空所有学习的可信网段，返回删除条数。"""
+    cur = _exec("DELETE FROM trusted_cidr")
+    return cur.rowcount
 
 
 def clear_blacklist():

@@ -205,3 +205,66 @@ class ApplyActionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LearnTrustedTest(unittest.TestCase):
+    """自动学习：AI 判 CDN 回源后记住，后续同段新 IP 也不再被封。
+
+    owner 拿不到 ESA 的回源 IP 列表，所以只能靠程序「遇到过就记住」。
+    """
+
+    def setUp(self):
+        from tests import new_home
+        new_home(self)
+        self.cfg = dict(config.DEFAULTS)
+        self.cfg.update({"ai_auto_ban": True, "ai_suspicious_ban": True,
+                         "ai_cdn_guard": True, "ai_learn_cdn": True,
+                         "blacklist_enabled": True})
+
+    def _apply(self, ip, proxies="a_http,b_http", geo="中国 移动"):
+        it = {"geo": geo, "proxies": proxies, "conns": 150}
+        with mock.patch.object(store, "list_ips", return_value=[]):
+            return ai._apply_action(ip, "suspicious", "web_scan", "x", it, self.cfg)
+
+    def _banned(self, ip):
+        with mock.patch.object(store, "list_ips", return_value=[]):
+            return store.is_banned(ip)
+
+    def test_cdn_origin_ip_is_learned(self):
+        self._apply("61.241.14.33")
+        self.assertIn("61.241.14.33/32", store.list_trusted_cidr_strings())
+
+    def test_learned_ip_is_trusted_even_if_heuristic_misses(self):
+        """学到之后，即使这次只打 1 个代理（启发式落空）也靠学习表挡住。"""
+        self._apply("61.241.14.33")                    # 先学到
+        res = self._apply("61.241.14.33", proxies="nightcc-tcp")
+        self.assertEqual(res["mode"], "trusted")
+        self.assertFalse(self._banned("61.241.14.33"))
+
+    def test_second_ip_in_subnet_escalates_to_24(self):
+        """同段学到第 2 个回源 IP -> 自动升级为整段可信。"""
+        self._apply("61.241.14.33")
+        self.assertNotIn("61.241.14.0/24", store.list_trusted_cidr_strings())
+        self._apply("61.241.14.41")
+        self.assertIn("61.241.14.0/24", store.list_trusted_cidr_strings())
+
+    def test_unseen_ip_in_learned_subnet_not_banned(self):
+        """学成 /24 后，同段从未见过的新节点也不再被封。"""
+        self._apply("61.241.14.33")
+        self._apply("61.241.14.41")
+        res = self._apply("61.241.14.200", proxies="nightcc-tcp")
+        self.assertEqual(res["mode"], "trusted")
+        self.assertFalse(self._banned("61.241.14.200"))
+
+    def test_other_subnet_still_banned(self):
+        """学习不能连带放行其它段。"""
+        self._apply("61.241.14.33")
+        self._apply("61.241.14.41")
+        res = self._apply("8.8.4.4", proxies="nightcc-tcp", geo="美国")
+        self.assertNotEqual(res["action"], "skipped")
+        self.assertTrue(self._banned("8.8.4.4"))
+
+    def test_learning_off_learns_nothing(self):
+        self.cfg["ai_learn_cdn"] = False
+        self._apply("61.241.14.33")
+        self.assertEqual(store.list_trusted_cidr_strings(), [])

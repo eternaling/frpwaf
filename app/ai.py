@@ -150,31 +150,76 @@ def _extract_json(text):
 
 
 def _in_trusted_cidr(ip, cfg):
-    """IP 是否落在「永不自动封禁」的可信网段里（配置 ai_trusted_cidrs）。
+    """IP 是否落在「永不自动封禁」的可信网段里。
 
-    为什么需要显式白名单：站点前置了 CDN/WAF/反代时，源站看到的**所有**连接
-    都来自那些节点的 IP。按 IP 封禁等于把所有真实用户一起封上（2026-11 就因封
-    阿里云 ESA 回源段导致整站 522）。这是确定性保护，不依赖模型判断。
+    两个来源（任一命中即可）：
+      1. 配置 `ai_trusted_cidrs`（运维手动声明的，确定性）；
+      2. **自动学习表** `trusted_cidr`（AI 判过 CDN 回源的 IP/段会自己记下）。
 
-    配置格式：逗号/空格分隔的 CIDR，例：`47.123.0.0/16, 8.25.82.0/24`。
-    留空或解析失败 → 视为未命中（不影响主流程）。
+    为什么需要：站点前置 CDN/WAF 时，回源 IP 属于共享边缘节点，封一个等于封
+    一片真实用户（2026-11 封掉阿里云 ESA 回源段 → 整站 522）。而回源 IP 段
+    不是固定公开列表（owner 也拿不到），所以只能「遇到过就记住」——这就是
+    第 2 个来源的意义。
+
+    调用频率：每个送审 IP 一次（不是每个连接），一次 DB 只读查询可接受。
     """
-    raw = str(cfg.get("ai_trusted_cidrs") or "").strip()
-    if not raw:
-        return False
     try:
         obj = ipaddress.ip_address(ip)
     except ValueError:
         return False
-    for part in re.split(r"[,;\s]+", raw):
-        if not part:
-            continue
+    cands = []
+    raw = str(cfg.get("ai_trusted_cidrs") or "").strip()
+    if raw:
+        cands.extend(p for p in re.split(r"[,;\s]+", raw) if p)
+    try:
+        cands.extend(store.list_trusted_cidr_strings())
+    except Exception:
+        pass                      # 读学习表失败不影响主流程
+    for part in cands:
         try:
             if obj in ipaddress.ip_network(part, strict=False):
                 return True
         except ValueError:
             continue
     return False
+
+
+def _learn_trusted(ip, reason, subnet=False):
+    """把 IP（或它所在的 /24）记入「可信回源网段」，以后不再自动封。
+
+    这只是**观察到的经验**，不改变本次处置——本次是否跳过封禁由调用方决定。
+    学习失败静默忽略：记不住也不该影响封禁/放行决策。
+
+    subnet=True 时直接学 /24（同段熔断触发时用）。
+
+    自动升级：只学 /32 时，同一 /24 里学到**第 2 个**回源 IP 就把整个 /24 也记下。
+    为什么：CDN 边缘节点是成批出现的（事故里 61.241.14.x 有 26 个），
+    逐个 /32 记会让每个新节点先被封一次才学会。同段出现 2 个回源 IP 已足以
+    说明这是个共享段，而不是巧合。
+    """
+    try:
+        obj = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    try:
+        if subnet and obj.version == 4:
+            return store.add_trusted_cidr(
+                str(ipaddress.ip_network(str(obj) + "/24", strict=False)), reason)
+        learned = store.add_trusted_cidr(str(obj), reason)
+        # 同段已有第 2 个回源 IP -> 升级为整段可信
+        if obj.version == 4:
+            prefix = str(ipaddress.ip_network(str(obj) + "/24", strict=False))
+            try:
+                n = store.count_trusted_in_subnet(prefix)
+            except Exception:
+                n = 0
+            if n >= 2:
+                store.add_trusted_cidr(
+                    prefix, "同段已学到 %d 个回源 IP，升级为整段可信（%s）"
+                    % (n, (reason or "")[:60]))
+        return learned
+    except Exception:
+        return None
 
 
 def _subnet_ban_hot(ip, cfg):
@@ -320,6 +365,10 @@ def _apply_action(ip, verdict, category, reason, it, cfg):
     # 整站不可访问（CDN 回源被拒 → 522）。仅对「本会触发封禁」的判定生效
     # （benign/unknown 本就不处置，走常规记录即可），只记录、不写任何封禁。
     if verdict in ("malicious", "suspicious") and _is_cdn_origin(category, it, cfg):
+        # 学到了就记住：下次同一个回源节点（或新节点）直接命中学习表，
+        # 不再依赖「混访多站」这个启发式（它可能因窗口内只命中 1 个代理而落空）。
+        if cfg.get("ai_learn_cdn", True):
+            _learn_trusted(ip, "AI 判定 CDN 回源：" + (reason or "")[:80])
         store.add_ai_review(0, ip, verdict, "CDN 回源，跳过自动处置", "skipped",
                             cfg.get("ai_model", ""))
         return {"ip": ip, "verdict": verdict, "category": category, "reason": reason,
@@ -340,6 +389,10 @@ def _apply_action(ip, verdict, category, reason, it, cfg):
     if verdict in ("malicious", "suspicious"):
         hit, count = _subnet_ban_hot(ip, cfg)
         if hit:
+            # 熔断时把整个 /24 学会：已经证明这个段里有多个 IP 被封，
+            # 大概率是共享出口/CDN，单个 /32 记不住这个段。
+            if cfg.get("ai_learn_cdn", True):
+                _learn_trusted(ip, "同段批量封禁熔断（%d 个）" % count, subnet=True)
             store.add_ai_review(
                 0, ip, verdict,
                 "同一 /24 在 %d 秒内已有 %d 个 IP 被自动封禁，判定为共享出口/CDN 段，"

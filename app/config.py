@@ -177,6 +177,11 @@ DEFAULTS = {
     # 0 = 关闭熔断。事故中 61.241.14.x 一次被封 26 个、39.91.185.x 17 个。
     "ai_subnet_ban_limit": 5,
     "ai_subnet_ban_window": 900,          # 熔断统计窗口（秒）
+    # 自动学习 CDN 回源 IP：AI 判定某 IP 为 CDN 回源、或同段熔断触发时，
+    # 把它（/ 熔断时取 /24）记入 trusted_cidr 表，以后直接跳过自动封禁。
+    # 这是「无需预知回源段」的关键：owner 拿不到 ESA 的回源 IP 列表，
+    # 只能靠程序自己遇到过就记住。
+    "ai_learn_cdn": True,
     "ai_ban_seconds": 1800,               # 疑似封禁时长（秒）；确凿判定走永久黑名单
     "ai_suspicious_ban": True,            # 疑似（suspicious）是否自动临时封禁
     "ai_ssh_strict": True,                # SSH 相关（SSH 爆破 / ssh 代理）是否从严
