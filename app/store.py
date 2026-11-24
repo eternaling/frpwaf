@@ -945,6 +945,29 @@ def release_ban(ban_id):
     invalidate_bans()
 
 
+def count_recent_bans_in_subnet(subnet, window_sec):
+    """窗口内同一网段下被自动封禁的**不同 IP** 数量（同段熔断用，只读）。
+
+    subnet 传 CIDR（如 `61.241.14.0/24`），用 SQL 前缀匹配近似：
+    把 CIDR 拆成前 3 段做 `ip LIKE 'a.b.c.%'`。比在应用层遍历所有 ban_log 便宜得多，
+    且 /24 场景下与真正的网段判断等价（ban_log 里存的是单 IP，不是 CIDR）。
+
+    只统计**自动处置**写下的记录（reason 以 `ai:` 开头）：手工封禁是人工判断，
+    不应被自动熔断屏蔽。
+    """
+    now = int(time.time())
+    since = now - int(window_sec)
+    prefix = str(subnet).split("/")[0].rsplit(".", 1)[0] + "."
+    rows = _query_ro(
+        "SELECT COUNT(DISTINCT ip) AS n FROM ban_log "
+        "WHERE banned_at>=? AND substr(reason,1,3)='ai:' AND ip LIKE ?",
+        (since, prefix + "%"))
+    try:
+        return int((rows[0] or {}).get("n") or 0)
+    except (IndexError, TypeError, ValueError):
+        return 0
+
+
 def release_bans(ids):
     """批量把 ban_log 里给定 id 标记为已释放（一条语句一次 commit）。
 

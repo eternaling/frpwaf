@@ -167,6 +167,16 @@ DEFAULTS = {
     "ai_max_ips": 20,                     # 每次最多送审的 IP 数
     "ai_auto_ban": True,                  # AI 判定为恶意时是否自动处置
     "ai_cdn_guard": True,                 # CDN 回源保护：判定为 CDN 回源的 IP 不自动封禁
+    # 永不自动封禁的网段（逗号/空白分隔的 CIDR）。
+    # 用途：站点前置了 CDN/WAF/反代时，源站看到的**所有**连接都来自这些节点的 IP，
+    # 按 IP 封禁等于封所有真实用户（2026-11 就因封阿里云 ESA 回源段导致整站 522）。
+    # 留空 = 不启用显式白名单（仍有关键字与同段熔断两道保护）。
+    "ai_trusted_cidrs": "",
+    # 同段批量封禁熔断：窗口内同一 /24 已有 N 个不同 IP 被自动封禁时，
+    # 判定该段大概率是共享出口/CDN 节点而非独立攻击者，停止继续封。
+    # 0 = 关闭熔断。事故中 61.241.14.x 一次被封 26 个、39.91.185.x 17 个。
+    "ai_subnet_ban_limit": 5,
+    "ai_subnet_ban_window": 900,          # 熔断统计窗口（秒）
     "ai_ban_seconds": 1800,               # 疑似封禁时长（秒）；确凿判定走永久黑名单
     "ai_suspicious_ban": True,            # 疑似（suspicious）是否自动临时封禁
     "ai_ssh_strict": True,                # SSH 相关（SSH 爆破 / ssh 代理）是否从严

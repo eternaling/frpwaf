@@ -149,6 +149,67 @@ def _extract_json(text):
     return salvaged if salvaged else None
 
 
+def _in_trusted_cidr(ip, cfg):
+    """IP 是否落在「永不自动封禁」的可信网段里（配置 ai_trusted_cidrs）。
+
+    为什么需要显式白名单：站点前置了 CDN/WAF/反代时，源站看到的**所有**连接
+    都来自那些节点的 IP。按 IP 封禁等于把所有真实用户一起封上（2026-11 就因封
+    阿里云 ESA 回源段导致整站 522）。这是确定性保护，不依赖模型判断。
+
+    配置格式：逗号/空格分隔的 CIDR，例：`47.123.0.0/16, 8.25.82.0/24`。
+    留空或解析失败 → 视为未命中（不影响主流程）。
+    """
+    raw = str(cfg.get("ai_trusted_cidrs") or "").strip()
+    if not raw:
+        return False
+    try:
+        obj = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for part in re.split(r"[,;\s]+", raw):
+        if not part:
+            continue
+        try:
+            if obj in ipaddress.ip_network(part, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _subnet_ban_hot(ip, cfg):
+    """同一 /24 是否因批量封禁而「变热」（返回 (是否熔断, 已有封禁数)）。
+
+    动机：CDN/WAF 的回源节点往往集中在同一运营商 /24 里（事故中
+    61.241.14.x 一次被封 26 个、39.91.185.x 17 个）。真实攻击者很少会在
+    短时间内在同一个 /24 里凑出这么多不同 IP 去探测同一个端口。
+
+    因此：窗口内同一 /24 已有 >= limit 个不同 IP 被自动封禁时，判定该段大概率
+    是共享出口/CDN 节点，停止继续封（避免群集连坐把整段用户打挂）。
+
+    limit <= 0 表示关闭熔断；会话错误时返回未熔断（宁可继续按模型判定处置）。
+    """
+    try:
+        limit = int(cfg.get("ai_subnet_ban_limit") or 0)
+        window = int(cfg.get("ai_subnet_ban_window") or 900)
+    except (TypeError, ValueError):
+        return False, 0
+    if limit <= 0:
+        return False, 0
+    try:
+        obj = ipaddress.ip_address(ip)
+        if obj.version != 4:
+            return False, 0          # 只对 IPv4 /24 做熔断；v6 前缀语义不同
+        subnet = str(ipaddress.ip_network(str(obj) + "/24", strict=False))
+    except ValueError:
+        return False, 0
+    try:
+        n = store.count_recent_bans_in_subnet(subnet, window)
+    except Exception:
+        return False, 0
+    return (n >= limit), n
+
+
 def _is_whitelisted(ip):
     """IP 是否落在白名单内（白名单优先：AI 不对其自动处置）。
 
@@ -264,6 +325,29 @@ def _apply_action(ip, verdict, category, reason, it, cfg):
         return {"ip": ip, "verdict": verdict, "category": category, "reason": reason,
                 "action": "skipped", "mode": "cdn", "ssh": ssh,
                 "geo": it.get("geo", ""), "conns": it.get("conns", 0)}
+
+    # 显式可信网段（配置 ai_trusted_cidrs）：确定性保护，不依赖模型判断。
+    # 站点前置 CDN/WAF 时，源站看到的全是节点 IP，按 IP 封禁 = 封所有真实用户。
+    if verdict in ("malicious", "suspicious") and _in_trusted_cidr(ip, cfg):
+        store.add_ai_review(0, ip, verdict, "命中可信网段（ai_trusted_cidrs），跳过自动处置",
+                            "skipped", cfg.get("ai_model", ""))
+        return {"ip": ip, "verdict": verdict, "category": category, "reason": reason,
+                "action": "skipped", "mode": "trusted", "ssh": ssh,
+                "geo": it.get("geo", ""), "conns": it.get("conns", 0)}
+
+    # 同段批量封禁熔断：窗口内同一 /24 已有多个 IP 被自动封禁 -> 大概率是
+    # 共享出口/CDN 节点（不是独立攻击者），停止继续封，避免越封越多、整段连坐。
+    if verdict in ("malicious", "suspicious"):
+        hit, count = _subnet_ban_hot(ip, cfg)
+        if hit:
+            store.add_ai_review(
+                0, ip, verdict,
+                "同一 /24 在 %d 秒内已有 %d 个 IP 被自动封禁，判定为共享出口/CDN 段，"
+                "跳过自动处置（熔断）" % (int(cfg.get("ai_subnet_ban_window") or 900), count),
+                "skipped", cfg.get("ai_model", ""))
+            return {"ip": ip, "verdict": verdict, "category": category,
+                    "reason": reason, "action": "skipped", "mode": "subnet",
+                    "ssh": ssh, "geo": it.get("geo", ""), "conns": it.get("conns", 0)}
 
     if not cfg.get("ai_auto_ban"):
         action, mode = "none", ""
