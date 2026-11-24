@@ -105,6 +105,21 @@ class ReconcileTest(unittest.TestCase):
                             cur={"192.0.2.30": 599})
         self.assertEqual(self.rec.n, 0, self.rec.argvs())
 
+    def test_expired_member_is_deleted_not_left_to_kernel_timeout(self):
+        """已到期的条目必须主动 del。
+
+        回归用例：旧实现遇到 `exp <= now` 直接 continue，注释写的是「集合自身的
+        per-entry timeout 会移除」。但那个 timeout 只保证到点后不再命中，
+        **条目仍然留在集合里**（生产上实测遗留 9 条 expire_at 已过、内核还在等
+        的情况），导致 DB 与内核长期不一致。
+        """
+        now = int(time.time())
+        # cur 里给一个只剩 0 秒/已过期的成员；want 为空 = 数据库已无此封禁
+        firewall._reconcile("frpwaf_block", want={}, cur={"192.0.2.40": 1})
+        body = self.rec.payload()
+        self.assertIn("del", body, "已过期条目必须下发 del，不能留给内核超时")
+        self.assertIn("192.0.2.40", body)
+
 
 class SyncFromStoreTest(unittest.TestCase):
     """sync_from_store 的记忆化行为。"""

@@ -534,9 +534,11 @@ def _reconcile(setname, want, cur=None):
     for m, exp in base.items():
         if m in want:
             continue
-        if exp and exp <= now:
-            # 已到期：集合自身的 per-entry timeout 会移除，不必再 del 一次
-            continue
+        # 已到期也必须主动 del，不能指望集合自身的 per-entry timeout：
+        # 那个 timeout 只保证「到点后不再命中」，但条目会留在集合里，
+        # 而集合大小是有限的（且 ipset 不会自动清理已过期条目 —— 实际观测
+        # 过内核里留下 9 条 expire_at 已过、timeout 仍在等的情况）。
+        # 依赖内核 timeout 会导致 DB 与内核长期不一致。
         cmds.append("del %s %s" % (setname, m))
     for m, exp in want.items():
         old = base.get(m, _MISSING)
