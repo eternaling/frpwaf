@@ -183,20 +183,39 @@ def _is_ssh_related(category, reason, proxies):
 
 # 纯 CDN/反代厂商关键字（归属地/ISP 文本命中即视为 CDN 回源强特征）。
 # 只收录「本身即 CDN 服务商」的名称：共享云厂商通用名（如 Amazon / Google /
-# Microsoft）不收录，避免把云主机上的普通用户/攻击者误判为回源而放行。
+# Microsoft）不收录，避免把云主机上的普通用户/误判为回源而放行。
+#
+# 阿里云 ESA（边缘安全加速）必须单独列：它的回源节点 IP 属于阿里云普通网段
+# （实测 47.123.x.x / 8.25.82.x.x），归属地只写「阿里云」而不会带 “cdn” 字样，
+# 光靠 "阿里云 cdn" 永远不命中 —— 2026-11 就因此把 ESA 回源 IP 当扫描器封了一批
+# （ban_log 里模型自己写着「无法确证 CDN 回源」），造成站点短暂 522。
 _CDN_KEYWORDS = (
     "cloudflare", "cloudfront", "fastly", "sucuri", "imperva", "incapsula",
     "akamai", "阿里云 cdn", "腾讯云 cdn", "百度云加速", "网宿", "chinacache",
     "keycdn", "bunnycdn", "stackpath", "edgecast", "limelight", "gcore",
+    # 阿里云 ESA（边缘安全加速）及其别名/英文名
+    "esa", "edge security acceleration", "边缘安全加速",
+    # 阿里云 CDN 的其它常见写法（归属地文本不统一）
+    "aliyun cdn", "alibaba cloud cdn", "aliyuncs",
+    # 腾讯云 EdgeOne
+    "edgeone", "tencent cloud cdn",
 )
 
 
 def _is_cdn_origin(category, it, cfg):
     """判断某送审 IP 是否应按「CDN 回源」跳过自动封禁（仅记录）。
 
-    两个来源任一命中即视为回源：
+    三层判断，任一命中即视为回源（层层兜底，因为模型会漏判）：
       1. 模型判定 category=cdn_origin（提示词已要求识别，最可靠）；
-      2. 归属地/ISP 文本命中纯 CDN 厂商关键字（模型漏判时的兜底）。
+      2. 归属地/ISP 文本命中 CDN 厂商关键字；
+      3. **行为特征**：同一 IP 同时访问多个不同 Web 站点代理（`proxies` 里
+         出现 2 个以上不同代理名，且都是 http/https 类）。
+
+    第 3 层是 2026-11 事故后补的：实测 ESA 回源 IP（47.123.x.x / 8.25.82.x.x）
+    的归属地只写「阿里云」不带 CDN 字样，模型又判 suspicious 并自述「无法
+    确证 CDN 回源」，前两层全部落空，于是回源 IP 被临时封禁 → 站点 522。
+    CDN 回源本质就是「一个 IP 后面跟着大量真实用户、混访多个站点」，
+    这个行为特征比话语描述可靠得多。
 
     注意：该判断只影响「自动处置」，不影响送审与审计记录；`ai_cdn_guard`
     关闭时不做任何跳过（恢复原有分级处置）。
@@ -206,7 +225,14 @@ def _is_cdn_origin(category, it, cfg):
     if (category or "").lower() == "cdn_origin":
         return True
     text = (str(it.get("geo") or "")).lower()
-    return any(k in text for k in _CDN_KEYWORDS)
+    if any(k in text for k in _CDN_KEYWORDS):
+        return True
+    # 行为特征：混访多个站点代理 → 典型的边缘节点/反向代理回源
+    try:
+        names = {p for p in re.split(r"[,;\s]+", str(it.get("proxies") or "")) if p}
+    except Exception:
+        names = set()
+    return len(names) >= 2
 
 
 def _apply_action(ip, verdict, category, reason, it, cfg):
