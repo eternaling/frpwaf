@@ -1655,6 +1655,9 @@ function fwCdnTrustClear(){
 }
 /* fill=true 时回填豁免代理/有效期输入框；删除信任 IP 后只刷新表格，不覆盖未保存的编辑 */
 function fwLoadSelfProtect(fill){
+  // 进页先把自己的 IP 记入信任（宝塔面板登录本身是强认证）。
+  // 失败不阻断页面渲染：拿不到 IP 时只是不写，不影响查看。
+  fwSend('trust_my_ip', {}, function(){});
   fwSend('self_protect_info', {}, function(r){
     var tb=document.getElementById('fwTrustList');
     if(!r || !r.status){
@@ -1673,7 +1676,7 @@ function fwLoadSelfProtect(fill){
             +'<td class="c"><button class="btn btn-danger btn-xs" data-ip="'+fwEsc(x.ip)+'" onclick="fwTrustLoginDel(this.dataset.ip)">取消</button></td></tr>';
         }).join('')
       : '<tr><td colspan="3" style="color:#bbb;text-align:center">'
-        +(ttl>0 ? '暂无信任 IP。登录面板成功后会自动出现在这里。' : '登录信任已关闭（有效期为 0），登录后不会自动加入信任名单。')
+        +(ttl>0 ? '暂无信任 IP。登录宝塔面板或打开本页后会自动出现在这里。' : '登录信任已关闭（有效期为 0），登录后不会自动加入信任名单。')
         +'</td></tr>';
     var res=d.exempt_resolved||[];
     document.getElementById('fwExemptResolved').innerHTML = res.length

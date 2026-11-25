@@ -1799,6 +1799,54 @@ class frpwaf_main:
         except Exception:
             return public.returnMsg(False, "清空失败：" + traceback.format_exc()[-200:])
 
+    def trust_my_ip(self, get=None):
+        """把**当前访问宝塔面板的客户端 IP** 记入登录信任名单。
+
+        为什么要这个：7080 独立面板的「登录即信任」对 owner 不起作用——他的工作流
+        是直接连数据库/SSH 隧道（走 frps 的 80/443），根本不会去访问 7080 面板。
+       而宝塔面板登录需要密码，本身就是一次强认证，所以把「插件被调用时的客户端 IP」
+        也当作可信来源是合理的。
+
+        IP 取 `public.get_client_ip()`：直连取 REMOTE_ADDR，经反代时取 X-Forwarded-For
+        （宝塔面板常挂 nginx，用户真实 IP 在转发头里）。
+
+        本机回环不写入（127.0.0.1 没有豁免意义，只会把真信息淹没）。
+        返回是否写入与写入的 IP。
+        """
+        try:
+            cfg = self._cfg_effective()
+            try:
+                ttl = int(cfg.get("trust_login_ttl") or 0)
+            except (TypeError, ValueError):
+                ttl = 0
+            if ttl <= 0:
+                return {"status": True, "msg": "登录信任已关闭（trust_login_ttl=0）",
+                        "data": {"saved": False, "ip": ""}}
+            try:
+                ip = str(public.get_client_ip() or "").strip()
+            except Exception:
+                ip = ""
+            ip = ip.replace("::ffff:", "")
+            try:
+                ip = str(ipaddress.ip_address(ip))
+            except ValueError:
+                return {"status": False, "msg": "无法获取有效的客户端 IP"}
+            # 回环地址不写：插件自己/本机调试不应占用信任名额
+            if ipaddress.ip_address(ip).is_loopback:
+                return {"status": True, "msg": "本机访问不写入信任",
+                        "data": {"saved": False, "ip": ip}}
+            self._store().trust_login_ip(ip, ttl)
+            self._engine_invalidate()
+            # 每次进插件页都会调，日志很容易刷爆：限频到 10 分钟一条
+            now = int(time.time())
+            if now - int(getattr(self, "_last_trust_log", 0) or 0) >= 600:
+                self._last_trust_log = now
+                self._audit("宝塔面板访问，已将 %s 加入登录信任（%d 秒）" % (ip, ttl))
+            return {"status": True, "msg": "已将当前 IP 加入信任：%s" % ip,
+                    "data": {"saved": True, "ip": ip, "ttl": ttl}}
+        except Exception:
+            return public.returnMsg(False, "写入登录信任失败：" + traceback.format_exc()[-200:])
+
     def self_protect_info(self, get=None):
         """防误封状态：登录信任 IP（含剩余秒数）+ 登录信任有效期 + 豁免代理。只读。"""
         try:
