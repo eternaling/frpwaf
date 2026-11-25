@@ -105,6 +105,7 @@
   <div class="bt-w-menu">
     <p class="bgw" data-item="status">概览</p>
     <p data-item="ban">IP 名单 / 封禁</p>
+    <p data-item="protect">误封保护</p>
     <p data-item="ai">AI 审查</p>
     <p data-item="connlog">连接日志</p>
     <p data-item="proxy">代理统计</p>
@@ -274,6 +275,54 @@
         </div>
       </div>
 
+      <!-- 误封保护：ESA 回源段 / 登录信任 / 代理豁免 -->
+      <div class="bt-w-item" data-item="protect">
+        <h2>误封保护</h2>
+        <div class="fw-grid cols-2">
+          <div class="fw-card fw-span-2">
+            <h3>ESA 回源段（自动学习） <span style="color:#999;font-size:12px;font-weight:400" id="fwCdnCount"></span> <span id="fwCdnLearn" class="fw-tag gray">检测中…</span></h3>
+            <div class="fw-row" style="margin-bottom:10px">
+              <span class="fw-tip" style="margin:0">AI 判定某 IP 为 CDN 回源时自动记录（开关：AI 设置里的 <code>ai_learn_cdn</code>）；命中这些网段的 IP 不会被 AI 自动处置。</span>
+              <span style="flex:1"></span>
+              <button class="btn btn-default btn-sm" onclick="fwLoadCdnTrust()">刷新</button>
+              <button class="btn btn-danger btn-sm" onclick="fwCdnTrustClear()">清空</button>
+            </div>
+            <div class="fw-table-wrap" style="max-height:320px">
+              <table class="fw-table"><thead><tr><th style="width:170px">网段</th><th style="width:90px" class="c">命中次数</th><th>学到的原因</th><th style="width:160px">最后见到</th><th style="width:80px" class="c">操作</th></tr></thead>
+              <tbody id="fwCdnList"><tr><td colspan="5" style="color:#bbb;text-align:center">加载中…</td></tr></tbody></table>
+            </div>
+          </div>
+          <div class="fw-card">
+            <h3>登录信任 IP <span style="color:#999;font-size:12px;font-weight:400" id="fwTrustCount"></span> <span id="fwTrustState" class="fw-tag gray">检测中…</span></h3>
+            <div class="fw-tip" style="margin:0 0 10px">登录面板成功后当前 IP 自动进入信任名单，在此期间不会触发自动封禁。</div>
+            <div class="fw-row" style="margin-bottom:10px">
+              <span style="flex:1"></span>
+              <button class="btn btn-default btn-sm" onclick="fwLoadSelfProtect(false)">刷新</button>
+              <button class="btn btn-danger btn-sm" onclick="fwTrustLoginClear()">全部取消</button>
+            </div>
+            <div class="fw-table-wrap" style="max-height:280px">
+              <table class="fw-table"><thead><tr><th>IP</th><th style="width:150px">剩余有效时间</th><th style="width:80px" class="c">操作</th></tr></thead>
+              <tbody id="fwTrustList"><tr><td colspan="3" style="color:#bbb;text-align:center">加载中…</td></tr></tbody></table>
+            </div>
+          </div>
+          <div class="fw-card">
+            <h3>代理豁免</h3>
+            <div class="fw-row">
+              <input id="fwExemptProxies" class="bt-input-text" style="width:100%" placeholder="ssh-tcp,mysql80-tcp,codebuddy*">
+            </div>
+            <div class="fw-tip">逗号分隔的代理名；这些代理照常准入、照常记日志，只是不再触发自动封禁。支持 <code>*</code> 通配，如 <code>codebuddy*</code>。</div>
+            <div class="fw-tip" id="fwExemptResolved"></div>
+            <div class="fw-row" style="margin-top:10px">
+              <span class="fw-tip" style="margin:0">登录信任有效期</span>
+              <input id="fwTrustTtl" class="bt-input-text" type="number" min="0" step="1" style="width:130px" value="86400">
+              <span class="fw-tip" style="margin:0">秒（0 = 关闭）</span>
+            </div>
+            <div class="fw-row" style="margin-top:12px">
+              <button class="btn btn-success btn-sm" id="fwProtectSaveBtn" onclick="fwSelfProtectSave()">保存</button>
+            </div>
+          </div>
+        </div>
+      </div>
       <!-- AI 审查 -->
       <div class="bt-w-item" data-item="ai">
         <h2>AI 自动 IP 审查 <span id="fwAiState" class="fw-badge off">未启用</span></h2>
@@ -828,6 +877,7 @@ document.querySelectorAll('.fw-main .bt-w-menu p').forEach(function(p){
     if(t==='log'){ fwLoadLog(); }
     if(t==='ban'){ fwLoadBans(); fwLoadIpList(); fwLoadBanHistory(); fwLoadKernBan(); }
     if(t==='ai'){ fwAiLoad(); }
+    if(t==='protect'){ fwLoadCdnTrust(); fwLoadSelfProtect(true); }
     if(t==='connlog'){ fwLogLoadProxies(); fwLoadBurst(); fwLogPage(0); }
     if(t==='proxy'){ fwLoadProxies(); }
     if(t==='settings'){ fwLoadPolicy(); fwLoadAdmin(); }
@@ -1552,6 +1602,118 @@ function fwKernBanSync(){
   });
 }
 
+/* ---- 误封保护：ESA 回源段 / 登录信任 / 代理豁免 ---- */
+/* 秒数 → 「x 天 y 小时」这类可读时长 */
+function fwFmtDur(s){
+  s=Math.max(0, parseInt(s,10)||0);
+  var d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60);
+  if(d) return d+' 天 '+h+' 小时';
+  if(h) return h+' 小时 '+m+' 分';
+  if(m) return m+' 分 '+(s%60)+' 秒';
+  return s+' 秒';
+}
+function fwLoadCdnTrust(){
+  fwSend('cdn_trust_list', {}, function(r){
+    var tb=document.getElementById('fwCdnList');
+    if(!r || !r.status){
+      tb.innerHTML='<tr><td colspan="5" style="color:#d33;text-align:center">'+fwEsc((r&&r.msg)||'请求失败，请稍后重试')+'</td></tr>';
+      return;
+    }
+    var d=r.data||{}, rows=d.items||[];
+    document.getElementById('fwCdnCount').textContent='共 '+(d.count||0)+' 条';
+    var lb=document.getElementById('fwCdnLearn');
+    lb.className='fw-tag '+(d.learn_enabled?'ok':'gray');
+    lb.textContent=d.learn_enabled?'自动学习已开启':'自动学习已关闭';
+    tb.innerHTML = rows.length
+      ? rows.map(function(x){
+          var reason=x.reason||'';
+          return '<tr><td class="mono">'+fwEsc(x.cidr)+'</td>'
+            +'<td class="c">'+fwEsc(x.hits)+'</td>'
+            +'<td class="remark" title="'+fwEsc(reason)+'"><span class="clamp">'+fwEsc(reason||'-')+'</span></td>'
+            +'<td class="nw dim">'+fwFmtTime(x.last_seen)+'</td>'
+            +'<td class="c"><button class="btn btn-danger btn-xs" data-cidr="'+fwEsc(x.cidr)+'" onclick="fwCdnTrustDel(this.dataset.cidr)">删除</button></td></tr>';
+        }).join('')
+      : '<tr><td colspan="5" style="color:#bbb;text-align:center">还没有学到回源段。AI 判定某 IP 为 CDN 回源时会自动记录。</td></tr>';
+  });
+}
+function fwCdnTrustDel(cidr){
+  layer.confirm('确认删除回源段 <b>'+fwEsc(cidr)+'</b>？删除后该网段内的 IP 会重新参与 AI 自动处置。', {icon:3, title:'提示'}, function(i){
+    layer.close(i);
+    fwSend('cdn_trust_del', {cidr:cidr}, function(r){
+      bt_tools.msg((r&&r.msg)||'完成', (r&&r.status)); fwLoadCdnTrust();
+    });
+  });
+}
+function fwCdnTrustClear(){
+  layer.confirm('确认清空全部 ESA 回源段？清空后同段新节点会重新开始被 AI 判定，可能再次被封，需要重新学习。（将写入操作审计）',
+    {icon:2, title:'危险操作'}, function(i){
+    layer.close(i);
+    fwSend('cdn_trust_clear', {}, function(r){
+      bt_tools.msg((r&&r.msg)||'完成', (r&&r.status)); fwLoadCdnTrust();
+    });
+  });
+}
+/* fill=true 时回填豁免代理/有效期输入框；删除信任 IP 后只刷新表格，不覆盖未保存的编辑 */
+function fwLoadSelfProtect(fill){
+  fwSend('self_protect_info', {}, function(r){
+    var tb=document.getElementById('fwTrustList');
+    if(!r || !r.status){
+      tb.innerHTML='<tr><td colspan="3" style="color:#d33;text-align:center">'+fwEsc((r&&r.msg)||'请求失败，请稍后重试')+'</td></tr>';
+      return;
+    }
+    var d=r.data||{}, rows=d.trust_login||[], ttl=parseInt(d.trust_login_ttl,10)||0;
+    document.getElementById('fwTrustCount').textContent='共 '+rows.length+' 条';
+    var st=document.getElementById('fwTrustState');
+    st.className='fw-tag '+(ttl>0?'ok':'gray');
+    st.textContent = ttl>0 ? ('已开启 · 有效期 '+fwFmtDur(ttl)) : '已关闭';
+    tb.innerHTML = rows.length
+      ? rows.map(function(x){
+          return '<tr><td class="mono">'+fwEsc(x.ip)+'</td>'
+            +'<td class="nw" title="到期 '+fwEsc(fwFmtTime(x.expires_at))+'">'+fwEsc(fwFmtDur(x.remaining_s))+'</td>'
+            +'<td class="c"><button class="btn btn-danger btn-xs" data-ip="'+fwEsc(x.ip)+'" onclick="fwTrustLoginDel(this.dataset.ip)">取消</button></td></tr>';
+        }).join('')
+      : '<tr><td colspan="3" style="color:#bbb;text-align:center">'
+        +(ttl>0 ? '暂无信任 IP。登录面板成功后会自动出现在这里。' : '登录信任已关闭（有效期为 0），登录后不会自动加入信任名单。')
+        +'</td></tr>';
+    var res=d.exempt_resolved||[];
+    document.getElementById('fwExemptResolved').innerHTML = res.length
+      ? '当前生效：'+res.map(function(n){ return '<span class="fw-tag info">'+fwEsc(n)+'</span>'; }).join(' ')
+      : '当前没有豁免任何代理。';
+    if(fill){
+      document.getElementById('fwExemptProxies').value = d.exempt_proxies||'';
+      document.getElementById('fwTrustTtl').value = ttl;
+    }
+  });
+}
+function fwTrustLoginDel(ip){
+  layer.confirm('确认取消 <b>'+fwEsc(ip)+'</b> 的登录信任？取消后该 IP 会重新参与自动封禁判定。', {icon:3, title:'提示'}, function(i){
+    layer.close(i);
+    fwSend('trust_login_del', {ip:ip}, function(r){
+      bt_tools.msg((r&&r.msg)||'完成', (r&&r.status)); fwLoadSelfProtect(false);
+    });
+  });
+}
+function fwTrustLoginClear(){
+  layer.confirm('确认取消全部登录信任？包括你当前正在使用的 IP，之后需重新登录面板才会再次加入信任。（将写入操作审计）',
+    {icon:2, title:'危险操作'}, function(i){
+    layer.close(i);
+    fwSend('trust_login_clear', {}, function(r){
+      bt_tools.msg((r&&r.msg)||'完成', (r&&r.status)); fwLoadSelfProtect(false);
+    });
+  });
+}
+function fwSelfProtectSave(){
+  var ex=(document.getElementById('fwExemptProxies').value||'').trim();
+  var ttlRaw=String(document.getElementById('fwTrustTtl').value||'').trim();
+  if(!/^[0-9]+$/.test(ttlRaw)){ bt_tools.msg('登录信任有效期必须是非负整数（秒，0 = 关闭）', false); return; }
+  var btn=document.getElementById('fwProtectSaveBtn');
+  btn.disabled=true;
+  fwSend('self_protect_save', {auto_ban_exempt_proxies:ex, trust_login_ttl:ttlRaw}, function(r){
+    btn.disabled=false;
+    bt_tools.msg((r&&r.msg)||'完成', (r&&r.status));
+    if(r && r.status) fwLoadSelfProtect(true);
+  });
+}
 /* ---- AI 审查 ---- */
 function fwAiLoad(){
   fwSend('ai_get_config', {}, function(r){

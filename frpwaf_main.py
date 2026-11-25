@@ -7,6 +7,7 @@
 # | 来源 IP 做黑/白名单与自动封禁，并提供独立管理面板。
 # +------------------------------------------------------------------
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -1717,6 +1718,180 @@ class frpwaf_main:
             return public.returnMsg(True, "已解封全部临时封禁（%d 条）" % n)
         except Exception:
             return public.returnMsg(False, "解封失败：" + traceback.format_exc()[-200:])
+
+    # ---------------- 误封保护：ESA 回源段 / 登录信任 / 代理豁免 ----------------
+    # 机制本身已在 app/ 实现，这里只提供面板读写入口：
+    #   trusted_cidr 表          —— AI 学到的 CDN 回源段，命中即不被 AI 自动处置
+    #   trust_login_ip 表        —— 网页端登录成功的来源 IP，有效期内不触发自动封禁
+    #   auto_ban_exempt_proxies  —— 免自动封禁的代理名（逗号分隔，支持 * 通配）
+    def _engine_invalidate(self):
+        """让本进程的决策缓存立即失效（守护进程侧靠自身 TTL 刷新，最长数秒）。"""
+        try:
+            fn = getattr(_app("engine"), "invalidate_cache", None)
+            if callable(fn):
+                fn()
+        except Exception:
+            pass
+
+    def _split_proxy_names(self, raw):
+        """豁免代理配置拆成列表：与 engine._proxy_exempt 同口径（逗号/分号/空白分隔），
+        大小写不敏感去重，保留首次出现的写法与顺序。"""
+        out, seen = [], set()
+        for part in str(raw or "").replace(",", " ").replace(";", " ").split():
+            key = part.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(part)
+        return out
+
+    def cdn_trust_list(self, get=None):
+        """ESA/CDN 回源段列表（trusted_cidr 表，按命中次数降序）。只读。"""
+        try:
+            store = self._store()
+            cap = int(getattr(store, "PANEL_LIST_CAP", 0) or 0)
+            rows = store.list_trusted_cidrs(cap) or []
+            items = []
+            for r in rows:
+                items.append({
+                    "cidr": r.get("cidr") or "",
+                    "hits": int(r.get("hits") or 0),
+                    "reason": r.get("reason") or "",
+                    "created_at": int(r.get("created_at") or 0),
+                    "last_seen": int(r.get("last_seen") or 0),
+                })
+            total = len(store.list_trusted_cidr_strings() or [])
+            cfg = self._cfg_effective()
+            return {"status": True, "data": {
+                "items": items,
+                "count": total,
+                "learn_enabled": bool(cfg.get("ai_learn_cdn", True)),
+            }}
+        except Exception:
+            return public.returnMsg(False, "读取回源段失败：" + traceback.format_exc()[-200:])
+
+    def cdn_trust_del(self, get=None):
+        """删除一条回源段（误学时用）。get.cidr 必填。"""
+        try:
+            raw = str(getattr(get, "cidr", "") or "").strip()
+            try:
+                cidr = str(ipaddress.ip_network(raw, strict=False))
+            except ValueError:
+                return public.returnMsg(False, "参数错误：网段不合法")
+            n = self._store().del_trusted_cidr(cidr)
+            if not n:
+                return public.returnMsg(False, "未找到该回源段：%s" % cidr)
+            self._engine_invalidate()
+            self._audit("插件端删除 CDN 回源段：%s" % cidr)
+            return public.returnMsg(True, "已删除回源段：%s" % cidr)
+        except Exception:
+            return public.returnMsg(False, "删除失败：" + traceback.format_exc()[-200:])
+
+    def cdn_trust_clear(self, get=None):
+        """清空全部回源段，返回删除条数（count）。"""
+        try:
+            n = int(self._store().clear_trusted_cidrs() or 0)
+            self._engine_invalidate()
+            self._audit("插件端清空 CDN 回源段（%d 条）" % n)
+            res = public.returnMsg(True, "已清空回源段（%d 条）" % n)
+            res["count"] = n
+            return res
+        except Exception:
+            return public.returnMsg(False, "清空失败：" + traceback.format_exc()[-200:])
+
+    def self_protect_info(self, get=None):
+        """防误封状态：登录信任 IP（含剩余秒数）+ 登录信任有效期 + 豁免代理。只读。"""
+        try:
+            cfg = self._cfg_effective()
+            now = int(time.time())
+            trust = []
+            for r in self._store().trusted_login_ips_with_expiry() or []:
+                exp = int(r.get("expires_at") or 0)
+                trust.append({
+                    "ip": r.get("ip") or "",
+                    "expires_at": exp,
+                    "created_at": int(r.get("created_at") or 0),
+                    "remaining_s": max(0, exp - now),
+                })
+            try:
+                ttl = int(cfg.get("trust_login_ttl") or 0)
+            except (TypeError, ValueError):
+                ttl = 0
+            raw = str(cfg.get("auto_ban_exempt_proxies") or "").strip()
+            return {"status": True, "data": {
+                "trust_login": trust,
+                "trust_login_ttl": ttl,
+                "exempt_proxies": raw,
+                "exempt_resolved": self._split_proxy_names(raw),
+            }}
+        except Exception:
+            return public.returnMsg(False, "读取防误封状态失败：" + traceback.format_exc()[-200:])
+
+    def self_protect_save(self, get=None):
+        """保存 auto_ban_exempt_proxies（豁免代理）与 trust_login_ttl（登录信任有效期，秒）。
+        只写传入的字段；走 _set_cfg（掩码过滤 + 并发保护）。"""
+        try:
+            patch = {}
+            raw_ex = getattr(get, "auto_ban_exempt_proxies", None)
+            if raw_ex is not None:
+                # 全角逗号也当分隔符，落盘统一成半角逗号，与 engine 解析口径一致
+                names = self._split_proxy_names(str(raw_ex).replace("，", ","))
+                for n in names:
+                    if len(n) > 64 or any(ord(c) < 32 for c in n):
+                        return public.returnMsg(False, "代理名不合法（单个不超过 64 个字符，不能含控制字符）")
+                if len(names) > 100:
+                    return public.returnMsg(False, "豁免代理最多 100 个")
+                patch["auto_ban_exempt_proxies"] = ",".join(names)
+            raw_ttl = getattr(get, "trust_login_ttl", None)
+            if raw_ttl is not None:
+                s = str(raw_ttl).strip()
+                if not s or any(c not in "0123456789" for c in s):
+                    return public.returnMsg(False, "登录信任有效期必须是非负整数（秒，0 = 关闭）")
+                ttl = int(s)
+                if ttl > 31536000:
+                    return public.returnMsg(False, "登录信任有效期不能超过 1 年（31536000 秒）")
+                patch["trust_login_ttl"] = ttl
+            if not patch:
+                return public.returnMsg(False, "参数错误：没有要保存的字段")
+            try:
+                self._set_cfg(patch)
+            except ValueError as e:
+                return public.returnMsg(False, "保存失败：%s" % e)
+            self._audit("插件端保存误封保护：豁免代理=%s；登录信任有效期=%s 秒" % (
+                patch.get("auto_ban_exempt_proxies", "(未改)"),
+                patch.get("trust_login_ttl", "(未改)")))
+            return public.returnMsg(True, "已保存")
+        except Exception:
+            return public.returnMsg(False, "保存失败：" + traceback.format_exc()[-200:])
+
+    def trust_login_del(self, get=None):
+        """取消一条登录信任。get.ip 必填。"""
+        try:
+            raw = str(getattr(get, "ip", "") or "").strip()
+            try:
+                ip = str(ipaddress.ip_address(raw))
+            except ValueError:
+                return public.returnMsg(False, "参数错误：IP 不合法")
+            n = self._store().untrust_login_ip(ip)
+            if not n:
+                return public.returnMsg(False, "该 IP 不在登录信任名单中：%s" % ip)
+            self._engine_invalidate()
+            self._audit("插件端取消登录信任：%s" % ip)
+            return public.returnMsg(True, "已取消登录信任：%s" % ip)
+        except Exception:
+            return public.returnMsg(False, "取消失败：" + traceback.format_exc()[-200:])
+
+    def trust_login_clear(self, get=None):
+        """清空登录信任，返回删除条数（count）。"""
+        try:
+            n = int(self._store().clear_trusted_login_ips() or 0)
+            self._engine_invalidate()
+            self._audit("插件端清空登录信任（%d 条）" % n)
+            res = public.returnMsg(True, "已全部取消登录信任（%d 条）" % n)
+            res["count"] = n
+            return res
+        except Exception:
+            return public.returnMsg(False, "清空失败：" + traceback.format_exc()[-200:])
 
     # ---------------- 概览统计 ----------------
     def waf_overview(self, get=None):
