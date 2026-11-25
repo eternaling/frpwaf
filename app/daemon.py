@@ -1287,6 +1287,19 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(0.3)
             return self._json({"code": 401, "msg": "用户名或密码错误"}, 401)
         _login_record(ip, True)
+        # 登录即信任：把当前 IP 记入豁免名单（防「在外面开发换网络后被自己的
+        # 自动封禁误封」）。故意在登录成功后做，失败不影响登录本身。
+        try:
+            ttl = int(config.get().get("trust_login_ttl") or 0)
+            if ttl > 0 and ip:
+                store.trust_login_ip(ip, ttl)
+                from . import engine as _engine
+                inv = getattr(_engine, "invalidate_cache", None)
+                if callable(inv):
+                    inv()                    # 让决策侧立刻看到新信任 IP
+                _log("登录成功，已将 %s 加入信任名单（%d 秒内不触发自动封禁）" % (ip, ttl))
+        except Exception:
+            pass
         _log("登录成功 来自 %s 用户名=%s" % (ip, user))
         token = auth.create_token(user)
         return self._json(

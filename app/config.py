@@ -182,6 +182,16 @@ DEFAULTS = {
     # 这是「无需预知回源段」的关键：owner 拿不到 ESA 的回源 IP 列表，
     # 只能靠程序自己遇到过就记住。
     "ai_learn_cdn": True,
+    # ---- 避免把自己封了（外面开发用）----
+    # 登录即信任：面板登录成功后，把来源 IP 记入信任名单，该 IP 不再触发自动封禁。
+    # TTL 单位秒，默认 24 小时；0 = 关闭该机制。
+    # 用途：在外面开发时 IP 经常变，换网络后登录一次面板即可，不用手加白名单。
+    "trust_login_ttl": 86400,
+    # 代理豁免：这些代理（逗号分隔，支持 * 通配）不参与自动封禁。
+    # 用途：自己用的数据库/SSH 隧道被客户端反复重连时，很容易命中
+    # 「敏感服务 20 次/60s -> 永久黑名单」而把自己封掉。
+    # 例：`mysql80-tcp,ssh-tcp,codebuddy*`
+    "auto_ban_exempt_proxies": "",
     "ai_ban_seconds": 1800,               # 疑似封禁时长（秒）；确凿判定走永久黑名单
     "ai_suspicious_ban": True,            # 疑似（suspicious）是否自动临时封禁
     "ai_ssh_strict": True,                # SSH 相关（SSH 爆破 / ssh 代理）是否从严

@@ -23,9 +23,13 @@ from . import config, store
 
 # 内存规则缓存
 _cache = {"black": [], "white": [], "loaded_at": 0,
-          "black_v4": [], "black_v6": [], "white_v4": [], "white_v6": []}
+          "black_v4": [], "black_v6": [], "white_v4": [], "white_v6": [],
+          # 登录即信任的 IP（面板登录后得的豁免名单），单独计时与规则缓存解耦
+          "trust_login": [], "trust_login_at": 0}
 _cache_lock = threading.Lock()
 CACHE_TTL = 3  # 秒
+# 登录信任名单的目标是「换网络后登录一次，马上生效」，所以 TTL 取得很短
+TRUST_LOGIN_TTL = 3  # 秒
 
 # 限速计数： ip -> (window_start, count)
 _rl = {}
@@ -334,6 +338,63 @@ def _bucket(nets):
 def invalidate_cache():
     with _cache_lock:
         _cache["loaded_at"] = 0
+        _cache["trust_login_at"] = 0
+
+
+def _trusted_login_ids():
+    """登录即信任的 IP 集合（带 3 秒缓存，不把 DB 查询带进决策热路径）。
+
+    为什么需要：在外面开发时 IP 不固定，连数据库/SSH 代理容易触发自动封禁
+    把自己封了；白名单又不现实（IP 一直在变）。改为面板登录成功就把当前 IP
+    记进信任表，这里读出来用于跳过自动封禁。
+
+    TTL 只有 3 秒：登录后要「立即生效」，且信任名单本来就会随时间过期。
+    读失败时返回空集合（宁可没有豁免，也不阻断决策）。
+    """
+    now = time.time()
+    with _cache_lock:
+        if now - _cache.get("trust_login_at", 0) <= TRUST_LOGIN_TTL:
+            return _cache.get("trust_login") or set()
+    try:
+        trusted = set(store.list_trusted_login_ips())
+    except Exception:
+        trusted = set()
+    with _cache_lock:
+        _cache["trust_login"] = trusted
+        _cache["trust_login_at"] = now
+    return trusted
+
+
+def _proxy_exempt(proxy_name, cfg):
+    """该代理是否不参与自动封禁（配置 auto_ban_exempt_proxies）。
+
+    用途：自己常用的代理（如 mysql80-tcp / ssh-tcp）被客户端反复重连时，
+    会因「敏感服务高频建连」把自己封了（而且是**永久**黑名单）。
+    把这些代理加进豁免名单即可——它们仍然是「应用层照常准入、日志照常记录」，
+    只是不再触发自动封禁。
+
+    支持 ﻿`*` 通配，例：`mysql80-tcp,ssh-tcp,codebuddy*`。
+    """
+    raw = str(cfg.get("auto_ban_exempt_proxies") or "").strip()
+    if not raw or not proxy_name:
+        return False
+    name = str(proxy_name).lower()
+    for part in re.split(r"[,;\s]+", raw):
+        pat = part.strip().lower()
+        if not pat:
+            continue
+        if pat == name:
+            return True
+        if "*" in pat:
+            # 支持任意位置的 `*`（转成正则安全匹配）。注意对 re.escape 后的模式
+            # 只把 \* 还原为 .*，避免其它字符被当正则会义字。
+            try:
+                rx = re.escape(pat).replace(r"\*", ".*")
+                if re.fullmatch(rx, name):
+                    return True
+            except re.error:
+                continue
+    return False
 
 
 # ---- 地址归一化 ----
@@ -692,7 +753,17 @@ def _attack_detect(cfg, ip, proxy_name, proxy_type):
 
     检测顺序：敏感服务（确凿，永久）-> CC -> 端口扫描。
     全部为内存计数，窗口过期自动重置，不查库、不做磁盘 IO。
+
+    两道豁免（在计数之前就返回，不写入任何封禁）：
+      1. 登录即信任：面板登录过的 IP（换网络后登录一次即可）；
+      2. 代理豁免：配置 auto_ban_exempt_proxies 里的代理（自己用的库/SSH 隧道）。
+    两者都只跳过**自动封禁**，不影响应用层准入与日志记录。
     """
+    if _proxy_exempt(proxy_name, cfg):
+        return ""
+    if ip in _trusted_login_ids():
+        return ""
+
     # 6.1 敏感服务爆破（ssh/mysql/redis 等）：高频新建 -> 永久黑名单
     if cfg.get("auto_ban_ssh_enabled") and _hit_sensitive(proxy_name, proxy_type):
         window = max(1, int(cfg.get("auto_ban_ssh_window") or 60))

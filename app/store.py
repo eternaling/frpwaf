@@ -114,6 +114,14 @@ CREATE TABLE IF NOT EXISTS trusted_cidr (
     last_seen INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_trusted_cidr_seen ON trusted_cidr(last_seen);
+-- 登录即信任：面板登录成功后把来源 IP 记进来（带过期时间）。
+-- 解决「在外面开发、IP 不固定、连数据库被自己的自动封禁误封」：
+-- 换网络后只要登录一次面板，当前 IP 就自动获得豁免，不用手加白名单。
+CREATE TABLE IF NOT EXISTS trust_login_ip (
+    ip TEXT PRIMARY KEY,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
 """
 
 
@@ -653,6 +661,60 @@ def del_trusted_cidr(cidr):
 def clear_trusted_cidrs():
     """清空所有学习的可信网段，返回删除条数。"""
     cur = _exec("DELETE FROM trusted_cidr")
+    return cur.rowcount
+
+
+# ---------------- 登录即信任（豁免自动封禁） ----------------
+
+def trust_login_ip(ip, ttl):
+    """把面板登录成功的来源 IP 记为「可信」（带过期时间，续期覆盖）。
+
+    用途：在外面开发时 IP 经常变，连数据库/SSH 代理容易触发自动封禁把自己封了。
+    换网络后只要登录一次面板，当前 IP 就自动豁免自动封禁（不需要手加白名单）。
+
+    ttl <= 0 时视为不启用（不写）。非法 IP 不写（防脏数据）。
+    """
+    try:
+        obj = ipaddress.ip_address((ip or "").strip())
+    except ValueError:
+        return None
+    ttl = int(ttl or 0)
+    if ttl <= 0:
+        return None
+    now = int(time.time())
+    _exec(
+        "INSERT INTO trust_login_ip(ip, expires_at, created_at) VALUES(?,?,?) "
+        "ON CONFLICT(ip) DO UPDATE SET expires_at=excluded.expires_at",
+        (str(obj), now + ttl, now))
+    return str(obj)
+
+
+def list_trusted_login_ips():
+    """当前仍有效的登录信任 IP（已过期的自动忽略，不依赖定时清理）。只读。"""
+    return [r["ip"] for r in _query_ro(
+        "SELECT ip FROM trust_login_ip WHERE expires_at>?", (int(time.time()),))]
+
+
+def trusted_login_ips_with_expiry():
+    """带过期时间的登录信任列表（面板展示用）。只读。"""
+    return _query_ro(
+        "SELECT ip, expires_at, created_at FROM trust_login_ip WHERE expires_at>? "
+        "ORDER BY expires_at DESC", (int(time.time()),))
+
+
+def untrust_login_ip(ip):
+    """取消某 IP 的登录信任，返回删除条数。"""
+    try:
+        obj = str(ipaddress.ip_address((ip or "").strip()))
+    except ValueError:
+        return 0
+    cur = _exec("DELETE FROM trust_login_ip WHERE ip=?", (obj,))
+    return cur.rowcount
+
+
+def clear_trusted_login_ips():
+    """清空登录信任，返回删除条数。"""
+    cur = _exec("DELETE FROM trust_login_ip")
     return cur.rowcount
 
 
