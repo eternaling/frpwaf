@@ -255,6 +255,20 @@ def _subnet_ban_hot(ip, cfg):
     return (n >= limit), n
 
 
+def _is_login_trusted(ip):
+    """IP 是否在「登录即信任」名单里（面板登录过，带 TTL）。
+
+    供 AI 处置侧使用：生产上 112.48.13.214 就是被 AI 以「临时访问 MySQL/Redis
+    等非 Web 服务」为由临时封的，光豁免引擎的自动封禁不够——AI 那条路也得让。
+
+    读失败按「不在信任中」处理（宁可照常处置，不能因读库失败而全放行）。
+    """
+    try:
+        return ip in set(store.list_trusted_login_ips())
+    except Exception:
+        return False
+
+
 def _is_whitelisted(ip):
     """IP 是否落在白名单内（白名单优先：AI 不对其自动处置）。
 
@@ -382,6 +396,16 @@ def _apply_action(ip, verdict, category, reason, it, cfg):
                             "skipped", cfg.get("ai_model", ""))
         return {"ip": ip, "verdict": verdict, "category": category, "reason": reason,
                 "action": "skipped", "mode": "trusted", "ssh": ssh,
+                "geo": it.get("geo", ""), "conns": it.get("conns", 0)}
+
+    # 登录即信任：面板登录过的 IP 也不自动处置。
+    # 为什么 AI 侧也要查：生产上 112.48.13.214 就是被 AI 以「临时访问 MySQL/Redis
+    # 等非 Web 服务且无探测证据」为由临时封的（不只是引擎的自动封禁）。
+    if verdict in ("malicious", "suspicious") and _is_login_trusted(ip):
+        store.add_ai_review(0, ip, verdict, "登录信任 IP，跳过自动处置",
+                            "skipped", cfg.get("ai_model", ""))
+        return {"ip": ip, "verdict": verdict, "category": category, "reason": reason,
+                "action": "skipped", "mode": "login", "ssh": ssh,
                 "geo": it.get("geo", ""), "conns": it.get("conns", 0)}
 
     # 同段批量封禁熔断：窗口内同一 /24 已有多个 IP 被自动封禁 -> 大概率是

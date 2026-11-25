@@ -21,7 +21,7 @@ HOME = tempfile.mkdtemp(prefix="frpwaf-exempt-")
 os.makedirs(os.path.join(HOME, "data"), exist_ok=True)
 os.environ.setdefault("FRPWAF_HOME", HOME)
 
-from app import config, engine, store  # noqa: E402
+from app import ai, config, engine, store  # noqa: E402
 
 
 def _in_blacklist(ip):
@@ -128,3 +128,41 @@ class ProxyExemptTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AILoginTrustTest(unittest.TestCase):
+    """AI 处置侧也要认登录信任。
+
+    生产实况：112.48.13.214 是被 AI 以「临时访问 MySQL/Redis 等非 Web 服务
+    且无探测证据」为由临时封的——光豁免引擎的自动封禁不够。
+    """
+
+    def setUp(self):
+        from tests import new_home
+        new_home(self)
+        from unittest import mock
+        self.mock = mock
+        self.cfg = dict(config.DEFAULTS)
+        self.cfg.update({"ai_auto_ban": True, "ai_suspicious_ban": True,
+                         "ai_cdn_guard": True, "blacklist_enabled": True})
+        self.it = {"geo": "中国 浙江", "proxies": "mysql80-tcp", "conns": 80}
+
+    def _apply(self, ip):
+        with self.mock.patch.object(store, "list_ips", return_value=[]):
+            return ai._apply_action(ip, "suspicious", "other",
+                                    "临时访问 MySQL 等非 Web 服务", self.it, self.cfg)
+
+    def test_untrusted_is_actioned(self):
+        res = self._apply("112.48.13.214")
+        self.assertNotEqual(res["action"], "skipped")
+
+    def test_trusted_is_skipped(self):
+        store.trust_login_ip("112.48.13.214", 86400)
+        res = self._apply("112.48.13.214")
+        self.assertEqual(res["action"], "skipped")
+        self.assertEqual(res["mode"], "login")
+
+    def test_expired_trust_restores_action(self):
+        store.trust_login_ip("112.48.13.214", -1)     # ttl<=0 不写
+        res = self._apply("112.48.13.214")
+        self.assertNotEqual(res["action"], "skipped")
