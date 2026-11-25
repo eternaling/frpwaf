@@ -114,6 +114,8 @@ CREATE TABLE IF NOT EXISTS trusted_cidr (
     last_seen INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_trusted_cidr_seen ON trusted_cidr(last_seen);
+-- source / expires_at / first_reason 三列由 _migrate_trusted_cidr 幂等补齐（新库旧库同一路径），
+-- expires_at 索引也在迁移里建：旧库执行本脚本时该列尚不存在。
 -- 登录即信任：面板登录成功后把来源 IP 记进来（带过期时间）。
 -- 解决「在外面开发、IP 不固定、连数据库被自己的自动封禁误封」：
 -- 换网络后只要登录一次面板，当前 IP 就自动获得豁免，不用手加白名单。
@@ -175,6 +177,54 @@ def _migrate_ip_list(c):
             pass
 
 
+# trusted_cidr 后补的列：列名 -> 完整 ALTER 语句（白名单字面量，不做任何字符串拼接）。
+_TRUSTED_CIDR_NEW_COLS = (
+    # model/keyword/behavior/subnet/manual/legacy
+    ("source", "ALTER TABLE trusted_cidr ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy'"),
+    # 0 = 永不过期
+    ("expires_at", "ALTER TABLE trusted_cidr ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0"),
+    # 首次学习理由，冲突更新不覆盖
+    ("first_reason", "ALTER TABLE trusted_cidr ADD COLUMN first_reason TEXT DEFAULT ''"),
+)
+
+
+def _migrate_trusted_cidr(c):
+    """给 trusted_cidr 补 source / expires_at / first_reason 三列（幂等，可重复执行）。
+
+    先查 PRAGMA table_info，缺列才 ALTER（裸 ALTER 重复执行会报 duplicate column）。
+    本次补上 expires_at 时，存量行统一标 legacy 并给 7 天有效期：旧逻辑写入的条目
+    含弱证据学习结果，需在一周内由强证据重新学到，否则自然过期。
+    expires_at 索引放在这里而不是 SCHEMA：旧库执行 SCHEMA 时该列还不存在，会中断建表脚本。
+    """
+    try:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(trusted_cidr)").fetchall()}
+    except sqlite3.Error:
+        return
+    if not cols:
+        return  # 表不存在（SCHEMA 执行失败），保守跳过
+    try:
+        added = set()
+        for name, alter_sql in _TRUSTED_CIDR_NEW_COLS:
+            if name not in cols:
+                # pi-lens-ignore: python-sql-injection -- alter_sql 只取自 _TRUSTED_CIDR_NEW_COLS 白名单字面量，无外部输入
+                c.execute(alter_sql)
+                added.add(name)
+        if "expires_at" in added:
+            c.execute(
+                "UPDATE trusted_cidr SET expires_at=? WHERE source='legacy' AND expires_at=0",
+                (int(time.time()) + TRUST_TTL["legacy"],))
+        if "first_reason" in added:
+            c.execute("UPDATE trusted_cidr SET first_reason=COALESCE(reason,'') "
+                      "WHERE COALESCE(first_reason,'')=''")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_trusted_cidr_exp ON trusted_cidr(expires_at)")
+        c.commit()
+    except sqlite3.Error:
+        try:
+            c.rollback()
+        except sqlite3.Error:
+            pass
+
+
 def _connect():
     global _conn
     if _conn is not None:
@@ -201,6 +251,7 @@ def _connect():
         _conn.execute("PRAGMA journal_size_limit=16777216")     # checkpoint 后截断至 ≤16MB
         _conn.executescript(SCHEMA)
         _migrate_ip_list(_conn)   # 旧库：cidr 全局唯一 -> UNIQUE(cidr,list_type)
+        _migrate_trusted_cidr(_conn)   # trusted_cidr 补 source / expires_at / first_reason
         _conn.commit()
     except sqlite3.Error:
         pass
@@ -598,40 +649,171 @@ def del_ip(entry_id):
 
 # ---------------- 自动学习的可信回源网段 ----------------
 
-def add_trusted_cidr(cidr, reason="", hits=1):
+# 学习来源 -> 有效期（秒）；0 = 永不过期。
+# 来源越弱有效期越短：误学的条目不再活跃就自然过期，不依赖人工清理。
+TRUST_TTL = {
+    "manual": 0,
+    "keyword": 30 * 86400,
+    "model": 14 * 86400,
+    "behavior": 86400,
+    "subnet": 86400,
+    "legacy": 7 * 86400,
+}
+# 强证据来源：只有这些 /32 计入「同段升级为 /24」的计数
+TRUST_STRONG_SOURCES = ("keyword", "model", "manual")
+# 来源强弱：冲突更新时保留较强者
+_TRUST_RANK = {"legacy": 0, "behavior": 1, "subnet": 1, "model": 2, "keyword": 3, "manual": 4}
+TRUST_MAX_AGE = 90 * 86400     # 续期上限：expires_at 不超过 created_at + 90 天
+TRUSTED_CIDR_CAP = 2000        # 条数上限，超出时淘汰 hits 最低且最久未见的非 manual 条目
+
+
+def _trust_source(source):
+    """规范化学习来源：未知值按最弱的 behavior 处理；legacy 只由迁移产生，不接受写入。"""
+    src = (source or "").strip().lower()
+    if src not in TRUST_TTL or src == "legacy":
+        return "behavior"
+    return src
+
+
+def _trust_expiry(source, now):
+    ttl = TRUST_TTL.get(source, TRUST_TTL["behavior"])
+    return 0 if ttl == 0 else now + ttl
+
+
+def add_trusted_cidr(cidr, reason="", hits=1, source="behavior"):
     """记下一条「可信回源网段」（已存在则累加命中次数）。
 
     cidr 会被规范化（单 IP 归一为 /32）。非法值抛 ValueError，由调用方决定怎么处理。
+    source 决定有效期（见 TRUST_TTL）；未声明来源按最弱的 behavior（24 小时）处理，
+    更强的来源必须由调用方显式声明。
+
+    冲突更新规则：
+      - first_reason 只在首次写入时填，之后不覆盖（审计需要保留最初的学习理由）；
+      - 来源取新旧中较强者；manual 条目保持永久；
+      - 未过期：expires_at 只延长不缩短，且不超过 created_at + 90 天；
+      - 已过期（尚未被清理）或已超出 90 天窗口：按重新学习处理，重置 created_at 与 expires_at。
     """
     net = ipaddress.ip_network((cidr or "").strip(), strict=False)
     cidr = str(net)
+    src = _trust_source(source)
+    reason = (reason or "")[:200]
     now = int(time.time())
-    _exec(
-        "INSERT INTO trusted_cidr(cidr, reason, hits, created_at, last_seen) "
-        "VALUES(?,?,?,?,?) "
-        "ON CONFLICT(cidr) DO UPDATE SET hits=hits+excluded.hits, "
-        "reason=excluded.reason, last_seen=excluded.last_seen",
-        (cidr, (reason or "")[:200], int(hits), now, now))
+    exp = _trust_expiry(src, now)
+    with _lock:
+        c = _connect()
+        row = c.execute(
+            "SELECT source, expires_at, created_at FROM trusted_cidr WHERE cidr=?",
+            (cidr,)).fetchone()
+        if row is None:
+            c.execute(
+                "INSERT INTO trusted_cidr(cidr, reason, hits, created_at, last_seen, "
+                "source, expires_at, first_reason) VALUES(?,?,?,?,?,?,?,?)",
+                (cidr, reason, int(hits), now, now, src, exp, reason))
+        else:
+            old_src = row[0] or "legacy"
+            old_exp = int(row[1] or 0)
+            created = int(row[2] or now)
+            if old_src == "manual" or src == "manual":
+                new_src, new_exp = "manual", 0
+            elif (old_exp and old_exp <= now) or now - created >= TRUST_MAX_AGE:
+                new_src, new_exp, created = src, exp, now
+            else:
+                new_src = src if _TRUST_RANK.get(src, 1) >= _TRUST_RANK.get(old_src, 0) else old_src
+                new_exp = max(old_exp, min(exp, created + TRUST_MAX_AGE))
+            c.execute(
+                "UPDATE trusted_cidr SET hits=hits+?, reason=?, last_seen=?, source=?, "
+                "expires_at=?, created_at=?, "
+                "first_reason=CASE WHEN COALESCE(first_reason,'')='' THEN ? ELSE first_reason END "
+                "WHERE cidr=?",
+                (int(hits), reason, now, new_src, new_exp, created, reason, cidr))
+        c.commit()
     return cidr
 
 
 def list_trusted_cidrs(limit=0):
-    """已学习的可信网段列表（按命中次数降序）。只读。"""
+    """已学习的可信网段列表（仅未过期，按命中次数降序）。只读。"""
     lim = int(limit or 0)
+    sql = ("SELECT * FROM trusted_cidr WHERE expires_at = 0 OR expires_at > ? "
+           "ORDER BY hits DESC, last_seen DESC")
+    now = int(time.time())
     if lim > 0:
-        return _query_ro(
-            "SELECT * FROM trusted_cidr ORDER BY hits DESC, last_seen DESC LIMIT ?", (lim,))
-    return _query_ro("SELECT * FROM trusted_cidr ORDER BY hits DESC, last_seen DESC")
+        return _query_ro(sql + " LIMIT ?", (now, lim))
+    return _query_ro(sql, (now,))
 
 
 def list_trusted_cidr_strings():
-    """只取 cidr 字段（匹配用，避免多传无关列）。只读。"""
-    return [r["cidr"] for r in _query_ro("SELECT cidr FROM trusted_cidr")]
+    """只取未过期条目的 cidr 字段（匹配用）。只读。
+
+    过期条目不再参与匹配：误学的段不活跃即自动失效，由周期清理物理删除。
+    """
+    return [r["cidr"] for r in _query_ro(
+        "SELECT cidr FROM trusted_cidr WHERE expires_at = 0 OR expires_at > ?",
+        (int(time.time()),))]
+
+
+def touch_trusted_cidr(cidr):
+    """学习表命中：hits+1、刷新 last_seen，并按来源 TTL 续期。
+
+    续期只延长不缩短，且不超过 created_at + 90 天；manual（永久）不变；
+    legacy 不续期——旧逻辑学到的条目必须由强证据重新学到才能留下。
+    返回是否找到该条目。
+    """
+    try:
+        cidr = str(ipaddress.ip_network((cidr or "").strip(), strict=False))
+    except ValueError:
+        return False
+    now = int(time.time())
+    with _lock:
+        c = _connect()
+        row = c.execute(
+            "SELECT source, expires_at, created_at FROM trusted_cidr WHERE cidr=?",
+            (cidr,)).fetchone()
+        if row is None:
+            return False
+        src = row[0] or "legacy"
+        old_exp = int(row[1] or 0)
+        created = int(row[2] or now)
+        if old_exp == 0 or src == "legacy":
+            new_exp = old_exp
+        else:
+            ttl = TRUST_TTL.get(src) or TRUST_TTL["behavior"]
+            new_exp = max(old_exp, min(now + ttl, created + TRUST_MAX_AGE))
+        c.execute("UPDATE trusted_cidr SET hits=hits+1, last_seen=?, expires_at=? WHERE cidr=?",
+                  (now, new_exp, cidr))
+        c.commit()
+    return True
+
+
+def purge_expired_trusted_cidrs(cap=TRUSTED_CIDR_CAP):
+    """删除已过期条目；条数超过 cap 时淘汰 hits 最低且最久未见的非 manual 条目。
+
+    返回 (过期删除数, 超限淘汰数)。由守护进程后台循环周期调用。
+    """
+    now = int(time.time())
+    try:
+        cap = int(cap or 0)
+    except (TypeError, ValueError):
+        cap = 0
+    with _lock:
+        c = _connect()
+        expired = c.execute(
+            "DELETE FROM trusted_cidr WHERE expires_at > 0 AND expires_at <= ?", (now,)).rowcount
+        evicted = 0
+        if cap > 0:
+            total = int(c.execute("SELECT COUNT(*) FROM trusted_cidr").fetchone()[0] or 0)
+            if total > cap:
+                evicted = c.execute(
+                    "DELETE FROM trusted_cidr WHERE cidr IN (SELECT cidr FROM trusted_cidr "
+                    "WHERE source != 'manual' ORDER BY hits ASC, last_seen ASC, created_at ASC "
+                    "LIMIT ?)", (total - cap,)).rowcount
+        c.commit()
+    return max(expired or 0, 0), max(evicted or 0, 0)
 
 
 def count_trusted_in_subnet(prefix):
     """已学习表里落在给定 /24 内的条目数（用于判断是否升级为整段可信）。只读。
 
+    只计未过期的强证据 /32（keyword / model / manual），弱证据不参与升级。
     prefix 传 `a.b.c.0/24`；用 LIKE 前缀近似（trusted_cidr 里存的是单 IP 或少数 CIDR），
     不会把 /16 之类的宽条目算进来 —— 这里只想知道「同段有几个具体回源 IP 被学到」。
     """
@@ -640,8 +822,9 @@ def count_trusted_in_subnet(prefix):
     except (AttributeError, IndexError):
         return 0
     rows = _query_ro(
-        "SELECT COUNT(*) AS n FROM trusted_cidr WHERE cidr LIKE ? AND cidr LIKE '%/32'",
-        (base + "%",))
+        "SELECT COUNT(*) AS n FROM trusted_cidr WHERE cidr LIKE ? AND cidr LIKE '%/32' "
+        "AND source IN ('keyword','model','manual') AND (expires_at = 0 OR expires_at > ?)",
+        (base + "%", int(time.time())))
     try:
         return int((rows[0] or {}).get("n") or 0)
     except (IndexError, TypeError, ValueError):

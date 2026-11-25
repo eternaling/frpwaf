@@ -6,16 +6,20 @@
 「同源多 IP、同一段集中访问 Web 代理」，批量封了 484 条中国 IP，导致
 所有走 HTTPS 回源的站点返回 522。模型自己在理由里写的是「**疑似**」。
 
-这里锁住三道保护，任何一道退化都会让测试变红：
-  1. 关键字/模型判定 cdn_origin；
-  2. 行为特征：同一 IP 混访 2 个以上站点代理；
+这里锁住几道保护，任何一道退化都会让测试变红：
+  1. 关键字命中，或模型判定 cdn_origin 且有旁证；
+  2. 行为特征：代理类型全为 http/https/tcpmux，且同一 IP 混访 2 个以上站点代理；
   3. **显式可信网段** ai_trusted_cidrs（确定性，不依赖模型）；
   4. **同段批量封禁熔断**：窗口内同一 /24 已被自动封禁多个 IP 时停止继续封。
+
+反向用例同样锁住：出现非 Web 代理类型一律否决（模型判定与关键字都推翻不了）；
+弱证据（行为层单独命中、同段熔断）只跳过本次、不写学习表；学习表条目会过期。
 
 只测纯函数与 _apply_action 的处置分支，不发起模型调用。
 """
 
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -35,9 +39,13 @@ class CdnGuardTest(unittest.TestCase):
         self.cfg = dict(config.DEFAULTS)
         self.cfg["ai_cdn_guard"] = True
 
-    def test_model_category_wins(self):
+    def test_model_category_needs_corroboration(self):
+        """模型判 cdn_origin 必须有旁证（全 Web 类型 + 多站点，或关键字命中）。"""
         self.assertTrue(ai._is_cdn_origin(
-            "cdn_origin", {"geo": "", "proxies": "a"}, self.cfg))
+            "cdn_origin", {"geo": "", "proxies": "site-a,site-b", "ptypes": "https"},
+            self.cfg))
+        self.assertFalse(ai._is_cdn_origin(
+            "cdn_origin", {"geo": "", "proxies": "a", "ptypes": "https"}, self.cfg))
 
     def test_keywords_for_aliyun_esa(self):
         """ESA 的英文名/别名要能命中。
@@ -58,17 +66,19 @@ class CdnGuardTest(unittest.TestCase):
             self.cfg))
 
     def test_aliyun_with_multi_proxy_is_cdn(self):
-        """阿里云 + 混访多站 = 回源（事故里被误封的就是这种）。"""
+        """阿里云 + 全 Web 类型 + 混访多站 = 回源（事故里被误封的就是这种）。"""
         self.assertTrue(ai._is_cdn_origin(
             "web_scan", {"geo": "中国 浙江 杭州 阿里云",
-                         "proxies": "gitea_htts2http,portal_htts2http"},
+                         "proxies": "gitea_htts2http,portal_htts2http",
+                         "ptypes": "https"},
             self.cfg))
 
     def test_multi_proxy_behavior(self):
-        """同一 IP 混访多站 = 回源特征（事故里被误封的 IP 全是这种）。"""
+        """全 Web 类型 + 同一 IP 混访多站 = 回源特征（事故里被误封的 IP 全是这种）。"""
         self.assertTrue(ai._is_cdn_origin(
             "web_scan", {"geo": "中国 浙江 移动",
-                         "proxies": "gitea_htts2http,portal_htts2http"},
+                         "proxies": "gitea_htts2http,portal_htts2http",
+                         "ptypes": "https"},
             self.cfg))
 
     def test_single_proxy_scanner_not_exempt(self):
@@ -164,12 +174,11 @@ class ApplyActionTest(unittest.TestCase):
         new_home(self)
         self.cfg = dict(config.DEFAULTS)
         self.cfg.update({"ai_auto_ban": True, "ai_suspicious_ban": True,
-                         "ai_cdn_guard": True, "blacklist_enabled": True,
-                         "blacklist_enabled": True})
+                         "ai_cdn_guard": True, "blacklist_enabled": True})
         self.cfg["ai_trusted_cidrs"] = "61.241.14.0/24"
 
-    def _apply(self, ip, category="web_scan", geo="", proxies=""):
-        it = {"geo": geo, "proxies": proxies, "conns": 100}
+    def _apply(self, ip, category="web_scan", geo="", proxies="", ptypes=""):
+        it = {"geo": geo, "proxies": proxies, "ptypes": ptypes, "conns": 100}
         with mock.patch.object(store, "list_ips", return_value=[]):
             return ai._apply_action(ip, "suspicious", category, "r", it, self.cfg)
 
@@ -184,9 +193,11 @@ class ApplyActionTest(unittest.TestCase):
         self.assertFalse(self._banned("61.241.14.33"))
 
     def test_multi_proxy_skips_ban(self):
-        res = self._apply("1.2.3.4", proxies="a_http,b_http")
+        res = self._apply("1.2.3.4", proxies="a_http,b_http", ptypes="https")
         self.assertEqual(res["mode"], "cdn")
         self.assertFalse(self._banned("1.2.3.4"))
+        self.assertEqual(store.list_trusted_cidr_strings(), [],
+                         "行为层单独命中只跳过本次，不得写学习表")
 
     def test_subnet_fuse_skips_ban(self):
         for i in range(5):
@@ -195,22 +206,22 @@ class ApplyActionTest(unittest.TestCase):
         self.assertEqual(res["action"], "skipped")
         self.assertEqual(res["mode"], "subnet")
         self.assertFalse(self._banned("9.9.9.99"))
+        self.assertEqual(store.list_trusted_cidr_strings(), [],
+                         "熔断只止血，不得写学习表")
 
     def test_normal_scanner_still_banned(self):
         """没有任何保护命中时，扫描器照旧被封禁。"""
-        res = self._apply("1.2.3.4", proxies="nightcc-tcp")
+        res = self._apply("1.2.3.4", proxies="nightcc-tcp", ptypes="tcp")
         self.assertIn(res["action"], ("temporary", "banned", "permanent"))
         self.assertTrue(self._banned("1.2.3.4"))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class LearnTrustedTest(unittest.TestCase):
-    """自动学习：AI 判 CDN 回源后记住，后续同段新 IP 也不再被封。
+    """自动学习：强证据判 CDN 回源后记住，后续同段新 IP 也不再被封。
 
     owner 拿不到 ESA 的回源 IP 列表，所以只能靠程序「遇到过就记住」。
+    只有强证据（关键字命中，或模型判 cdn_origin 且有旁证）才学习，
+    所以这里默认用「阿里云 ESA」归属地；行为层单独命中不学习，见 WeakEvidenceNoLearnTest。
     """
 
     def setUp(self):
@@ -221,8 +232,8 @@ class LearnTrustedTest(unittest.TestCase):
                          "ai_cdn_guard": True, "ai_learn_cdn": True,
                          "blacklist_enabled": True})
 
-    def _apply(self, ip, proxies="a_http,b_http", geo="中国 移动"):
-        it = {"geo": geo, "proxies": proxies, "conns": 150}
+    def _apply(self, ip, proxies="site-a", geo="中国 浙江 阿里云 ESA", ptypes="https"):
+        it = {"geo": geo, "proxies": proxies, "ptypes": ptypes, "conns": 150}
         with mock.patch.object(store, "list_ips", return_value=[]):
             return ai._apply_action(ip, "suspicious", "web_scan", "x", it, self.cfg)
 
@@ -237,7 +248,8 @@ class LearnTrustedTest(unittest.TestCase):
     def test_learned_ip_is_trusted_even_if_heuristic_misses(self):
         """学到之后，即使这次只打 1 个代理（启发式落空）也靠学习表挡住。"""
         self._apply("61.241.14.33")                    # 先学到
-        res = self._apply("61.241.14.33", proxies="nightcc-tcp")
+        res = self._apply("61.241.14.33", proxies="nightcc-tcp", geo="中国 移动",
+                          ptypes="tcp")
         self.assertEqual(res["mode"], "trusted")
         self.assertFalse(self._banned("61.241.14.33"))
 
@@ -252,7 +264,8 @@ class LearnTrustedTest(unittest.TestCase):
         """学成 /24 后，同段从未见过的新节点也不再被封。"""
         self._apply("61.241.14.33")
         self._apply("61.241.14.41")
-        res = self._apply("61.241.14.200", proxies="nightcc-tcp")
+        res = self._apply("61.241.14.200", proxies="nightcc-tcp", geo="中国 移动",
+                          ptypes="tcp")
         self.assertEqual(res["mode"], "trusted")
         self.assertFalse(self._banned("61.241.14.200"))
 
@@ -260,7 +273,7 @@ class LearnTrustedTest(unittest.TestCase):
         """学习不能连带放行其它段。"""
         self._apply("61.241.14.33")
         self._apply("61.241.14.41")
-        res = self._apply("8.8.4.4", proxies="nightcc-tcp", geo="美国")
+        res = self._apply("8.8.4.4", proxies="nightcc-tcp", geo="美国", ptypes="tcp")
         self.assertNotEqual(res["action"], "skipped")
         self.assertTrue(self._banned("8.8.4.4"))
 
@@ -268,3 +281,189 @@ class LearnTrustedTest(unittest.TestCase):
         self.cfg["ai_learn_cdn"] = False
         self._apply("61.241.14.33")
         self.assertEqual(store.list_trusted_cidr_strings(), [])
+
+
+class TypeVetoTest(unittest.TestCase):
+    """反向用例：代理类型硬否决与关键字词边界（防扫描器被当成 CDN 回源）。"""
+
+    def setUp(self):
+        self.cfg = dict(config.DEFAULTS)
+        self.cfg["ai_cdn_guard"] = True
+
+    def _cdn(self, category="web_scan", geo="", proxies="", ptypes=""):
+        return ai._is_cdn_origin(
+            category, {"geo": geo, "proxies": proxies, "ptypes": ptypes}, self.cfg)
+
+    def test_ssh_mysql_tcp_not_cdn(self):
+        """1. 访问 ssh/mysql 的纯 tcp IP 不可能是回源。"""
+        self.assertFalse(self._cdn(proxies="ssh-tcp,mysql-tcp", ptypes="tcp"))
+
+    def test_three_tcp_proxies_not_cdn(self):
+        """2. 哪怕扫了 3 个代理，纯 tcp 也否决。"""
+        self.assertFalse(self._cdn(proxies="a-tcp,b-tcp,c-tcp", ptypes="tcp"))
+
+    def test_production_scanner_profile_not_cdn(self):
+        """3. 生产 66.132.159.18 的画像：短时间内扫多个 tcp 代理。"""
+        self.assertFalse(self._cdn(proxies="mysql-tcp,status-tcp", ptypes="tcp"))
+
+    def test_mixed_types_not_cdn(self):
+        """混入任何非 Web 类型即否决，关键字命中也推翻不了。"""
+        self.assertFalse(self._cdn(geo="cloudflare", proxies="site-a,ssh-tcp",
+                                   ptypes="https,tcp"))
+
+    def test_esa_substring_words_not_cdn(self):
+        """4. 含 esa 子串的地名/组织名不能误中关键字。"""
+        for geo in ("Empresa", "Mesa", "Telesat", "Teresa"):
+            with self.subTest(geo=geo):
+                self.assertFalse(self._cdn(geo=geo, proxies="site-a", ptypes="https"))
+
+    def test_aliyun_esa_is_cdn(self):
+        """5. 「阿里云 ESA」是明确的 CDN 产品字样。"""
+        self.assertTrue(self._cdn(geo="中国 浙江 阿里云 ESA", proxies="site-a",
+                                  ptypes="https"))
+
+    def test_model_cdn_origin_vetoed_by_tcp(self):
+        """6. 模型判 cdn_origin，类型为 tcp 也要否决。"""
+        self.assertFalse(self._cdn(category="cdn_origin", geo="cloudflare",
+                                   proxies="site-a,site-b", ptypes="tcp"))
+
+    def test_model_cdn_origin_with_web_multi_site(self):
+        """7. 模型判 cdn_origin + 全 https + 多站点 = 回源，命中层记为 model。"""
+        it = {"geo": "", "proxies": "site-a,site-b", "ptypes": "https"}
+        self.assertTrue(ai._is_cdn_origin("cdn_origin", it, self.cfg))
+        self.assertEqual(ai._cdn_origin_hit("cdn_origin", it, self.cfg),
+                         (True, "model", "behavior:2"))
+
+    def test_empty_ptypes_behavior_not_enough(self):
+        """ptypes 缺失时行为层不成立（证据不足不放行），关键字层不受影响。"""
+        self.assertFalse(self._cdn(proxies="site-a,site-b", ptypes=""))
+        self.assertTrue(self._cdn(geo="cloudflare", proxies="site-a", ptypes=""))
+
+
+class WeakEvidenceNoLearnTest(unittest.TestCase):
+    """8-10：弱证据（行为层单独命中、同段熔断）只跳过本次，不写学习表。"""
+
+    def setUp(self):
+        from tests import new_home
+        new_home(self)
+        self.cfg = dict(config.DEFAULTS)
+        self.cfg.update({"ai_auto_ban": True, "ai_suspicious_ban": True,
+                         "ai_cdn_guard": True, "ai_learn_cdn": True,
+                         "blacklist_enabled": True, "ai_trusted_cidrs": "",
+                         "ai_subnet_ban_limit": 5, "ai_subnet_ban_window": 900})
+
+    def _apply(self, ip, geo="中国 移动", proxies="site-a,site-b", ptypes="https"):
+        it = {"geo": geo, "proxies": proxies, "ptypes": ptypes, "conns": 150}
+        with mock.patch.object(store, "list_ips", return_value=[]):
+            return ai._apply_action(ip, "suspicious", "web_scan", "x", it, self.cfg)
+
+    def test_behavior_hit_skips_but_not_learned(self):
+        """8. 行为层命中：本次跳过，学习表无新增。"""
+        res = self._apply("61.241.14.33")
+        self.assertEqual(res["mode"], "cdn")
+        self.assertEqual(store.list_trusted_cidr_strings(), [])
+
+    def test_subnet_fuse_not_learned(self):
+        """9. 熔断命中：只止血，学习表无新增，审查记录里留「熔断待复核」。"""
+        for i in range(5):
+            store.add_ban("9.9.9.%d" % (10 + i), "ai: 探测", 1800)
+        res = self._apply("9.9.9.99", proxies="nightcc-tcp", ptypes="tcp")
+        self.assertEqual(res["mode"], "subnet")
+        self.assertEqual(store.list_trusted_cidr_strings(), [])
+        rows = store._query_ro("SELECT * FROM ai_review", ())
+        self.assertTrue(any("熔断待复核" in str(v)
+                            for r in rows for v in dict(r).values()))
+
+    def test_two_weak_ips_in_subnet_no_24(self):
+        """10. 同 /24 两条弱证据：不学 /32，更不升级 /24。"""
+        self._apply("61.241.14.33")
+        self._apply("61.241.14.41")
+        self.assertEqual(store.list_trusted_cidr_strings(), [])
+
+    def test_weak_sources_do_not_count_toward_24(self):
+        """10（纵深）：学习表里即使有 behavior 来源的 /32，也不计入 /24 升级。"""
+        ai._learn_trusted("61.241.15.33", "x", source="behavior")
+        ai._learn_trusted("61.241.15.41", "x", source="behavior")
+        self.assertNotIn("61.241.15.0/24", store.list_trusted_cidr_strings())
+
+    def test_keyword_learn_records_layer(self):
+        """强证据学习：source 与 reason 写明命中层，不再一律写「AI 判定」。"""
+        self._apply("61.241.14.33", geo="中国 浙江 阿里云 ESA", proxies="site-a")
+        rows = [r for r in store.list_trusted_cidrs() if r["cidr"] == "61.241.14.33/32"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["source"], "keyword")
+        self.assertIn("keyword:", rows[0]["reason"])
+
+
+class TrustedCidrStoreTest(unittest.TestCase):
+    """11-13：学习表过期、first_reason 保留与迁移幂等。"""
+
+    def setUp(self):
+        from tests import new_home
+        new_home(self)
+        self.cfg = dict(config.DEFAULTS)
+        self.cfg["ai_trusted_cidrs"] = ""
+
+    def _row(self, cidr):
+        rows = [r for r in store.list_trusted_cidrs() if r["cidr"] == cidr]
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    def test_expired_entry_not_matched(self):
+        """11. 过期条目不参与 _in_trusted_cidr 匹配。"""
+        store.add_trusted_cidr("5.6.7.8", "kw", source="keyword")
+        self.assertTrue(ai._in_trusted_cidr("5.6.7.8", self.cfg))
+        store._exec("UPDATE trusted_cidr SET expires_at=? WHERE cidr=?",
+                    (int(time.time()) - 60, "5.6.7.8/32"))
+        self.assertFalse(ai._in_trusted_cidr("5.6.7.8", self.cfg))
+
+    def test_manual_never_expires(self):
+        store.add_trusted_cidr("5.6.7.0/24", "运维声明", source="manual")
+        self.assertEqual(int(self._row("5.6.7.0/24")["expires_at"]), 0)
+
+    def test_first_reason_not_overwritten(self):
+        """12. 冲突更新时 first_reason 不被覆盖。"""
+        store.add_trusted_cidr("5.6.7.8", "首次理由", source="keyword")
+        store.add_trusted_cidr("5.6.7.8", "后续理由", source="keyword")
+        row = self._row("5.6.7.8/32")
+        self.assertEqual(row["first_reason"], "首次理由")
+        self.assertEqual(row["reason"], "后续理由")
+        self.assertEqual(int(row["hits"]), 2)
+
+    def test_migration_idempotent_on_current_db(self):
+        """13. 已迁移的库上再跑两次迁移不报错。"""
+        c = store._connect()
+        store._migrate_trusted_cidr(c)
+        store._migrate_trusted_cidr(c)
+        cols = {r[1] for r in c.execute("PRAGMA table_info(trusted_cidr)").fetchall()}
+        self.assertTrue({"source", "expires_at", "first_reason"} <= cols)
+
+    def test_migration_idempotent_on_legacy_table(self):
+        """13. 旧表结构 + 存量数据：连续迁移两次不报错，存量行标 legacy 且 7 天到期。"""
+        path = os.path.join(tempfile.mkdtemp(prefix="frpwaf-mig-"), "old.db")
+        c = sqlite3.connect(path)
+        try:
+            c.execute("CREATE TABLE trusted_cidr (cidr TEXT PRIMARY KEY, reason TEXT, "
+                      "hits INTEGER DEFAULT 0, created_at INTEGER, last_seen INTEGER)")
+            now = int(time.time())
+            c.executemany("INSERT INTO trusted_cidr VALUES(?,?,?,?,?)",
+                          [("61.241.14.0/24", "旧理由 A", 5, now, now),
+                           ("66.132.159.18/32", "旧理由 B", 3, now, now)])
+            c.commit()
+            store._migrate_trusted_cidr(c)
+            store._migrate_trusted_cidr(c)   # 第二次必须是空操作
+            cols = {r[1] for r in c.execute("PRAGMA table_info(trusted_cidr)").fetchall()}
+            self.assertTrue({"source", "expires_at", "first_reason"} <= cols)
+            rows = c.execute("SELECT source, expires_at, first_reason, reason "
+                             "FROM trusted_cidr").fetchall()
+            self.assertEqual(len(rows), 2)
+            for src, exp, first, reason in rows:
+                self.assertEqual(src, "legacy")
+                self.assertAlmostEqual(exp, now + 7 * 86400, delta=120)
+                self.assertEqual(first, reason)
+        finally:
+            c.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

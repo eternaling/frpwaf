@@ -24,6 +24,7 @@ import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from concurrent.futures import ThreadPoolExecutor
@@ -35,13 +36,16 @@ SYSTEM_PROMPT = (
     "你会收到一组来源 IP 及其归属地、连接次数、命中的代理端口类型等信息。"
     "请判断每个 IP 是否属于恶意/可疑行为（例如：端口扫描、SSH 暴力破解、"
     "爬虫抓取、异常高频访问、来自高风险地区的自动化攻击等）。"
-    "正常用户访问（如本人手机/公司网络的常规访问、CDN/云服务回源）应判为 benign。"
-    "特别注意 CDN/反向代理回源流量：当某 IP 归属地/ISP 为 CDN 厂商"
-    "（Cloudflare、Amazon CloudFront、Fastly、Sucuri、Imperva、Incapsula、"
-    "Akamai、阿里云 CDN、腾讯云 CDN、百度云加速等），且对 http/https/tcpmux "
-    "类代理有高频连接时，这通常是 CDN 边缘节点在为用户回源（一个边缘节点会"
-    "代表大量真实用户发起连接），必须判为 benign，category 填 cdn_origin，"
-    "绝不能判为恶意——误封 CDN 边缘 IP 会导致整站不可访问。"
+    "正常用户访问（如本人手机/公司网络的常规访问）应判为 benign。"
+    "关于 CDN/反向代理回源：一个 CDN 边缘节点会代表大量真实用户发起连接，"
+    "误封边缘 IP 会使经该节点访问的站点整体不可用。"
+    "仅当某 IP 的归属地/ISP/组织名属于 CDN 厂商（Cloudflare、Amazon CloudFront、"
+    "Fastly、Sucuri、Imperva、Incapsula、Akamai、阿里云 CDN/ESA、腾讯云 CDN/EdgeOne、"
+    "百度云加速等），且只访问 http/https/tcpmux 类代理时，才可将 category 填 cdn_origin，"
+    "此时 verdict 一般为 benign。"
+    "通用云厂商（Amazon EC2、阿里云 ECS、腾讯云 CVM 等）上既有 CDN 也有普通云主机，"
+    "不能仅凭厂商名判为 cdn_origin。"
+    "访问 ssh/mysql/redis 等非 Web 服务（ptypes 含 tcp/udp 等类型）的 IP 不可能是 CDN 回源。"
     "对每个 IP 还需给出攻击类型 category（英文短语，如 ssh_bruteforce、port_scan、"
     "web_scan、crawler、rate_abuse、cdn_origin、other；正常访问填 none）。"
     "只输出 JSON，不要输出任何多余文字或 markdown 代码块。"
@@ -58,9 +62,9 @@ def _build_user_prompt(items):
         '"category":"ssh_bruteforce|port_scan|web_scan|crawler|rate_abuse|cdn_origin|other|none",'
         '"reason":"简短中文理由"}]',
         "判定规则：确凿的攻击/扫描/爆破 => malicious；可疑但不确定 => suspicious；正常 => benign。",
-        "category 必须是上述取值之一；无法归类时填 other；正常访问填 none；"
-        "CDN/反向代理回源（ISP 为 CDN 厂商且高频访问 Web 代理）填 cdn_origin。",
-        "再次强调：CDN 回源 IP 判 benign + cdn_origin，不要判 malicious/suspicious。",
+        "category 取上述取值之一；无法归类时填 other；正常访问填 none。",
+        "cdn_origin 的适用条件：ISP/组织名属于 CDN 厂商，且 ptypes 只含 http/https/tcpmux；"
+        "ptypes 含其它类型、或只有通用云厂商名时不适用 cdn_origin。",
     ]
     return "\n".join(lines)
 
@@ -98,8 +102,8 @@ def _collect():
             "conns": r["conns"],
             "rejected": r["rejected"] or 0,
             "proxies": (r["proxies"] or "")[:120],
-            # 命中代理类型：模型据此区分 Web 回源（http/https/tcpmux）与
-            # 敏感服务爆破，辅助 cdn_origin 判定（不参与本地处置决策）。
+            # 命中代理类型：模型据此区分 Web 回源（http/https/tcpmux）与敏感服务爆破；
+            # 本地 _cdn_origin_hit 也用它做类型硬否决（非 Web 类型不可能是 CDN 回源）。
             "ptypes": (r["ptypes"] or "")[:80],
         })
     return items
@@ -171,8 +175,10 @@ def _in_trusted_cidr(ip, cfg):
     raw = str(cfg.get("ai_trusted_cidrs") or "").strip()
     if raw:
         cands.extend(p for p in re.split(r"[,;\s]+", raw) if p)
+    learned = []
     try:
-        cands.extend(store.list_trusted_cidr_strings())
+        # 学习表查询已过滤过期条目：过期记录不再参与匹配，误学可自愈
+        learned = list(store.list_trusted_cidr_strings())
     except Exception:
         pass                      # 读学习表失败不影响主流程
     for part in cands:
@@ -181,21 +187,35 @@ def _in_trusted_cidr(ip, cfg):
                 return True
         except ValueError:
             continue
+    for part in learned:
+        try:
+            if obj in ipaddress.ip_network(part, strict=False):
+                # 命中学习表：刷新 last_seen 并按来源续期（续期上限 created_at + 90 天）
+                try:
+                    store.touch_trusted_cidr(part)
+                except Exception:
+                    pass
+                return True
+        except ValueError:
+            continue
     return False
 
 
-def _learn_trusted(ip, reason, subnet=False):
+def _learn_trusted(ip, reason, source="behavior", subnet=False):
     """把 IP（或它所在的 /24）记入「可信回源网段」，以后不再自动封。
 
     这只是**观察到的经验**，不改变本次处置——本次是否跳过封禁由调用方决定。
     学习失败静默忽略：记不住也不该影响封禁/放行决策。
 
-    subnet=True 时直接学 /24（同段熔断触发时用）。
+    source 为学习来源（keyword / model / behavior / subnet / manual），决定条目 TTL。
+    调用方只应对强证据调用本函数：关键字命中，或模型判 cdn_origin 且有旁证。
+    subnet=True 时直接学 /24（保留兼容；同段熔断已不再调用）。
 
-    自动升级：只学 /32 时，同一 /24 里学到**第 2 个**回源 IP 就把整个 /24 也记下。
+    自动升级：只学 /32 时，同一 /24 里有**第 2 个**未过期的强证据 /32，就把整个 /24
+    也记下（source=subnet，24 小时 TTL，命中续期，上限 created_at + 90 天）。
     为什么：CDN 边缘节点是成批出现的（事故里 61.241.14.x 有 26 个），
-    逐个 /32 记会让每个新节点先被封一次才学会。同段出现 2 个回源 IP 已足以
-    说明这是个共享段，而不是巧合。
+    逐个 /32 记会让每个新节点先被封一次才学会；整段信任面更大，
+    所以只按强证据计数，并给短 TTL，不再活跃即自然过期。
     """
     try:
         obj = ipaddress.ip_address(ip)
@@ -204,9 +224,10 @@ def _learn_trusted(ip, reason, subnet=False):
     try:
         if subnet and obj.version == 4:
             return store.add_trusted_cidr(
-                str(ipaddress.ip_network(str(obj) + "/24", strict=False)), reason)
-        learned = store.add_trusted_cidr(str(obj), reason)
-        # 同段已有第 2 个回源 IP -> 升级为整段可信
+                str(ipaddress.ip_network(str(obj) + "/24", strict=False)), reason,
+                source="subnet")
+        learned = store.add_trusted_cidr(str(obj), reason, source=source)
+        # 同段已有第 2 个强证据回源 IP -> 升级为整段可信（短 TTL）
         if obj.version == 4:
             prefix = str(ipaddress.ip_network(str(obj) + "/24", strict=False))
             try:
@@ -215,8 +236,8 @@ def _learn_trusted(ip, reason, subnet=False):
                 n = 0
             if n >= 2:
                 store.add_trusted_cidr(
-                    prefix, "同段已学到 %d 个回源 IP，升级为整段可信（%s）"
-                    % (n, (reason or "")[:60]))
+                    prefix, "同段已学到 %d 个强证据回源 IP，升级为整段可信（%s）"
+                    % (n, (reason or "")[:60]), source="subnet")
         return learned
     except Exception:
         return None
@@ -313,8 +334,10 @@ _CDN_KEYWORDS = (
     "cloudflare", "cloudfront", "fastly", "sucuri", "imperva", "incapsula",
     "akamai", "阿里云 cdn", "腾讯云 cdn", "百度云加速", "网宿", "chinacache",
     "keycdn", "bunnycdn", "stackpath", "edgecast", "limelight", "gcore",
-    # 阿里云 ESA（边缘安全加速）及其别名/英文名
-    "esa", "edge security acceleration", "边缘安全加速",
+    # 阿里云 ESA（边缘安全加速）及其别名/英文名。不收录裸 "esa"：
+    # 子串匹配会误中 Empresa / Mesa / Telesat / Teresa / Desa 等地名与组织名。
+    "阿里云 esa", "aliyun esa", "alibaba cloud esa", "alibaba cloud edge security",
+    "edge security acceleration", "边缘安全加速",
     # 阿里云 CDN 的其它常见写法（归属地文本不统一）
     "aliyun cdn", "alibaba cloud cdn", "aliyuncs",
     # 腾讯云 EdgeOne
@@ -322,37 +345,96 @@ _CDN_KEYWORDS = (
 )
 
 
-def _is_cdn_origin(category, it, cfg):
-    """判断某送审 IP 是否应按「CDN 回源」跳过自动封禁（仅记录）。
+# CDN 回源只可能经 HTTP 层或 tcpmux 代理进入；出现其它类型（tcp/udp/stcp 等）即不是回源。
+_WEB_TYPES = frozenset(("http", "https", "tcpmux"))
 
-    三层判断，任一命中即视为回源（层层兜底，因为模型会漏判）：
-      1. 模型判定 category=cdn_origin（提示词已要求识别，最可靠）；
-      2. 归属地/ISP 文本命中 CDN 厂商关键字；
-      3. **行为特征**：同一 IP 同时访问多个不同 Web 站点代理（`proxies` 里
-         出现 2 个以上不同代理名，且都是 http/https 类）。
 
-    第 3 层是 2026-11 事故后补的：实测 ESA 回源 IP（47.123.x.x / 8.25.82.x.x）
-    的归属地只写「阿里云」不带 CDN 字样，模型又判 suspicious 并自述「无法
-    确证 CDN 回源」，前两层全部落空，于是回源 IP 被临时封禁 → 站点 522。
-    CDN 回源本质就是「一个 IP 后面跟着大量真实用户、混访多个站点」，
-    这个行为特征比话语描述可靠得多。
+def _ptypes(it):
+    """返回代理类型集合（小写）。GROUP_CONCAT 后用逗号/空白/分号分隔。"""
+    return {p.strip().lower()
+            for p in re.split(r"[,;\s]+", str(it.get("ptypes") or "")) if p.strip()}
 
-    注意：该判断只影响「自动处置」，不影响送审与审计记录；`ai_cdn_guard`
-    关闭时不做任何跳过（恢复原有分级处置）。
+
+def _proxy_names(it):
+    """返回命中的代理名集合（去重）。"""
+    return {p for p in re.split(r"[,;\s]+", str(it.get("proxies") or "")) if p}
+
+
+def _is_ascii(s):
+    # str.isascii 需要 3.7+，手写以兼容老环境
+    return all(ord(c) < 128 for c in s)
+
+
+def _keyword_hit(text):
+    """归属地/ISP 文本命中的 CDN 厂商关键字；未命中返回空串。
+
+    4 个字符以下的 ASCII 关键字要求前后不是字母（词边界），避免子串误中更长的单词；
+    其余关键字（中文、多词短语）按子串匹配。
+    """
+    text = (text or "").lower()
+    for kw in _CDN_KEYWORDS:
+        if len(kw) <= 4 and _is_ascii(kw):
+            if re.search(r"(?<![a-z])" + re.escape(kw) + r"(?![a-z])", text):
+                return kw
+        elif kw in text:
+            return kw
+    return ""
+
+
+def _hit_label(source, detail):
+    """命中层标签：model / keyword:<kw> / behavior:<n>，写入审查记录与学习理由。"""
+    if source == "model" or not detail:
+        return source
+    return "%s:%s" % (source, detail)
+
+
+def _cdn_origin_hit(category, it, cfg):
+    """CDN 回源判定，返回 (是否回源, 命中层, 明细)。
+
+    命中层：model（模型判 cdn_origin 且有旁证）/ keyword / behavior；未命中为 (False, "", "")。
+
+    先做类型硬否决：ptypes 非空且含 http/https/tcpmux 之外的类型 -> 不是回源，
+    模型判定与关键字都不能推翻。ptypes 为空（数据缺失）时不否决，交给下面三层。
+
+    三层判断：
+      1. 模型判 category=cdn_origin，且有旁证（关键字命中，或 全 Web 类型 + 多站点），
+         无旁证不认；
+      2. 归属地/ISP 文本命中 CDN 厂商关键字（短关键字按词边界匹配）；
+      3. 行为特征：ptypes 非空且全为 Web 类型，同时 proxies 里有 2 个以上不同代理名。
+         ptypes 为空时本层不成立（证据不足，不放行）。
+
+    第 3 层来自 2026-11 事故：ESA 回源 IP（47.123.x.x / 8.25.82.x.x）归属地只写
+    「阿里云」不带 CDN 字样，模型判 suspicious，前两层落空，回源 IP 被封导致 522。
+    但只看「混访多站」会把扫多个 tcp 代理的扫描器也当成回源（生产 66.132.159.18
+    在 98 秒内连了 5 个 tcp 代理），所以必须叠加类型判断。
+
+    该判断只影响「自动处置」，不影响送审与审计记录；`ai_cdn_guard` 关闭时不做任何跳过。
     """
     if not cfg.get("ai_cdn_guard", True):
-        return False
+        return False, "", ""
+    types = _ptypes(it)
+    if types and not types <= _WEB_TYPES:
+        return False, "", ""      # 出现过任何非 Web 类型 -> 不可能是 CDN 回源
+    names = _proxy_names(it)
+    web_multi = bool(types) and len(names) >= 2
+    kw = _keyword_hit(str(it.get("geo") or ""))
     if (category or "").lower() == "cdn_origin":
-        return True
-    text = (str(it.get("geo") or "")).lower()
-    if any(k in text for k in _CDN_KEYWORDS):
-        return True
-    # 行为特征：混访多个站点代理 → 典型的边缘节点/反向代理回源
-    try:
-        names = {p for p in re.split(r"[,;\s]+", str(it.get("proxies") or "")) if p}
-    except Exception:
-        names = set()
-    return len(names) >= 2
+        # 模型判 cdn_origin 必须配合旁证：关键字命中，或 全 Web 类型 + 多站点
+        if kw:
+            return True, "model", "keyword:" + kw
+        if web_multi:
+            return True, "model", "behavior:%d" % len(names)
+        return False, "", ""      # 无旁证不认
+    if kw:
+        return True, "keyword", kw
+    if web_multi:
+        return True, "behavior", str(len(names))
+    return False, "", ""
+
+
+def _is_cdn_origin(category, it, cfg):
+    """判断某送审 IP 是否应按「CDN 回源」跳过自动封禁（bool 包装，规则见 _cdn_origin_hit）。"""
+    return _cdn_origin_hit(category, it, cfg)[0]
 
 
 def _apply_action(ip, verdict, category, reason, it, cfg):
@@ -378,13 +460,20 @@ def _apply_action(ip, verdict, category, reason, it, cfg):
     # CDN 回源保护：边缘节点 IP 被大量真实用户共享，一旦自动封禁会导致
     # 整站不可访问（CDN 回源被拒 → 522）。仅对「本会触发封禁」的判定生效
     # （benign/unknown 本就不处置，走常规记录即可），只记录、不写任何封禁。
-    if verdict in ("malicious", "suspicious") and _is_cdn_origin(category, it, cfg):
-        # 学到了就记住：下次同一个回源节点（或新节点）直接命中学习表，
-        # 不再依赖「混访多站」这个启发式（它可能因窗口内只命中 1 个代理而落空）。
-        if cfg.get("ai_learn_cdn", True):
-            _learn_trusted(ip, "AI 判定 CDN 回源：" + (reason or "")[:80])
-        store.add_ai_review(0, ip, verdict, "CDN 回源，跳过自动处置", "skipped",
-                            cfg.get("ai_model", ""))
+    cdn_hit, cdn_src, cdn_detail = False, "", ""
+    if verdict in ("malicious", "suspicious"):
+        cdn_hit, cdn_src, cdn_detail = _cdn_origin_hit(category, it, cfg)
+    if cdn_hit:
+        label = _hit_label(cdn_src, cdn_detail)
+        if cdn_src == "model" and cdn_detail:
+            label = "model，旁证 " + cdn_detail
+        # 只有强证据才学习：关键字命中，或模型判 cdn_origin 且有旁证。
+        # 行为层单独命中只跳过本次：「混访多站」是启发式，持久化成信任可被扫描器利用。
+        if cdn_src in ("keyword", "model") and cfg.get("ai_learn_cdn", True):
+            _learn_trusted(ip, "CDN 回源（%s）：%s" % (label, (reason or "")[:80]),
+                           source=cdn_src)
+        store.add_ai_review(0, ip, verdict, "CDN 回源（%s），跳过自动处置" % label,
+                            "skipped", cfg.get("ai_model", ""))
         return {"ip": ip, "verdict": verdict, "category": category, "reason": reason,
                 "action": "skipped", "mode": "cdn", "ssh": ssh,
                 "geo": it.get("geo", ""), "conns": it.get("conns", 0)}
@@ -413,14 +502,13 @@ def _apply_action(ip, verdict, category, reason, it, cfg):
     if verdict in ("malicious", "suspicious"):
         hit, count = _subnet_ban_hot(ip, cfg)
         if hit:
-            # 熔断时把整个 /24 学会：已经证明这个段里有多个 IP 被封，
-            # 大概率是共享出口/CDN，单个 /32 记不住这个段。
-            if cfg.get("ai_learn_cdn", True):
-                _learn_trusted(ip, "同段批量封禁熔断（%d 个）" % count, subnet=True)
+            # 熔断只止血、不学习：同段多个 IP 被封只说明「可能」是共享出口，
+            # 把止血结果持久化成信任，会让批量探测换来整段长期豁免。
             store.add_ai_review(
                 0, ip, verdict,
-                "同一 /24 在 %d 秒内已有 %d 个 IP 被自动封禁，判定为共享出口/CDN 段，"
-                "跳过自动处置（熔断）" % (int(cfg.get("ai_subnet_ban_window") or 900), count),
+                "【熔断待复核】同一 /24 在 %d 秒内已有 %d 个 IP 被自动封禁，疑似共享出口/CDN 段，"
+                "跳过本次自动处置，未写入可信网段"
+                % (int(cfg.get("ai_subnet_ban_window") or 900), count),
                 "skipped", cfg.get("ai_model", ""))
             return {"ip": ip, "verdict": verdict, "category": category,
                     "reason": reason, "action": "skipped", "mode": "subnet",
@@ -497,6 +585,9 @@ def _endpoint(base, path):
     b = (base or "").strip().rstrip("/")
     if not b:
         return b
+    # 只放行 http/https：防止 ai_base_url 被填成 file:// 或自定义协议，让 urlopen 读取本地文件
+    if urllib.parse.urlsplit(b).scheme.lower() not in ("http", "https"):
+        raise ValueError("ai_base_url 只支持 http:// 或 https://")
     if b.endswith(path):
         return b
     i = path.find("/", 1)
@@ -530,13 +621,14 @@ def _call_openai(cfg, user_prompt, timeout=60, max_tokens=1500):
         "temperature": 0.1,
         "max_tokens": int(max_tokens),
     }
-    req = urllib.request.Request(
+    # url 由 _endpoint 生成，已限定 http/https 协议
+    req = urllib.request.Request(  # noqa: S310
         url, data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json",
                  "Authorization": "Bearer " + cfg["ai_api_key"]},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
         data = json.loads(resp.read().decode("utf-8"))
     return data["choices"][0]["message"]["content"]
 
@@ -550,14 +642,15 @@ def _call_anthropic(cfg, user_prompt, timeout=60, max_tokens=1500):
         "system": SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": user_prompt}],
     }
-    req = urllib.request.Request(
+    # url 由 _endpoint 生成，已限定 http/https 协议
+    req = urllib.request.Request(  # noqa: S310
         url, data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json",
                  "x-api-key": cfg["ai_api_key"],
                  "anthropic-version": "2023-06-01"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
         data = json.loads(resp.read().decode("utf-8"))
     parts = data.get("content") or []
     return "".join(p.get("text", "") for p in parts if p.get("type") == "text")

@@ -282,14 +282,14 @@
           <div class="fw-card fw-span-2">
             <h3>ESA 回源段（自动学习） <span style="color:#999;font-size:12px;font-weight:400" id="fwCdnCount"></span> <span id="fwCdnLearn" class="fw-tag gray">检测中…</span></h3>
             <div class="fw-row" style="margin-bottom:10px">
-              <span class="fw-tip" style="margin:0">AI 判定某 IP 为 CDN 回源时自动记录（开关：AI 设置里的 <code>ai_learn_cdn</code>）；命中这些网段的 IP 不会被 AI 自动处置。</span>
+              <span class="fw-tip" style="margin:0">仅在强证据（CDN 厂商关键字命中，或模型判回源且有旁证）时自动记录（开关：AI 设置里的 <code>ai_learn_cdn</code>）；命中这些网段的 IP 不会被 AI 自动处置。条目按来源设有效期，不再活跃即自动失效。</span>
               <span style="flex:1"></span>
               <button class="btn btn-default btn-sm" onclick="fwLoadCdnTrust()">刷新</button>
               <button class="btn btn-danger btn-sm" onclick="fwCdnTrustClear()">清空</button>
             </div>
             <div class="fw-table-wrap" style="max-height:320px">
-              <table class="fw-table"><thead><tr><th style="width:170px">网段</th><th style="width:90px" class="c">命中次数</th><th>学到的原因</th><th style="width:160px">最后见到</th><th style="width:80px" class="c">操作</th></tr></thead>
-              <tbody id="fwCdnList"><tr><td colspan="5" style="color:#bbb;text-align:center">加载中…</td></tr></tbody></table>
+              <table class="fw-table"><thead><tr><th style="width:170px">网段</th><th style="width:90px" class="c">命中次数</th><th style="width:90px" class="c">来源</th><th>学到的原因</th><th style="width:120px">剩余有效期</th><th style="width:160px">最后见到</th><th style="width:80px" class="c">操作</th></tr></thead>
+              <tbody id="fwCdnList"><tr><td colspan="7" style="color:#bbb;text-align:center">加载中…</td></tr></tbody></table>
             </div>
           </div>
           <div class="fw-card">
@@ -1612,11 +1612,24 @@ function fwFmtDur(s){
   if(m) return m+' 分 '+(s%60)+' 秒';
   return s+' 秒';
 }
+/* 回源段学习来源 → 中文小标签（强证据绿色，其余灰色） */
+var FW_TRUST_SRC={model:'模型+旁证',keyword:'关键字',behavior:'行为',subnet:'同段升级',manual:'手动',legacy:'旧数据'};
+function fwTrustSrcTag(s){
+  s=String(s||'legacy');
+  var cls=(s==='manual'||s==='keyword'||s==='model')?'ok':'gray';
+  return '<span class="fw-tag '+cls+'">'+fwEsc(FW_TRUST_SRC[s]||s)+'</span>';
+}
+/* 剩余有效期：expires_at=0 为永久 */
+function fwTrustRemain(x){
+  if(!parseInt(x.expires_at,10)) return '永久';
+  var s=parseInt(x.remaining_s,10)||0;
+  return s>0 ? fwFmtDur(s) : '<span class="dim">已过期</span>';
+}
 function fwLoadCdnTrust(){
   fwSend('cdn_trust_list', {}, function(r){
     var tb=document.getElementById('fwCdnList');
     if(!r || !r.status){
-      tb.innerHTML='<tr><td colspan="5" style="color:#d33;text-align:center">'+fwEsc((r&&r.msg)||'请求失败，请稍后重试')+'</td></tr>';
+      tb.innerHTML='<tr><td colspan="7" style="color:#d33;text-align:center">'+fwEsc((r&&r.msg)||'请求失败，请稍后重试')+'</td></tr>';
       return;
     }
     var d=r.data||{}, rows=d.items||[];
@@ -1626,14 +1639,17 @@ function fwLoadCdnTrust(){
     lb.textContent=d.learn_enabled?'自动学习已开启':'自动学习已关闭';
     tb.innerHTML = rows.length
       ? rows.map(function(x){
-          var reason=x.reason||'';
+          var reason=x.reason||'', first=x.first_reason||'';
+          var tip=reason+(first&&first!==reason?'\n首次：'+first:'');
           return '<tr><td class="mono">'+fwEsc(x.cidr)+'</td>'
             +'<td class="c">'+fwEsc(x.hits)+'</td>'
-            +'<td class="remark" title="'+fwEsc(reason)+'"><span class="clamp">'+fwEsc(reason||'-')+'</span></td>'
+            +'<td class="c">'+fwTrustSrcTag(x.source)+'</td>'
+            +'<td class="remark" title="'+fwEsc(tip)+'"><span class="clamp">'+fwEsc(reason||'-')+'</span></td>'
+            +'<td class="nw">'+fwTrustRemain(x)+'</td>'
             +'<td class="nw dim">'+fwFmtTime(x.last_seen)+'</td>'
             +'<td class="c"><button class="btn btn-danger btn-xs" data-cidr="'+fwEsc(x.cidr)+'" onclick="fwCdnTrustDel(this.dataset.cidr)">删除</button></td></tr>';
         }).join('')
-      : '<tr><td colspan="5" style="color:#bbb;text-align:center">还没有学到回源段。AI 判定某 IP 为 CDN 回源时会自动记录。</td></tr>';
+      : '<tr><td colspan="7" style="color:#bbb;text-align:center">还没有学到回源段。只有强证据（CDN 厂商关键字，或模型判回源且有旁证）才会自动记录。</td></tr>';
   });
 }
 function fwCdnTrustDel(cidr){

@@ -1746,17 +1746,26 @@ class frpwaf_main:
         return out
 
     def cdn_trust_list(self, get=None):
-        """ESA/CDN 回源段列表（trusted_cidr 表，按命中次数降序）。只读。"""
+        """ESA/CDN 回源段列表（trusted_cidr 表，仅未过期，按命中次数降序）。只读。
+
+        remaining_s：剩余有效秒数；expires_at=0（永久）时为 -1。
+        """
         try:
             store = self._store()
             cap = int(getattr(store, "PANEL_LIST_CAP", 0) or 0)
             rows = store.list_trusted_cidrs(cap) or []
             items = []
+            now = int(time.time())
             for r in rows:
+                exp = int(r.get("expires_at") or 0)
                 items.append({
                     "cidr": r.get("cidr") or "",
                     "hits": int(r.get("hits") or 0),
                     "reason": r.get("reason") or "",
+                    "first_reason": r.get("first_reason") or "",
+                    "source": r.get("source") or "legacy",
+                    "expires_at": exp,
+                    "remaining_s": -1 if exp == 0 else max(0, exp - now),
                     "created_at": int(r.get("created_at") or 0),
                     "last_seen": int(r.get("last_seen") or 0),
                 })

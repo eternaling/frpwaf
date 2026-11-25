@@ -2291,6 +2291,13 @@ def _bg_loop():
             store.trim_logs(int(cfg.get("log_max_rows") or 50000))
             store.trim_bans(20000)
             store.trim_ai_review(5000)
+            # 回源段学习表自愈：删过期条目 + 超限淘汰；单独兜底，失败不影响后续内核同步
+            try:
+                n_exp, n_evict = store.purge_expired_trusted_cidrs()
+                if n_exp or n_evict:
+                    _log("回源段学习表清理：过期 %d 条，超限淘汰 %d 条" % (n_exp, n_evict))
+            except Exception:
+                _log("回源段学习表清理异常：%s" % traceback.format_exc()[-200:])
             _fw_sync()
             # 安全水位告警：先判断是否跨 bad 跳变，再发送（未配置则直接返回）
             _alert_check(cfg)
