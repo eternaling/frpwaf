@@ -10,7 +10,9 @@
   1. 关键字命中，或模型判定 cdn_origin 且有旁证；
   2. 行为特征：代理类型全为 http/https/tcpmux，且同一 IP 混访 2 个以上站点代理；
   3. **显式可信网段** ai_trusted_cidrs（确定性，不依赖模型）；
-  4. **同段批量封禁熔断**：窗口内同一 /24 已被自动封禁多个 IP 时停止继续封。
+  4. **同段批量封禁熔断**：窗口内同一 /24 已被自动封禁多个 IP 时停止继续封；
+  5. **自动学习表** trusted_cidr：强证据 /32 才学；同段强证据 /32 达到
+     `ai._TRUST_SUBNET_MIN_IPS`（当前 3）个才升级为整段可信（24h TTL）。
 
 反向用例同样锁住：出现非 Web 代理类型一律否决（模型判定与关键字都推翻不了）；
 弱证据（行为层单独命中、同段熔断）只跳过本次、不写学习表；学习表条目会过期。
@@ -165,6 +167,24 @@ class SubnetBanFuseTest(unittest.TestCase):
         self.assertFalse(hit)
         self.assertEqual(n, 0)
 
+    def test_permanent_blacklist_not_counted(self):
+        """已定口径：AI 永久处置（写 ip_list 黑名单）不计入同段熔断。"""
+        for i in range(6):
+            store.add_ip("61.241.14.%d" % (10 + i), "black", "ai: malicious 永久拉黑")
+        hit, n = ai._subnet_ban_hot("61.241.14.99", self.cfg)
+        self.assertFalse(hit, "永久黑名单不应推高熔断计数")
+        self.assertEqual(n, 0)
+
+    def test_permanent_mixed_with_temp_only_temp_counted(self):
+        """临时封禁与永久黑名单混合：只按 ai: 临时封禁计数，未达阈值不熔断。"""
+        for i in range(4):
+            self._ban("61.241.14.%d" % (10 + i))
+        for i in range(3):
+            store.add_ip("61.241.14.%d" % (50 + i), "black", "ai: malicious 永久拉黑")
+        hit, n = ai._subnet_ban_hot("61.241.14.99", self.cfg)
+        self.assertEqual(n, 4)
+        self.assertFalse(hit)
+
 
 class ApplyActionTest(unittest.TestCase):
     """_apply_action 的处置分支：保护优先于封禁。"""
@@ -237,6 +257,22 @@ class LearnTrustedTest(unittest.TestCase):
         with mock.patch.object(store, "list_ips", return_value=[]):
             return ai._apply_action(ip, "suspicious", "web_scan", "x", it, self.cfg)
 
+    def _apply_model_web_multi(self, ip):
+        """模型判 cdn_origin + 全 Web 类型 + 2 个代理名（无关键字旁证）。
+
+        这正是本次要挡的形态：模型层把 web_multi 当旁证，所以这种来源也能
+        贡献一个「强证据」名额。
+        """
+        it = {"geo": "中国 移动", "proxies": "site-a,site-b", "ptypes": "https",
+              "conns": 150}
+        with mock.patch.object(store, "list_ips", return_value=[]):
+            return ai._apply_action(ip, "suspicious", "cdn_origin", "x", it, self.cfg)
+
+    def _trust_row(self, cidr):
+        rows = [r for r in store.list_trusted_cidrs() if r["cidr"] == cidr]
+        self.assertEqual(len(rows), 1, cidr)
+        return rows[0]
+
     def _banned(self, ip):
         with mock.patch.object(store, "list_ips", return_value=[]):
             return store.is_banned(ip)
@@ -245,34 +281,102 @@ class LearnTrustedTest(unittest.TestCase):
         self._apply("61.241.14.33")
         self.assertIn("61.241.14.33/32", store.list_trusted_cidr_strings())
 
+    def test_learned_entry_points_back_to_review_record(self):
+        """学到的条目能直接回查到本次审查记录（不用拿时间 + IP 去猜）。"""
+        self._apply("61.241.14.33")
+        row = self._trust_row("61.241.14.33/32")
+        rid = int(row["ai_review_id"] or 0)
+        self.assertGreater(rid, 0)
+        reviews = {r["id"]: r for r in store.list_ai_review(50)}
+        self.assertIn(rid, reviews)                       # id 指向真实存在的审查记录
+        self.assertEqual(reviews[rid]["ip"], "61.241.14.33")
+        self.assertEqual(reviews[rid]["action"], "skipped")
+        self.assertIn("CDN 回源", reviews[rid]["reason"])
+
+    def test_escalated_24_points_back_to_triggering_review(self):
+        """整段升级行也带来源 id，且指向触发升级的那次审查。"""
+        for ip in ("61.241.16.33", "61.241.16.41"):
+            self._apply(ip)
+        self._apply("61.241.16.52")                       # 第三个强证据 -> 升级
+        self.assertIn("61.241.16.0/24", store.list_trusted_cidr_strings())
+        row = self._trust_row("61.241.16.0/24")
+        rid = int(row["ai_review_id"] or 0)
+        self.assertGreater(rid, 0)
+        self.assertEqual(row["source"], "subnet")
+        reviews = {r["id"]: r for r in store.list_ai_review(50)}
+        self.assertEqual(reviews[rid]["ip"], "61.241.16.52")
+
+    def test_learn_trusted_rejects_removed_subnet_flag(self):
+        """已删除的 subnet 开关无人再用：误传必须是显式 TypeError，不能静默变行为。"""
+        with self.assertRaises(TypeError):
+            ai._learn_trusted("61.241.17.33", "x", subnet=True)
+
     def test_learned_ip_is_trusted_even_if_heuristic_misses(self):
         """学到之后，即使这次只打 1 个代理（启发式落空）也靠学习表挡住。"""
         self._apply("61.241.14.33")                    # 先学到
         res = self._apply("61.241.14.33", proxies="nightcc-tcp", geo="中国 移动",
                           ptypes="tcp")
-        self.assertEqual(res["mode"], "trusted")
+        self.assertEqual(res["mode"], "learned")
         self.assertFalse(self._banned("61.241.14.33"))
 
-    def test_second_ip_in_subnet_escalates_to_24(self):
-        """同段学到第 2 个回源 IP -> 自动升级为整段可信。"""
+    def test_second_ip_in_subnet_does_not_escalate(self):
+        """同段第 2 个强证据：不再升级（门槛已提到 3）。"""
         self._apply("61.241.14.33")
-        self.assertNotIn("61.241.14.0/24", store.list_trusted_cidr_strings())
         self._apply("61.241.14.41")
+        self.assertNotIn("61.241.14.0/24", store.list_trusted_cidr_strings())
+
+    def test_third_ip_in_subnet_escalates_to_24(self):
+        """同段第 3 个强证据 -> 自动升级为整段可信。"""
+        self._apply("61.241.14.33")
+        self._apply("61.241.14.41")
+        self.assertNotIn("61.241.14.0/24", store.list_trusted_cidr_strings())
+        self._apply("61.241.14.52")
         self.assertIn("61.241.14.0/24", store.list_trusted_cidr_strings())
+
+    def test_two_model_web_multi_sources_do_not_escalate(self):
+        """反例：同段两条「model + web_multi」来源不得升级整段。
+
+        单条 /32 仍学习（误判只影响一个 IP，14 天自然过期）；第 3 条才到门槛。
+        """
+        self._apply_model_web_multi("61.241.16.33")
+        self._apply_model_web_multi("61.241.16.41")
+        self.assertNotIn("61.241.16.0/24", store.list_trusted_cidr_strings())
+        self.assertEqual(self._trust_row("61.241.16.33/32")["source"], "model")
+        self.assertEqual(store.count_trusted_in_subnet("61.241.16.0/24"), 2)
+        self._apply_model_web_multi("61.241.16.52")
+        self.assertIn("61.241.16.0/24", store.list_trusted_cidr_strings())
+
+    def test_escalated_24_keeps_short_ttl_and_is_deletable(self):
+        """升级出的 /24：source=subnet、24h TTL、面板可删。"""
+        for ip in ("61.241.14.33", "61.241.14.41", "61.241.14.52"):
+            self._apply(ip)
+        row = self._trust_row("61.241.14.0/24")
+        self.assertEqual(row["source"], "subnet")
+        ttl = int(row["expires_at"]) - int(time.time())
+        self.assertLessEqual(ttl, store.TRUST_TTL["subnet"])
+        self.assertGreater(ttl, store.TRUST_TTL["subnet"] - 120)
+        self.assertEqual(store.del_trusted_cidr("61.241.14.0/24"), 1)
+        self.assertEqual(ai._in_learned_cidrs("61.241.14.200"), "")
+
+    def test_escalated_24_not_counted_itself(self):
+        """数同段证据只数 /32：已升级的 /24 行不参与，重复数不会自膨胀。"""
+        for ip in ("61.241.14.33", "61.241.14.41", "61.241.14.52"):
+            self._apply(ip)
+        self.assertEqual(store.count_trusted_in_subnet("61.241.14.0/24"), 3)
 
     def test_unseen_ip_in_learned_subnet_not_banned(self):
         """学成 /24 后，同段从未见过的新节点也不再被封。"""
-        self._apply("61.241.14.33")
-        self._apply("61.241.14.41")
+        for ip in ("61.241.14.33", "61.241.14.41", "61.241.14.52"):
+            self._apply(ip)
         res = self._apply("61.241.14.200", proxies="nightcc-tcp", geo="中国 移动",
                           ptypes="tcp")
-        self.assertEqual(res["mode"], "trusted")
+        self.assertEqual(res["mode"], "learned")
         self.assertFalse(self._banned("61.241.14.200"))
 
     def test_other_subnet_still_banned(self):
         """学习不能连带放行其它段。"""
-        self._apply("61.241.14.33")
-        self._apply("61.241.14.41")
+        for ip in ("61.241.14.33", "61.241.14.41", "61.241.14.52"):
+            self._apply(ip)
         res = self._apply("8.8.4.4", proxies="nightcc-tcp", geo="美国", ptypes="tcp")
         self.assertNotEqual(res["action"], "skipped")
         self.assertTrue(self._banned("8.8.4.4"))
@@ -431,15 +535,86 @@ class TrustedCidrStoreTest(unittest.TestCase):
         self.assertEqual(int(row["hits"]), 2)
 
     def test_migration_idempotent_on_current_db(self):
-        """13. 已迁移的库上再跑两次迁移不报错。"""
+        """13. 已迁移的库上再跑两次迁移不报错；四列齐全。"""
         c = store._connect()
         store._migrate_trusted_cidr(c)
         store._migrate_trusted_cidr(c)
         cols = {r[1] for r in c.execute("PRAGMA table_info(trusted_cidr)").fetchall()}
-        self.assertTrue({"source", "expires_at", "first_reason"} <= cols)
+        self.assertTrue({"source", "expires_at", "first_reason", "ai_review_id"} <= cols)
+
+    def test_migration_adds_review_id_without_losing_rows(self):
+        """14. 缺 ai_review_id 的库：补列后存量条目全部保留，该列为 0。"""
+        path = os.path.join(tempfile.mkdtemp(prefix="frpwaf-mig2-"), "mid.db")
+        c = sqlite3.connect(path)
+        try:
+            # 中间版本结构：已有 source / expires_at / first_reason，缺 ai_review_id
+            c.execute("CREATE TABLE trusted_cidr (cidr TEXT PRIMARY KEY, reason TEXT, "
+                      "hits INTEGER DEFAULT 0, created_at INTEGER, last_seen INTEGER, "
+                      "source TEXT NOT NULL DEFAULT 'legacy', "
+                      "expires_at INTEGER NOT NULL DEFAULT 0, "
+                      "first_reason TEXT DEFAULT '')")
+            now = int(time.time())
+            c.executemany(
+                "INSERT INTO trusted_cidr(cidr, reason, hits, created_at, last_seen, "
+                "source, expires_at, first_reason) VALUES(?,?,?,?,?,?,?,?)",
+                [("61.241.14.0/24", "旧理由 A", 5, now, now, "keyword", now + 3600, "旧理由 A"),
+                 ("66.132.159.18/32", "旧理由 B", 3, now, now, "manual", 0, "旧理由 B")])
+            c.commit()
+            store._migrate_trusted_cidr(c)
+            store._migrate_trusted_cidr(c)   # 第二次必须是空操作
+            cols = {r[1] for r in c.execute("PRAGMA table_info(trusted_cidr)").fetchall()}
+            self.assertIn("ai_review_id", cols)
+            rows = c.execute("SELECT cidr, reason, source, first_reason, ai_review_id "
+                             "FROM trusted_cidr ORDER BY cidr").fetchall()
+            self.assertEqual(len(rows), 2, rows)        # 存量条目不丢
+            for r in rows:
+                self.assertEqual(int(r[4] or 0), 0)     # 新列无关联
+            self.assertEqual([r[0] for r in rows], ["61.241.14.0/24", "66.132.159.18/32"])
+            self.assertEqual(rows[0][1], "旧理由 A")
+            self.assertEqual(rows[0][3], "旧理由 A")
+        finally:
+            c.close()
+
+    def test_new_entry_records_review_id(self):
+        """15. 写入路径能带上来源审查记录 id。"""
+        rid = store.add_ai_review(0, "5.6.7.8", "suspicious", "CDN 回源（x）",
+                                  "skipped", "m")
+        self.assertGreater(rid, 0)
+        store.add_trusted_cidr("5.6.7.8", "CDN 回源（x）", source="keyword",
+                               ai_review_id=rid)
+        self.assertEqual(int(self._row("5.6.7.8/32")["ai_review_id"]), rid)
+
+    def test_review_id_not_overwritten_on_relearn(self):
+        """15. 同一段再学时保留首次来源 id（只补空值）。"""
+        store.add_trusted_cidr("5.6.7.9", "首次", source="keyword", ai_review_id=11)
+        store.add_trusted_cidr("5.6.7.9", "后续", source="keyword", ai_review_id=22)
+        self.assertEqual(int(self._row("5.6.7.9/32")["ai_review_id"]), 11)
+
+    def test_review_id_filled_when_previously_empty(self):
+        """15. 原本无关联的条目（人工/存量）被学到时可补上来源 id。"""
+        store.add_trusted_cidr("5.6.7.10", "人工", source="manual")
+        self.assertEqual(int(self._row("5.6.7.10/32")["ai_review_id"]), 0)
+        store.add_trusted_cidr("5.6.7.10", "学到", source="keyword", ai_review_id=33)
+        self.assertEqual(int(self._row("5.6.7.10/32")["ai_review_id"]), 33)
+
+    def test_touch_keeps_review_id(self):
+        """15. 命中续期只刷 hits/last_seen，不改写来源 id。"""
+        store.add_trusted_cidr("5.6.7.11", "首次", source="keyword", ai_review_id=44)
+        before = self._row("5.6.7.11/32")
+        self.assertTrue(store.touch_trusted_cidr("5.6.7.11"))
+        after = self._row("5.6.7.11/32")
+        self.assertEqual(int(after["ai_review_id"]), 44)
+        self.assertEqual(int(after["hits"]), int(before["hits"]) + 1)
+        self.assertGreaterEqual(int(after["last_seen"]), int(before["last_seen"]))
 
     def test_migration_idempotent_on_legacy_table(self):
-        """13. 旧表结构 + 存量数据：连续迁移两次不报错，存量行标 legacy 且 7 天到期。"""
+        """13. 旧表结构 + 存量数据：连续迁移两次不报错；存量行标 legacy 后**被清掉**。
+
+        口径变更（2026-11-27）：旧行为是把存量行标 legacy + 给 7 天有效期。但
+        legacy 是 P0 修复前「混访多站即算回源」的产物，可能是纯 tcp 来源，留着会同时
+        给 AI 侧与引擎侧豁免。现改为启动迁移时直接删除，见
+        store.purge_legacy_trusted_cidrs()。
+        """
         path = os.path.join(tempfile.mkdtemp(prefix="frpwaf-mig-"), "old.db")
         c = sqlite3.connect(path)
         try:
@@ -453,14 +628,11 @@ class TrustedCidrStoreTest(unittest.TestCase):
             store._migrate_trusted_cidr(c)
             store._migrate_trusted_cidr(c)   # 第二次必须是空操作
             cols = {r[1] for r in c.execute("PRAGMA table_info(trusted_cidr)").fetchall()}
-            self.assertTrue({"source", "expires_at", "first_reason"} <= cols)
+            self.assertTrue({"source", "expires_at", "first_reason", "ai_review_id"} <= cols)
+            # 存量行已被清：旧结构没有 source 列，补列后全部落为 legacy，随即被删
             rows = c.execute("SELECT source, expires_at, first_reason, reason "
                              "FROM trusted_cidr").fetchall()
-            self.assertEqual(len(rows), 2)
-            for src, exp, first, reason in rows:
-                self.assertEqual(src, "legacy")
-                self.assertAlmostEqual(exp, now + 7 * 86400, delta=120)
-                self.assertEqual(first, reason)
+            self.assertEqual(len(rows), 0)
         finally:
             c.close()
 

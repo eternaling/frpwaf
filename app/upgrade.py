@@ -80,6 +80,25 @@ _MIN_FREE_BYTES = 50 * 1024 * 1024
 # 覆盖后要清理的陈旧文件后缀（陈旧模块仍可能被 import，是真实隐患）
 _STALE_EXT = {".py", ".pyc", ".pyo"}
 
+# 面板载荷（安装载荷）：只用插件目录里那份，运行目录不需要副本。
+#
+# 插件入口 frpwaf_main.py 由面板从插件目录加载（它用自身位置推导 PLUGIN_DIR），
+# 安装脚本一律读 ${PLUGIN_DIR}/...，守护进程只 import app.*（daemon.py 以自身
+# 位置补 sys.path）——三处都不读运行目录里的这些文件。因此覆盖到运行目录时
+# 跳过它们，并清掉历史升级残留的副本，避免同一文件名在两处各有一份。
+#
+# 注意 web/ 不在此列：daemon.py 的 WEB_DIR 指向运行目录下的 web/，
+# 独立 Web 端的静态页必须继续覆盖过去，否则会 404。
+_PANEL_PAYLOAD = {
+    "frpwaf_main.py",
+    "index.html",
+    "info.json",
+    "install.sh",
+    "uninstall.sh",
+    "frpwaf.init",
+    "frpwaf.service",
+}
+
 _lock = threading.Lock()
 
 
@@ -614,6 +633,33 @@ def _backup(target, backup_dir):
     return n
 
 
+def _is_runtime_dir(target):
+    """目标目录是否为运行目录（config.BASE）。路径归一后比较，避免尾斜杠误判。"""
+    try:
+        return os.path.abspath(target) == os.path.abspath(config.BASE)
+    except Exception:
+        return False
+
+
+def _drop_panel_payload(target):
+    """删除运行目录里残留的面板载荷文件（历史升级写入的副本）。
+
+    只按固定名单动这 7 个具体文件，不遍历目录、不碰 data/ 与其它内容。
+    返回被删除的相对路径列表（供审计）。
+    """
+    dropped = []
+    for rel in sorted(_PANEL_PAYLOAD):
+        full = os.path.join(target, rel)
+        if not os.path.isfile(full):
+            continue
+        try:
+            os.remove(full)
+            dropped.append(rel)
+        except OSError:
+            pass
+    return dropped
+
+
 def _prune_stale(target, keep_rel):
     """删除目标目录里「新包里已不存在」的 .py/.pyc/.pyo（防陈旧模块被 import）。
 
@@ -637,17 +683,31 @@ def _prune_stale(target, keep_rel):
 def _overwrite(root, target):
     """把解包内容覆盖到目标目录（保持相对结构），并清理新包中已不存在的旧模块。
 
+    目标是运行目录（config.BASE）时跳过 `_PANEL_PAYLOAD` 里的面板载荷——那 7 个
+    文件只有插件目录那份在被读取（见 `_PANEL_PAYLOAD` 注释），并把目标里已有的
+    同名文件清掉，好让升级一次就把历史副本收干净。插件目录仍全量覆盖，
+    否则一次在线升级就会把面板端 UI 与安装脚本留在旧版本。
+
     返回 (写入数, 被清理的相对路径列表)。
     """
+    runtime = _is_runtime_dir(target)
     pkg_rel = set()
     n = 0
     for full, rel in _iter_files(root):
+        if runtime and rel in _PANEL_PAYLOAD:
+            continue
         pkg_rel.add(rel)
         dst = os.path.join(target, rel)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(full, dst)
         n += 1
-    return n, _prune_stale(target, pkg_rel)
+    removed = []
+    if runtime:
+        # 先按名单清残留，再跑后缀级的陈旧模块清理：顺序反过来时 frpwaf_main.py
+        # 会先被当作「新包里已不存在的 .py」删掉，被清清单里就查不到它了。
+        removed.extend(_drop_panel_payload(target))
+    removed.extend(_prune_stale(target, pkg_rel))
+    return n, removed
 
 
 def _restore(targets, backup_root):

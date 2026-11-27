@@ -176,7 +176,7 @@ ai_timeout`。
 | GET | `/api/syslog?limit=N` | `data/frpwaf.log` 尾部（limit 1~2000，默认 200）→ `{lines, total}` |
 | POST | `/api/service` | `{action:"restart"\|"stop"}`；延迟约 2s 执行（避免当前请求被自身重启打断）；写审计 |
 | GET | `/api/upgrade/check` | 检查 GitHub 最新版本（取 `github_repo`；POST 时可用入参 `repo` **仅做只读对比**）→ `{ok,current,latest,has_update,tarball,url,notes,pkg,asset_names}`；`pkg` 为可校验的发布包（`{name,url,size,sha256,hash_source}`），无锤点时返回 `verify_hint`（「该发布缺少校验信息…」） |
-| POST | `/api/upgrade/apply` | **提交**在线升级任务（选定带 sha256 锤点的包 → 下载校验 → 解包+结构校验 → 备份 → 覆盖程序 → 重启；失败自动回滚，**不覆盖 data/**）；写审计。**立即返回 job 状态，不再返回升级结果**：`{code:0,msg:"升级任务已提交，正在后台执行（可轮询进度）",data:{job_id,started:true}}`。**仓库只取配置 `github_repo`**，请求体的 `repo` 被忽略（不一致会写一条拒绝审计）。**发布缺校验锤点时升级会在后台失败**（任务状态 `ok:false` + 「该发布缺少校验信息…」）；升级备份只保留最近 3 份并清理包内已不存在的陈旧 `.py` |
+| POST | `/api/upgrade/apply` | **提交**在线升级任务（选定带 sha256 锤点的包 → 下载校验 → 解包+结构校验 → 备份 → 覆盖程序 → 重启；失败自动回滚，**不覆盖 data/**）；写审计。**立即返回 job 状态，不再返回升级结果**：`{code:0,msg:"升级任务已提交，正在后台执行（可轮询进度）",data:{job_id,started:true}}`。**仓库只取配置 `github_repo`**，请求体的 `repo` 被忽略（不一致会写一条拒绝审计）。**发布缺校验锤点时升级会在后台失败**（任务状态 `ok:false` + 「该发布缺少校验信息…」）；升级备份只保留最近 3 份并清理包内已不存在的陈旧 `.py`。**覆盖时按目标目录分开**：运行目录（`/opt/frpwaf`）只落 `app/`、`web/`，7 个面板载荷（`frpwaf_main.py`/`index.html`/`info.json`/`install.sh`/`uninstall.sh`/`frpwaf.init`/`frpwaf.service`）只写插件目录并清掉运行目录里的历史副本（见 [04 §3.10](04-数据模型与配置项.md)） |
 | GET | `/api/upgrade/status` | 轮询升级任务状态 `{code:0,data:{…job 状态…}}`（字段与语义见 §12.1） |
 | GET | `/api/blockpage` | 拦截页服务状态 `{enabled, running, port}` |
 

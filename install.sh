@@ -58,6 +58,19 @@ Install_frpwaf()
     fi
     mkdir -p "${WAF_HOME}/data"
 
+    # 版本一致性闸门（防「载荷副本静默覆盖运行副本」）
+    # 插件目录里的 app/ 只是**安装载荷**，install.sh 会把它单向同步到 ${WAF_HOME}。
+    # 所以一旦装的是拼包（新代码 + 旧 info.json，或反之），就会用不匹配的代码
+    # 盖掉正在跑的那份，而服务不重启，归属不明、排查极难。
+    # 两处版本号必须相等；任一处读不到则跳过（不阻断自定义安装）。
+    _pkg_ver=$(sed -n 's/.*"versions"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${PLUGIN_DIR}/info.json" 2>/dev/null | head -n 1)
+    _code_ver=$(sed -n 's/^__version__[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${PLUGIN_DIR}/app/__init__.py" 2>/dev/null | head -n 1)
+    if [ -n "${_pkg_ver}" ] && [ -n "${_code_ver}" ] && [ "${_pkg_ver}" != "${_code_ver}" ]; then
+        echo "安装中止：版本号不一致（info.json=${_pkg_ver}，app/__init__.py=${_code_ver}）"
+        echo "这通常意味着安装包是拼接的（新代码配旧 info.json 或反之）。"
+        echo "请用 'bash build.sh zip' 重新打包后再安装；未同步任何代码，${WAF_HOME} 未被修改。"
+        exit 1
+    fi
     # 首次安装时把运行文件从插件目录同步到 /opt/frpwaf
     if [ ! -f "${WAF_HOME}/app/daemon.py" ]; then
         cp -a "${PLUGIN_DIR}/app" "${WAF_HOME}/" 2>/dev/null

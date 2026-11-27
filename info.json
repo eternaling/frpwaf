@@ -3,10 +3,8 @@
   "name": "frpwaf",
   "type": "免费应用",
   "ps": "frp 服务端/客户端管理 + IP 黑白名单/自动封禁/AI 审查，替代官方 frp管理器",
-  "versions": "1.5.2",
-  "checks": [
-    "/opt/frpwaf/app/daemon.py"
-  ],
+  "versions": "1.5.3",
+  "checks": "/www/server/panel/plugin/frpwaf/frpwaf_main.py",
   "author": "nightsoil",
   "home": "https://github.com/eternaling/frpwaf",
   "date": "2026-10-09",

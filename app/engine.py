@@ -25,7 +25,9 @@ from . import config, store
 _cache = {"black": [], "white": [], "loaded_at": 0,
           "black_v4": [], "black_v6": [], "white_v4": [], "white_v6": [],
           # 登录即信任的 IP（面板登录后得的豁免名单），单独计时与规则缓存解耦
-          "trust_login": [], "trust_login_at": 0}
+          "trust_login": [], "trust_login_at": 0,
+          # 可信回源网段索引（/32 整数集合 + 宽网段元组），同上单独计时
+          "trust_cidr_exact": frozenset(), "trust_cidr_nets": (), "trust_cidr_at": 0}
 _cache_lock = threading.Lock()
 CACHE_TTL = 3  # 秒
 # 登录信任名单的目标是「换网络后登录一次，马上生效」，所以 TTL 取得很短
@@ -339,6 +341,7 @@ def invalidate_cache():
     with _cache_lock:
         _cache["loaded_at"] = 0
         _cache["trust_login_at"] = 0
+        _cache["trust_cidr_at"] = 0
 
 
 def _trusted_login_ids():
@@ -365,13 +368,82 @@ def _trusted_login_ids():
     return trusted
 
 
+def _trusted_cidr_index():
+    """学习到的可信回源网段索引 -> (exact, nets)，带 3 秒缓存。
+
+    exact 是 /32（含 /128）条目的 (版本, 整数) 集合，O(1) 命中——学习表里绝大多数
+    是单 IP；nets 是更宽的网段元组（/24 升级等，少见）逐个比较。
+
+    决策热路径红线要求这里不能每连接查库，所以与 _rules()/_trusted_login_ids()
+    同口径：3 秒缓存 + invalidate_cache() 立即失效。必须带版本判断：IPv4 的
+    0.0.0.1 与 IPv6 的 ::1 整数相同，只按整数比会把两版混在一起。
+
+    读库失败按「没有可信网段」处理（宁可照常封禁，也不因读失败而全放行）。
+    """
+    now = time.time()
+    with _cache_lock:
+        if now - _cache.get("trust_cidr_at", 0) <= CACHE_TTL:
+            return (_cache.get("trust_cidr_exact") or frozenset(),
+                    _cache.get("trust_cidr_nets") or ())
+    exact, nets = set(), []
+    try:
+        for part in store.list_trusted_cidr_strings():
+            try:
+                net = ipaddress.ip_network(part, strict=False)
+            except ValueError:
+                continue
+            if net.prefixlen >= net.max_prefixlen:
+                exact.add((net.version, int(net.network_address)))
+            else:
+                nets.append(net)
+    except Exception:
+        exact, nets = set(), []
+    exact, nets = frozenset(exact), tuple(nets)
+    with _cache_lock:
+        _cache["trust_cidr_exact"] = exact
+        _cache["trust_cidr_nets"] = nets
+        _cache["trust_cidr_at"] = now
+    return exact, nets
+
+
+def _in_trusted_cidr(ip_obj, cfg):
+    """IP 是否落在「可信回源网段」内，命中返回网段字符串，否则 ""。
+
+    与 `app/ai.py::_in_trusted_cidr` **同口径，两处必须一起改**：
+      1. 配置 `ai_trusted_cidrs`（人工声明，确定性，不读库）；
+      2. 学习表 `trusted_cidr`（AI 判过 CDN 回源的 IP/段自己记下的）。
+
+    为什么引擎侧也要查：CDN/ESA 回源 IP 是共享边缘节点，封一个等于封该 CDN 背后
+    的整站用户（2026-11 封掉 ESA 回源段 -> 整站 522）。AI 侧早就不封了，但本模块
+    的自动封禁（基础/敏感服务/CC/多代理探测）原来不查这条，于是「AI 不封」形同虚设。
+    """
+    raw = str(cfg.get("ai_trusted_cidrs") or "").strip()
+    if raw:
+        for part in re.split(r"[,;\s]+", raw):
+            if not part:
+                continue
+            try:
+                if ip_obj in ipaddress.ip_network(part, strict=False):
+                    return part
+            except ValueError:
+                continue
+    exact, nets = _trusted_cidr_index()
+    if (ip_obj.version, int(ip_obj)) in exact:
+        return str(ip_obj)
+    for net in nets:
+        if net.version == ip_obj.version and ip_obj in net:
+            return str(net)
+    return ""
+
+
 def _proxy_exempt(proxy_name, cfg):
     """该代理是否不参与自动封禁（配置 auto_ban_exempt_proxies）。
 
     用途：自己常用的代理（如 mysql80-tcp / ssh-tcp）被客户端反复重连时，
     会因「敏感服务高频建连」把自己封了（而且是**永久**黑名单）。
     把这些代理加进豁免名单即可——它们仍然是「应用层照常准入、日志照常记录」，
-    只是不再触发自动封禁。
+    在第 5 步基础自动封禁与 6.1 / 6.2 不再触发封禁；但 6.3 多代理探测仍然生效
+    （同一 IP 访问多个不同代理时照常判定），见 _attack_detect。
 
     支持 ﻿`*` 通配，例：`mysql80-tcp,ssh-tcp,codebuddy*`。
     """
@@ -711,9 +783,13 @@ def decide(remote_ip, remote_port, proxy_name, proxy_type, user):
     if _is_banned(remote_ip):
         return False, "banned"
 
-    # 突发观测：记录通过前置准入（白/黑/封禁）的连接。放在第 3 步之后，
-    # 已知恶意 IP 的重试不进入观测；纯内存、失败静默，不影响准入。
-    _burst_track(proxy_name, proxy_type, remote_ip, time.time())
+    # 突发观测与代理级冷却的豁免流量完全绕过：既不进入观测窗口，
+    # 也不参与冷却续期证据，更不能在第 7 步被拦截。只在冷却开关开启时
+    # 查询登录信任表，避免关闭该功能时给决策热路径增加额外读取。
+    cool_exempt = bool(cfg.get("proxy_cool_enabled")
+                       and _proxy_cool_exempt(remote_ip, proxy_name, cfg))
+    if not cool_exempt:
+        _burst_track(proxy_name, proxy_type, remote_ip, time.time())
 
     # 4. 限速
     if cfg.get("rate_limit_enabled") and _rate_limited(remote_ip, int(cfg.get("rate_limit_per_sec") or 0)):
@@ -726,7 +802,10 @@ def decide(remote_ip, remote_port, proxy_name, proxy_type, user):
     if cfg.get("auto_ban_enabled"):
         window = int(cfg.get("auto_ban_window") or 60)
         threshold = int(cfg.get("auto_ban_threshold") or 0)
-        if threshold > 0:
+        # 豁免流量（登录信任 / 代理豁免）完全不进计数窗口：先判豁免再计数。
+        # 若只在认领时判定，豁免连接会消耗本窗口唯一的一次认领，同一窗口内
+        # 该 IP 再访问非豁免代理也不会触发封禁。
+        if threshold > 0 and not _exempt_hit(remote_ip, proxy_name, cfg):
             cnt, claimed = _attack_count("base", remote_ip, window, threshold)
             if claimed:
                 reason = "auto: %d conns/%ds" % (threshold, window)
@@ -742,10 +821,39 @@ def decide(remote_ip, remote_port, proxy_name, proxy_type, user):
 
     # 7. 代理级冷却（默认关闭）：分布式突发下拒绝该代理「新出现 IP」的首连；
     #    冷却期间已见 IP（known 冻结集合）放行，控制对真实用户的误伤面。
-    if proxy_name and _cool_active(proxy_name) and _cool_blocks(proxy_name, remote_ip):
+    if (not cool_exempt and proxy_name and _cool_active(proxy_name)
+            and _cool_blocks(proxy_name, remote_ip)):
         return False, "proxy_cool"
 
     return True, ""
+
+
+def _exempt_hit(ip, proxy_name, cfg, proxy=True):
+    """自动封禁认领点的豁免判定。
+
+    三道豁免：
+      1. 登录信任（始终生效）；
+      2. 可信回源网段（人工 ai_trusted_cidrs + AI 学习表，始终生效——回源节点访问
+         多站点正是误封高发场景，所以 6.3 多代理探测也认这条）；
+      3. 代理豁免（proxy=False 时不看，6.3 多代理探测使用）。
+
+    在各检测项计数**之前**调用，命中即不计数。三个来源都带短缓存
+    （与 _rules 同口径），决策热路径不查库。
+    """
+    if ip in _trusted_login_ids():
+        return True
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+    except ValueError:
+        ip_obj = None
+    if ip_obj is not None and _in_trusted_cidr(ip_obj, cfg):
+        return True
+    return bool(proxy and _proxy_exempt(proxy_name, cfg))
+
+
+def _proxy_cool_exempt(ip, proxy_name, cfg):
+    """第 7 步的豁免判定：登录信任 IP 与配置豁免代理均完全跳过。"""
+    return _exempt_hit(ip, proxy_name, cfg)
 
 
 def _attack_detect(cfg, ip, proxy_name, proxy_type):
@@ -754,21 +862,20 @@ def _attack_detect(cfg, ip, proxy_name, proxy_type):
     检测顺序：敏感服务（确凿，永久）-> CC -> 端口扫描。
     全部为内存计数，窗口过期自动重置，不查库、不做磁盘 IO。
 
-    两道豁免（在计数之前就返回，不写入任何封禁）：
-      1. 登录即信任：面板登录过的 IP（换网络后登录一次即可）；
-      2. 代理豁免：配置 auto_ban_exempt_proxies 里的代理（自己用的库/SSH 隧道）。
-    两者都只跳过**自动封禁**，不影响应用层准入与日志记录。
+    两道豁免按检测项分别生效（判定前置到各分支计数之前，豁免连接不计数）：
+      1. 登录即信任：面板登录过的 IP，6.1 / 6.2 / 6.3 均不封禁；
+      2. 代理豁免：配置 auto_ban_exempt_proxies 里的代理，6.1 / 6.2 不封禁，
+         **6.3 仍然生效**——同一 IP 在窗口内访问多个不同代理，本身不是
+         「在用自己的那一个服务」的特征，豁免单个代理名不应让多代理探测失效。
+    命中豁免的连接不进入该检测项的计数窗口（不累加、不消耗认领），继续后续检测项；
+    两者都只影响**自动封禁**，不影响应用层准入与日志记录。
     """
-    if _proxy_exempt(proxy_name, cfg):
-        return ""
-    if ip in _trusted_login_ids():
-        return ""
 
     # 6.1 敏感服务爆破（ssh/mysql/redis 等）：高频新建 -> 永久黑名单
     if cfg.get("auto_ban_ssh_enabled") and _hit_sensitive(proxy_name, proxy_type):
         window = max(1, int(cfg.get("auto_ban_ssh_window") or 60))
         threshold = int(cfg.get("auto_ban_ssh_threshold") or 0)
-        if threshold > 0:
+        if threshold > 0 and not _exempt_hit(ip, proxy_name, cfg):
             cnt, claimed = _attack_count("ssh", ip, window, threshold)
             if claimed:
                 reason = "auto_ssh: %s %d conns/%ds" % (proxy_name or "-", cnt, window)
@@ -782,7 +889,7 @@ def _attack_detect(cfg, ip, proxy_name, proxy_type):
         if ptype in ("http", "https", "tcpmux"):
             window = max(1, int(cfg.get("auto_ban_cc_window") or 60))
             threshold = int(cfg.get("auto_ban_cc_threshold") or 0)
-            if threshold > 0:
+            if threshold > 0 and not _exempt_hit(ip, proxy_name, cfg):
                 cnt, claimed = _attack_count("cc", ip, window, threshold)
                 if claimed:
                     reason = "auto_cc: %d conns/%ds" % (cnt, window)
@@ -794,7 +901,9 @@ def _attack_detect(cfg, ip, proxy_name, proxy_type):
     if cfg.get("auto_ban_scan_enabled") and proxy_name:
         window = max(1, int(cfg.get("auto_ban_scan_window") or 60))
         threshold = int(cfg.get("auto_ban_scan_threshold") or 0)
-        if threshold > 0:
+        # 只看登录信任、不看代理豁免：多代理探测不因单个代理名豁免而失效；
+        # 登录信任的 IP 不进入扫描窗口。
+        if threshold > 0 and not _exempt_hit(ip, proxy_name, cfg, proxy=False):
             n, claimed, names = _attack_scan(ip, proxy_name, window, threshold)
             if claimed:
                 reason = "auto_scan: %d proxies/%ds" % (n, window)

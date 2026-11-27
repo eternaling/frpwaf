@@ -481,7 +481,7 @@ class frpwaf_main:
             self._fw_sync()
             return public.returnMsg(True, "WAF 网页端安装成功（仅安装网页端，非安装 frp）！管理面板：%s（默认账号 admin / 123456，请及时修改）" % self._panel_url())
         except Exception:
-            return public.returnMsg(False, "安装失败：" + traceback.format_exc())
+            return self._fail("安装失败")
 
     def reinstall_waf(self, get=None):
         """重装：卸载后重新安装。注意 uninstall 会移除 frps.toml 中的插件块，
@@ -555,7 +555,7 @@ class frpwaf_main:
                 pass
             return public.returnMsg(True, "已卸载（数据保留在 %s/data）" % WAF_HOME)
         except Exception:
-            return public.returnMsg(False, "卸载失败：" + traceback.format_exc())
+            return self._fail("卸载失败")
 
     # ---------------- 服务控制 ----------------
     def _audit(self, msg):
@@ -571,6 +571,43 @@ class frpwaf_main:
                         % (time.strftime("%Y-%m-%d %H:%M:%S"), _log_text(msg)))
         except Exception:
             pass
+
+    def _log_exc(self, msg):
+        """记录当前异常，返回给前端的简短文本（须在 except 块内调用）。
+
+        前端只回简短消息 + 异常类型名，不回传堆栈：堆栈尾部常含服务器绝对路径。
+        完整堆栈写入 data/frpwaf.log 的 [错误] 行，按类型名与时间对照定位。
+        需要自定义返回结构的接口（如 conn_logs 的 error 字段）直接用它，
+        其余接口走 _fail。
+        """
+        etype = sys.exc_info()[0]
+        name = getattr(etype, "__name__", "") or "Exception"
+        try:
+            p = os.path.join(WAF_HOME, "data", "frpwaf.log")
+            with open(p, "a", encoding="utf-8") as f:
+                f.write("[%s] [错误] %s：%s\n"
+                        % (time.strftime("%Y-%m-%d %H:%M:%S"), _log_text(msg),
+                           _log_text(traceback.format_exc())))
+        except Exception:
+            pass
+        return "%s（%s，详见运行日志）" % (msg, name)
+
+    def _route_error(self, msg, detail=""):
+        """记录净化后的接口错误详情，只向插件端返回固定短文案。"""
+        detail = str(detail or "未提供错误详情")
+        try:
+            p = os.path.join(WAF_HOME, "data", "frpwaf.log")
+            with open(p, "a", encoding="utf-8") as f:
+                f.write("[%s] [错误] %s：%s\n"
+                        % (time.strftime("%Y-%m-%d %H:%M:%S"), _log_text(msg),
+                           _log_text(detail)))
+        except Exception:
+            pass
+        return public.returnMsg(False, msg)
+
+    def _fail(self, msg):
+        """接口统一异常出口（须在 except 块内调用）：记录堆栈，返回 returnMsg 失败结构。"""
+        return public.returnMsg(False, self._log_exc(msg))
 
     def waf_admin(self, get):
         if not hasattr(get, "status") or not get.status:
@@ -607,7 +644,7 @@ class frpwaf_main:
                 "网页端已开启" if enabled
                 else "网页端已关闭（WAF 防护与 frps 回调不受影响，可随时重新开启）")
         except Exception:
-            return public.returnMsg(False, "操作失败：" + traceback.format_exc()[-200:])
+            return self._fail("操作失败")
 
     def _port_listening(self, port, host="127.0.0.1"):
         import socket
@@ -790,7 +827,7 @@ class frpwaf_main:
                     public.ExecShell("/etc/init.d/frps restart")
             return public.returnMsg(True, "网页端端口已改为 %d，管理面板：%s" % (port, self._panel_url()))
         except Exception:
-            return public.returnMsg(False, "修改失败：" + traceback.format_exc()[-200:])
+            return self._fail("修改失败")
 
     # ---------------- frps 集成 ----------------
     def get_frps_status(self, get=None):
@@ -826,7 +863,7 @@ class frpwaf_main:
             public.ExecShell("/etc/init.d/frps restart")
             return public.returnMsg(True, "已注入 frp 插件配置并重启 frps")
         except Exception:
-            return public.returnMsg(False, "注入失败：" + traceback.format_exc())
+            return self._fail("注入失败")
 
     def _remove_frps_plugin(self):
         """按块移除 name="frpwaf" 的 [[httpPlugins]] 配置，保留其余内容。
@@ -865,7 +902,7 @@ class frpwaf_main:
             info["log_path"] = ("/var/log/frps.log" if kind == "frps" else "/var/log/frpc.log")
             return {"status": True, "data": info}
         except Exception:
-            return {"status": False, "msg": "获取失败：" + traceback.format_exc()[-200:]}
+            return {"status": False, "msg": self._log_exc("获取失败")}
 
     def frp_latest(self, get=None):
         """查询 GitHub 最新版本（带缓存，按需调用）。"""
@@ -898,7 +935,7 @@ class frpwaf_main:
             ok, msg = frp.control(kind, action)
             return public.returnMsg(ok, msg)
         except Exception:
-            return public.returnMsg(False, "操作失败：" + traceback.format_exc()[-200:])
+            return self._fail("操作失败")
 
     def frp_install_start(self, get=None):
         """启动后台安装任务（立即返回，前端轮询进度）。"""
@@ -913,7 +950,7 @@ class frpwaf_main:
             ok, msg = frp.start_install(kind, ver)
             return public.returnMsg(ok, msg)
         except Exception:
-            return public.returnMsg(False, "启动失败：" + traceback.format_exc()[-300:])
+            return self._fail("启动失败")
 
     def frp_install_status(self, get=None):
         """查询后台安装任务进度。"""
@@ -930,7 +967,7 @@ class frpwaf_main:
             ok, msg = frp.uninstall(kind)
             return public.returnMsg(ok, msg)
         except Exception:
-            return public.returnMsg(False, "卸载失败：" + traceback.format_exc()[-200:])
+            return self._fail("卸载失败")
 
     def frp_rollback(self, get=None):
         """回滚到最近一次升级前备份（含二进制与配置），并重启服务。"""
@@ -940,7 +977,7 @@ class frpwaf_main:
             ok, msg = frp.rollback(kind)
             return public.returnMsg(ok, msg)
         except Exception:
-            return public.returnMsg(False, "回滚失败：" + traceback.format_exc()[-200:])
+            return self._fail("回滚失败")
 
     def frp_get_config(self, get=None):
         """读取配置（结构化 + 原文）。配置不存在时自动预创建。"""
@@ -951,12 +988,12 @@ class frpwaf_main:
                 frp.ensure_config(kind)
             ok, cfg = frp.load_config(kind)
             if not ok:
-                return {"status": False, "msg": cfg}
+                return self._route_error("读取配置失败", cfg)
             return {"status": True, "data": cfg,
                     "raw": self._read(frp._toml_path(kind)),
                     "path": frp._toml_path(kind)}
-        except Exception:
-            return {"status": False, "msg": traceback.format_exc()[-200:]}
+        except Exception as e:
+            return self._route_error("读取配置失败", e)
 
     def frp_ensure_config(self, get=None):
         """确保 frps / frpc 配置文件存在，缺失则预创建。"""
@@ -966,9 +1003,11 @@ class frpwaf_main:
             created, path, msg = frp.ensure_config(kind)
             if created:
                 return public.returnMsg(True, "已预创建配置文件：%s" % path)
-            return public.returnMsg(True, "配置文件已存在：%s" % path)
-        except Exception:
-            return public.returnMsg(False, "操作失败：" + traceback.format_exc()[-200:])
+            if msg == "配置文件已存在":
+                return public.returnMsg(True, "配置文件已存在：%s" % path)
+            return self._route_error("配置文件操作失败", msg)
+        except Exception as e:
+            return self._route_error("配置文件操作失败", e)
 
     def frp_save_config(self, get=None):
         """结构化保存配置（保留未知字段、写前备份、写后校验）。"""
@@ -982,9 +1021,11 @@ class frpwaf_main:
             except Exception:
                 return public.returnMsg(False, "参数格式错误")
             ok, msg = frp.save_config(kind, patch)
-            return public.returnMsg(ok, msg)
-        except Exception:
-            return public.returnMsg(False, "保存失败：" + traceback.format_exc()[-300:])
+            if ok:
+                return public.returnMsg(True, msg)
+            return self._route_error("保存配置失败", msg)
+        except Exception as e:
+            return self._route_error("保存配置失败", e)
 
     def _toml_verify_path(self, frp, kind, cand):
         """用 frps/frpc `verify -c <cand>` 校验候选文件，返回错误串（通过/无法校验返回空）。
@@ -1026,16 +1067,15 @@ class frpwaf_main:
                 return public.returnMsg(False, "内容为空")
             path = frp._toml_path(kind)
             if not os.path.exists(path):
-                return public.returnMsg(False, "配置文件不存在：%s" % path)
+                return self._route_error("配置文件不存在", path)
             terr = frp.check_toml(text)   # 语法校验（纯标准库，不依赖第三方 toml）
             if terr:
-                return public.returnMsg(False, "TOML 语法错误：%s" % terr)
+                return self._route_error("TOML 语法校验失败", terr)
             # 备份成功才动原文件
             try:
                 self._backup_file(path)
             except Exception as e:
-                return public.returnMsg(False, "备份失败，已放弃保存（原文件未改动）：%s"
-                                        % str(e)[:200])
+                return self._route_error("备份失败，已放弃保存（原文件未改动）", e)
             # 候选文件必须与正式文件同目录：frp 对配置里的相对路径按配置文件位置解析，
             # 放到 /tmp 校验会得出与线上不同的结果（假失败）。
             cand = "%s.verify.%d" % (path, os.getpid())
@@ -1047,8 +1087,8 @@ class frpwaf_main:
                     pass
                 verr = self._toml_verify_path(frp, kind, cand)
                 if verr:
-                    return public.returnMsg(
-                        False, "配置校验未通过，已放弃保存（原文件未改动）：%s" % verr)
+                    return self._route_error(
+                        "配置校验未通过，已放弃保存（原文件未改动）", verr)
                 os.replace(cand, path)
                 self._fsync_dir(os.path.dirname(path))
             finally:
@@ -1058,8 +1098,8 @@ class frpwaf_main:
                     except OSError:
                         pass
             return public.returnMsg(True, "已保存并通过校验")
-        except Exception:
-            return public.returnMsg(False, "保存失败：" + traceback.format_exc()[-200:])
+        except Exception as e:
+            return self._route_error("保存配置失败", e)
 
     def frp_verify(self, get=None):
         try:
@@ -1067,10 +1107,10 @@ class frpwaf_main:
             kind = self._kind(get)
             err = frp.verify(kind)
             if err:
-                return public.returnMsg(False, "校验失败：" + err)
+                return self._route_error("配置校验失败", err)
             return public.returnMsg(True, "配置校验通过")
-        except Exception:
-            return public.returnMsg(False, traceback.format_exc()[-200:])
+        except Exception as e:
+            return self._route_error("配置校验失败", e)
 
     def frp_log(self, get=None):
         """读取 frps / frpc 运行日志。"""
@@ -1205,7 +1245,7 @@ class frpwaf_main:
             return public.returnMsg(
                 False, "放行失败（%s）：%s%s" % (backend, "，".join(failed), warn))
         except Exception:
-            return public.returnMsg(False, "放行失败：" + traceback.format_exc()[-200:])
+            return self._fail("放行失败")
 
     def get_log(self, get=None):
         n = 200
@@ -1245,7 +1285,7 @@ class frpwaf_main:
                 "lat": g.get("lat"), "lon": g.get("lon"),
             }}
         except Exception:
-            return public.returnMsg(False, "查询失败：" + traceback.format_exc()[-200:])
+            return self._fail("查询失败")
 
     def geo_top(self, get=None):
         """高频来源 IP（含归属地），按连接数排序。"""
@@ -1401,7 +1441,7 @@ class frpwaf_main:
             self._set_cfg(patch)
             return public.returnMsg(True, "AI 配置已保存")
         except Exception:
-            return public.returnMsg(False, "保存失败：" + traceback.format_exc()[-200:])
+            return self._fail("保存失败")
 
     def ai_test(self, get=None):
         """测试 AI 连接（可用表单值覆盖已保存配置）。
@@ -1452,7 +1492,7 @@ class frpwaf_main:
                 return public.returnMsg(False, _msg)
             return {"status": True, "data": st, "msg": "已提交测试任务"}
         except Exception:
-            return public.returnMsg(False, "测试失败：" + traceback.format_exc()[-200:])
+            return self._fail("测试失败")
 
     def ai_test_status(self, get=None):
         """读回 AI 连接测试状态（供插件页面轮询）。"""
@@ -1479,7 +1519,7 @@ class frpwaf_main:
             self._set_cfg({"ai_run_requested": req})
             return public.returnMsg(True, "已提交，正在后台审查（完成后自动显示结果）")
         except Exception:
-            return public.returnMsg(False, "提交失败：" + traceback.format_exc()[-300:])
+            return self._fail("提交失败")
 
     def ai_status(self, get=None):
         """查询异步审查状态（前端轮询用）。
@@ -1602,7 +1642,7 @@ class frpwaf_main:
                 return public.returnMsg(True, "内核封禁与拦截页均已关闭，已清理内核规则")
             return public.returnMsg(False, "当前环境不支持（需 root + ipset/iptables）")
         except Exception:
-            return public.returnMsg(False, "同步失败：" + traceback.format_exc()[-200:])
+            return self._fail("同步失败")
 
     def list_bans(self, get=None):
         """返回：黑名单永久封禁 + 临时封禁（生效中）。"""
@@ -1656,7 +1696,7 @@ class frpwaf_main:
         except ValueError as e:
             return public.returnMsg(False, str(e))
         except Exception:
-            return public.returnMsg(False, "封禁失败：" + traceback.format_exc()[-200:])
+            return self._fail("封禁失败")
 
     def unban_ip(self, get=None):
         """解禁：kind=perm 删除黑名单条目；kind=temp 释放临时封禁。"""
@@ -1686,7 +1726,7 @@ class frpwaf_main:
                 self._fw_sync()
                 return public.returnMsg(True, "已从黑名单移除")
         except Exception:
-            return public.returnMsg(False, "解禁失败：" + traceback.format_exc()[-200:])
+            return self._fail("解禁失败")
 
     def unban_all_black(self, get=None):
         """一键解封：清空黑名单全部条目（永久封禁），并同步内核。
@@ -1704,7 +1744,7 @@ class frpwaf_main:
             self._fw_sync()
             return public.returnMsg(True, "已解封全部黑名单（%d 条）" % n)
         except Exception:
-            return public.returnMsg(False, "解封失败：" + traceback.format_exc()[-200:])
+            return self._fail("解封失败")
 
     def unban_all_temp(self, get=None):
         """一键解封：释放全部生效中的临时封禁，并同步内核。
@@ -1717,7 +1757,7 @@ class frpwaf_main:
             self._fw_sync()
             return public.returnMsg(True, "已解封全部临时封禁（%d 条）" % n)
         except Exception:
-            return public.returnMsg(False, "解封失败：" + traceback.format_exc()[-200:])
+            return self._fail("解封失败")
 
     # ---------------- 误封保护：ESA 回源段 / 登录信任 / 代理豁免 ----------------
     # 机制本身已在 app/ 实现，这里只提供面板读写入口：
@@ -1749,6 +1789,8 @@ class frpwaf_main:
         """ESA/CDN 回源段列表（trusted_cidr 表，仅未过期，按命中次数降序）。只读。
 
         remaining_s：剩余有效秒数；expires_at=0（永久）时为 -1。
+        ai_review_id：首次学到该段的审查记录 id（0 = 无关联）。ai_review 会定期裁剪，
+        本条仅作排障线索，不保证记录仍存在。
         """
         try:
             store = self._store()
@@ -1768,8 +1810,9 @@ class frpwaf_main:
                     "remaining_s": -1 if exp == 0 else max(0, exp - now),
                     "created_at": int(r.get("created_at") or 0),
                     "last_seen": int(r.get("last_seen") or 0),
+                    "ai_review_id": int(r.get("ai_review_id") or 0),
                 })
-            total = len(store.list_trusted_cidr_strings() or [])
+            total = int(store.count_trusted_cidrs() or 0)
             cfg = self._cfg_effective()
             return {"status": True, "data": {
                 "items": items,
@@ -1777,7 +1820,7 @@ class frpwaf_main:
                 "learn_enabled": bool(cfg.get("ai_learn_cdn", True)),
             }}
         except Exception:
-            return public.returnMsg(False, "读取回源段失败：" + traceback.format_exc()[-200:])
+            return self._fail("读取回源段失败")
 
     def cdn_trust_del(self, get=None):
         """删除一条回源段（误学时用）。get.cidr 必填。"""
@@ -1794,7 +1837,7 @@ class frpwaf_main:
             self._audit("插件端删除 CDN 回源段：%s" % cidr)
             return public.returnMsg(True, "已删除回源段：%s" % cidr)
         except Exception:
-            return public.returnMsg(False, "删除失败：" + traceback.format_exc()[-200:])
+            return self._fail("删除回源段失败")
 
     def cdn_trust_clear(self, get=None):
         """清空全部回源段，返回删除条数（count）。"""
@@ -1806,7 +1849,7 @@ class frpwaf_main:
             res["count"] = n
             return res
         except Exception:
-            return public.returnMsg(False, "清空失败：" + traceback.format_exc()[-200:])
+            return self._fail("清空回源段失败")
 
     def trust_my_ip(self, get=None):
         """把**当前访问宝塔面板的客户端 IP** 记入登录信任名单。
@@ -1819,8 +1862,10 @@ class frpwaf_main:
         IP 取 `public.get_client_ip()`：直连取 REMOTE_ADDR，经反代时取 X-Forwarded-For
         （宝塔面板常挂 nginx，用户真实 IP 在转发头里）。
 
-        本机回环不写入（127.0.0.1 没有豁免意义，只会把真信息淹没）。
-        返回是否写入与写入的 IP。
+        只写入公网地址：回环 / 内网 / 链路本地 / 保留地址跳过并在 msg 中说明原因。
+        按 IP 去重：已在信任表且剩余有效期超过 TTL 一半时不重写、不记审计，
+        由信任表本身实现限频（插件类每次请求新建实例，实例属性存不住状态）。
+        返回是否写入与对应 IP。
         """
         try:
             cfg = self._cfg_effective()
@@ -1837,24 +1882,39 @@ class frpwaf_main:
                 ip = ""
             ip = ip.replace("::ffff:", "")
             try:
-                ip = str(ipaddress.ip_address(ip))
+                obj = ipaddress.ip_address(ip)
             except ValueError:
                 return {"status": False, "msg": "无法获取有效的客户端 IP"}
-            # 回环地址不写：插件自己/本机调试不应占用信任名额
-            if ipaddress.ip_address(ip).is_loopback:
-                return {"status": True, "msg": "本机访问不写入信任",
-                        "data": {"saved": False, "ip": ip}}
-            self._store().trust_login_ip(ip, ttl)
-            self._engine_invalidate()
-            # 每次进插件页都会调，日志很容易刷爆：限频到 10 分钟一条
+            ip = str(obj)
+            # 只写公网地址：非公网来源多为本机调试或反代内网跳，豁免它们没有意义，
+            # 只会占用信任名额、掩盖真实来源。链路本地先于内网判断（169.254/16 两者皆真）
+            skip = ""
+            if obj.is_loopback:
+                skip = "本机回环地址"
+            elif obj.is_link_local:
+                skip = "链路本地地址"
+            elif obj.is_private:
+                skip = "内网地址"
+            elif obj.is_unspecified or obj.is_multicast or obj.is_reserved:
+                skip = "保留地址"
+            if skip:
+                return {"status": True, "msg": "%s不写入信任：%s" % (skip, ip),
+                        "data": {"saved": False, "ip": ip, "reason": "non_public"}}
+            store = self._store()
+            # 按 IP 去重：剩余有效期仍超过 TTL 一半就不重写、不记审计（天然限频）
             now = int(time.time())
-            if now - int(getattr(self, "_last_trust_log", 0) or 0) >= 600:
-                self._last_trust_log = now
-                self._audit("宝塔面板访问，已将 %s 加入登录信任（%d 秒）" % (ip, ttl))
+            remaining = int(store.trusted_login_expiry(ip) or 0) - now
+            if remaining > ttl // 2:
+                return {"status": True, "msg": "当前 IP 已在信任名单中：%s" % ip,
+                        "data": {"saved": False, "ip": ip, "ttl": ttl,
+                                 "remaining_s": remaining, "reason": "fresh"}}
+            store.trust_login_ip(ip, ttl)
+            self._engine_invalidate()
+            self._audit("宝塔面板访问，已将 %s 加入登录信任（%d 秒）" % (ip, ttl))
             return {"status": True, "msg": "已将当前 IP 加入信任：%s" % ip,
                     "data": {"saved": True, "ip": ip, "ttl": ttl}}
         except Exception:
-            return public.returnMsg(False, "写入登录信任失败：" + traceback.format_exc()[-200:])
+            return self._fail("写入登录信任失败")
 
     def self_protect_info(self, get=None):
         """防误封状态：登录信任 IP（含剩余秒数）+ 登录信任有效期 + 豁免代理。只读。"""
@@ -1882,7 +1942,7 @@ class frpwaf_main:
                 "exempt_resolved": self._split_proxy_names(raw),
             }}
         except Exception:
-            return public.returnMsg(False, "读取防误封状态失败：" + traceback.format_exc()[-200:])
+            return self._fail("读取防误封状态失败")
 
     def self_protect_save(self, get=None):
         """保存 auto_ban_exempt_proxies（豁免代理）与 trust_login_ttl（登录信任有效期，秒）。
@@ -1919,7 +1979,7 @@ class frpwaf_main:
                 patch.get("trust_login_ttl", "(未改)")))
             return public.returnMsg(True, "已保存")
         except Exception:
-            return public.returnMsg(False, "保存失败：" + traceback.format_exc()[-200:])
+            return self._fail("保存误封保护失败")
 
     def trust_login_del(self, get=None):
         """取消一条登录信任。get.ip 必填。"""
@@ -1936,7 +1996,7 @@ class frpwaf_main:
             self._audit("插件端取消登录信任：%s" % ip)
             return public.returnMsg(True, "已取消登录信任：%s" % ip)
         except Exception:
-            return public.returnMsg(False, "取消失败：" + traceback.format_exc()[-200:])
+            return self._fail("取消登录信任失败")
 
     def trust_login_clear(self, get=None):
         """清空登录信任，返回删除条数（count）。"""
@@ -1948,7 +2008,7 @@ class frpwaf_main:
             res["count"] = n
             return res
         except Exception:
-            return public.returnMsg(False, "清空失败：" + traceback.format_exc()[-200:])
+            return self._fail("清空登录信任失败")
 
     # ---------------- 概览统计 ----------------
     def waf_overview(self, get=None):
@@ -2027,7 +2087,7 @@ class frpwaf_main:
         except ValueError as e:
             return public.returnMsg(False, str(e))
         except Exception:
-            return public.returnMsg(False, "添加失败：" + traceback.format_exc()[-200:])
+            return self._fail("添加失败")
 
     def del_ip_entry(self, get=None):
         """删除名单条目（按 id）。"""
@@ -2043,7 +2103,7 @@ class frpwaf_main:
             self._fw_sync()
             return public.returnMsg(True, "已删除")
         except Exception:
-            return public.returnMsg(False, "删除失败：" + traceback.format_exc()[-200:])
+            return self._fail("删除失败")
 
     def batch_import_ips(self, get=None):
         """批量导入：text 每行  cidr[,备注]；list_type=black/white。"""
@@ -2079,7 +2139,7 @@ class frpwaf_main:
             self._fw_sync()
             return public.returnMsg(True, "导入完成：成功 %d，跳过 %d" % (ok, fail))
         except Exception:
-            return public.returnMsg(False, "导入失败：" + traceback.format_exc()[-200:])
+            return self._fail("导入失败")
 
     # ---------------- 连接日志 ----------------
     def conn_logs(self, get=None):
@@ -2134,7 +2194,7 @@ class frpwaf_main:
                     "limit": limit, "offset": offset}
         except Exception:
             return {"status": True, "data": [], "total": 0,
-                    "error": traceback.format_exc()[-200:]}
+                    "error": self._log_exc("查询连接日志失败")}
 
     def log_proxy_list(self, get=None):
         """连接日志中出现过的代理名（供筛选下拉框）。"""
@@ -2203,7 +2263,7 @@ class frpwaf_main:
             _app("store").purge_logs()
             return public.returnMsg(True, "连接日志已清空")
         except Exception:
-            return public.returnMsg(False, "清空失败：" + traceback.format_exc()[-200:])
+            return self._fail("清空失败")
 
     # ---------------- 封禁历史 ----------------
     def ban_history(self, get=None):
@@ -2304,7 +2364,7 @@ class frpwaf_main:
                 pass
             return public.returnMsg(True, "策略已保存")
         except Exception:
-            return public.returnMsg(False, "保存失败：" + traceback.format_exc()[-200:])
+            return self._fail("保存失败")
 
     # ---------------- 静态拦截页 / GitHub 在线升级 / 关于 ----------------
     def _upgrade_repo(self, get=None):
@@ -2332,7 +2392,7 @@ class frpwaf_main:
             return {"status": bool(res.get("ok")), "data": res,
                     "msg": res.get("error") or res.get("msg") or "检查完成"}
         except Exception:
-            return {"status": False, "msg": "检查更新失败：" + traceback.format_exc()[-200:]}
+            return {"status": False, "msg": self._log_exc("检查更新失败")}
 
     def upgrade_apply(self, get=None):
         """提交 GitHub 在线升级（异步：立即返回 job_id，前端轮询进度）。
@@ -2384,7 +2444,7 @@ class frpwaf_main:
                 return {"status": False, "msg": msg, "data": st}
             return {"status": True, "data": st, "msg": "已提交升级任务"}
         except Exception:
-            return {"status": False, "msg": "升级提交失败：" + traceback.format_exc()[-200:]}
+            return {"status": False, "msg": self._log_exc("升级提交失败")}
 
     def upgrade_status(self, get=None):
         """读回升级任务状态（供插件页面轮询）。
@@ -2474,4 +2534,4 @@ class frpwaf_main:
             self._set_cfg(patch)
             return public.returnMsg(True, "账号已更新")
         except Exception:
-            return public.returnMsg(False, "修改失败：" + traceback.format_exc()[-200:])
+            return self._fail("修改失败")

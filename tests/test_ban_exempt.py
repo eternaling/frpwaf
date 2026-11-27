@@ -130,6 +130,147 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class ExemptScopeTest(unittest.TestCase):
+    """P1-1：登录信任 / 代理豁免在第 5、6 步的生效范围。
+
+    口径：
+      - 登录信任在所有自动封禁决策点生效（第 5 步、6.1 / 6.2 / 6.3）；
+      - 代理豁免在第 5 步与 6.1 / 6.2 生效，但**不屏蔽 6.3 端口扫描**——
+        同一 IP 访问多个不同代理本身不是「在用我自己的那一个服务」的画像。
+    """
+
+    IP = "9.9.9.9"
+    # 与生产配置一致的豁免列表
+    SCAN_PROXIES = ("ssh-tcp", "mysql80-tcp", "mysql-tcp", "postgres-tcp",
+                    "mongodb-tcp", "redis-tcp")
+
+    def setUp(self):
+        from tests import new_home
+        new_home(self)
+        engine.invalidate_cache()
+        self.cfg = dict(config.DEFAULTS)
+        # 内存攻击计数是模块级状态，逐用例清掉本 IP 的残留，避免用例间串扰
+        for d in engine._attack.values():
+            d.pop(self.IP, None)
+        # 只打开被测的那一项，避免其它检测项干扰结论
+        self.cfg.update({
+            "whitelist_enabled": False, "rate_limit_enabled": False,
+            "auto_ban_enabled": False, "auto_ban_ssh_enabled": False,
+            "auto_ban_cc_enabled": False, "auto_ban_scan_enabled": False,
+            "auto_ban_exempt_proxies": ",".join(self.SCAN_PROXIES) + ",web-http",
+        })
+
+    def tearDown(self):
+        engine.invalidate_cache()
+
+    def _banned(self, ip):
+        return (any((r.get("ip") or "") == ip for r in store.active_bans())
+                or _in_blacklist(ip))
+
+    def _trust(self, ip):
+        store.trust_login_ip(ip, 86400)
+        engine.invalidate_cache()
+
+    def _decide_n(self, cfg, n, proxy, ptype="tcp"):
+        from unittest import mock
+        with mock.patch.object(config, "get", return_value=cfg):
+            return [engine.decide(self.IP, 50000, proxy, ptype, "") for _ in range(n)]
+
+    def _base_cfg(self):
+        return dict(self.cfg, auto_ban_enabled=True, auto_ban_threshold=5,
+                    auto_ban_window=60)
+
+    # ---- 第 5 步基础自动封禁 ----
+    def test_base_trusted_login_not_banned(self):
+        """1. 登录信任的 IP 达到 auto_ban_threshold -> 不封。"""
+        self._trust(self.IP)
+        res = self._decide_n(self._base_cfg(), 8, "gitea-web")
+        self.assertTrue(all(ok for ok, _ in res), res)
+        self.assertFalse(self._banned(self.IP))
+
+    def test_base_exempt_proxy_not_banned(self):
+        """2. 豁免代理的 IP 达到阈值 -> 不封（P1-1 核心）。"""
+        res = self._decide_n(self._base_cfg(), 8, "mysql80-tcp")
+        self.assertTrue(all(ok for ok, _ in res), res)
+        self.assertFalse(self._banned(self.IP))
+
+    def test_base_non_exempt_still_banned(self):
+        """对照组：非豁免代理、未信任 IP 照常被第 5 步封禁。"""
+        res = self._decide_n(self._base_cfg(), 8, "gitea-web")
+        self.assertIn((False, "auto_ban"), res)
+        self.assertTrue(self._banned(self.IP))
+
+    # ---- 第 6 步 ----
+    def test_sensitive_exempt_not_counted(self):
+        """3. 6.1 敏感爆破：豁免代理高频连接 -> 不封，且完全不进入计数窗口。"""
+        cfg = dict(self.cfg, auto_ban_ssh_enabled=True, auto_ban_ssh_threshold=5,
+                   auto_ban_ssh_window=60)
+        res = [engine._attack_detect(cfg, self.IP, "mysql80-tcp", "tcp") for _ in range(10)]
+        self.assertEqual(set(res), {""})
+        self.assertFalse(self._banned(self.IP))
+        self.assertNotIn(self.IP, engine._attack["ssh"])
+
+    def test_scan_across_exempt_proxies_banned(self):
+        """4. 6.3 端口扫描：同一 IP 连续访问多个不同豁免代理达到阈值 -> 封（修漏封核心）。"""
+        cfg = dict(self.cfg, auto_ban_scan_enabled=True, auto_ban_scan_threshold=4,
+                   auto_ban_scan_window=60)
+        res = [engine._attack_detect(cfg, self.IP, p, "tcp") for p in self.SCAN_PROXIES]
+        self.assertIn("auto_ban_scan", res)
+        self.assertTrue(self._banned(self.IP))
+
+    def test_cc_exempt_not_banned(self):
+        """5. 6.2 CC：豁免代理 -> 不封。"""
+        cfg = dict(self.cfg, auto_ban_cc_enabled=True, auto_ban_cc_threshold=5,
+                   auto_ban_cc_window=60)
+        res = [engine._attack_detect(cfg, self.IP, "web-http", "http") for _ in range(10)]
+        self.assertEqual(set(res), {""})
+        self.assertFalse(self._banned(self.IP))
+
+    def test_scan_trusted_login_not_banned(self):
+        """6. 登录信任的 IP 即使触发 6.3 -> 不封（信任优先）。"""
+        self._trust(self.IP)
+        cfg = dict(self.cfg, auto_ban_scan_enabled=True, auto_ban_scan_threshold=4,
+                   auto_ban_scan_window=60)
+        res = [engine._attack_detect(cfg, self.IP, p, "tcp") for p in self.SCAN_PROXIES]
+        self.assertEqual(set(res), {""})
+        self.assertFalse(self._banned(self.IP))
+        # 登录信任的 IP 不进入扫描窗口
+        self.assertNotIn(self.IP, engine._attack["scan"])
+
+    # ---- 豁免流量完全排除于攻击计数窗口：豁免流量不再吃掉本窗口的认领 ----
+    def test_base_exempt_then_non_exempt_same_window_banned(self):
+        """第 5 步：豁免代理先超阈值，同窗口内再访问非豁免代理 -> 第 threshold 次即封。"""
+        cfg = self._base_cfg()
+        res = self._decide_n(cfg, 8, "mysql80-tcp")
+        self.assertTrue(all(ok for ok, _ in res), res)
+        self.assertNotIn(self.IP, engine._attack["base"])
+        res = self._decide_n(cfg, 5, "gitea-web")
+        self.assertTrue(all(ok for ok, _ in res[:-1]), res)
+        self.assertEqual(res[-1], (False, "auto_ban"))
+        self.assertTrue(self._banned(self.IP))
+
+    def test_sensitive_exempt_then_non_exempt_same_window_banned(self):
+        """6.1：豁免敏感代理先超阈值，同窗口内访问非豁免敏感代理 -> 第 threshold 次即封。"""
+        cfg = dict(self.cfg, auto_ban_ssh_enabled=True, auto_ban_ssh_threshold=5,
+                   auto_ban_ssh_window=60)
+        for _ in range(10):
+            self.assertEqual(engine._attack_detect(cfg, self.IP, "mysql80-tcp", "tcp"), "")
+        res = [engine._attack_detect(cfg, self.IP, "ssh-prod", "tcp") for _ in range(5)]
+        self.assertEqual(res, ["", "", "", "", "auto_ban_ssh"])
+        self.assertTrue(self._banned(self.IP))
+
+    def test_cc_exempt_then_non_exempt_same_window_banned(self):
+        """6.2：豁免 HTTP 代理先超阈值，同窗口内访问非豁免 HTTP 代理 -> 第 threshold 次即封。"""
+        cfg = dict(self.cfg, auto_ban_cc_enabled=True, auto_ban_cc_threshold=5,
+                   auto_ban_cc_window=60)
+        for _ in range(10):
+            self.assertEqual(engine._attack_detect(cfg, self.IP, "web-http", "http"), "")
+        self.assertNotIn(self.IP, engine._attack["cc"])
+        res = [engine._attack_detect(cfg, self.IP, "blog-http", "http") for _ in range(5)]
+        self.assertEqual(res, ["", "", "", "", "auto_ban_cc"])
+        self.assertTrue(self._banned(self.IP))
+
+
 class AILoginTrustTest(unittest.TestCase):
     """AI 处置侧也要认登录信任。
 

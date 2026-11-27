@@ -29,7 +29,7 @@ python -m unittest tests.test_engine -v
 | `test_store.py` | 名单/封禁/连接日志的基本读写、`trim_*` 裁剪边界、计数与统计 |
 | `test_engine.py` | `decide()` 的优先级（白名单 > 黑名单 > 生效封禁 > 限速 > 自动封禁 > 类型封禁 > 冷却）、IPv4-mapped 归一化、地址解析失败时 `strict_addr` 两种策略 |
 | `test_firewall.py` | `_reconcile` 差量计算、延长封禁必须重建条目、`sync_from_store` 稳态零调用、`invalidate()` 后重新对账、名单开关关闭后不下发 |
-| `test_upgrade.py` | 解包时拒绝路径回退/绝对路径/链接条目、解包体积与文件数上限、`validate_tree` 的文件存在性与最小结构断言、版本对齐 |
+| `test_upgrade.py` | 解包时拒绝路径回退/绝对路径/链接条目、解包体积与文件数上限、`validate_tree` 的文件存在性与最小结构断言、版本对齐；`_overwrite` 按目标目录分两种：插件目录全量写入 7 个面板载荷、运行目录（`config.BASE`）不写入并清掉已有同名副本、`app/`+`web/` 两边都落、`data/` 两者都不碰、跳过后陈旧 `.py` 仍被清理、`_backup` 不因排除少备文件 |
 | `test_backup.py` | `backup_db` 快照文件生成与逐表行数比对、保留策略（连做 10 次只留最近 7 份且留最新）、写入中断不留半个 `.db`、磁盘不足跳过并返回原因、库文件缺失不抛异常、并发写入下快照一致、备份不持全局锁；`/api/export` 未登录 401 与机密字段一律掩码 |
 | `test_api_routes.py` | HTTP 路由层回归：每条 path 的 GET/POST 实际状态码（含「方法不匹配时是 404 还是 405」这一现状差异）、鉴权边界（未登录 401、`password_changed=False` 时除白名单外全 403）、入参异常一律 400 而不是 500、关键端点（`/api/metrics`、两个 `status`、`/api/export`、`/api/config`）返回结构、协议边界与安全响应头；只打桩进程外副作用与外部网络调用，**不 mock 路由分发本身** |
 

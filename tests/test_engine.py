@@ -209,11 +209,60 @@ class AutoBanTest(EngineTest):
 
 
 class ProxyCoolTest(EngineTest):
+    def setUp(self):
+        super().setUp()
+        self._trusted_patch = mock.patch.object(
+            engine, "_trusted_login_ids", return_value=set())
+        self._trusted_patch.start()
+        self.addCleanup(self._trusted_patch.stop)
+
     def _seed_cool(self, known=("2.2.2.2",), seconds=60):
         now = time.time()
         engine._cool["proxy"] = {"until": now + seconds,
                                  "known": frozenset(known),
                                  "since": now, "conns": 0}
+
+    def test_exempt_proxy_skips_cool_and_burst(self):
+        self.cfg["proxy_cool_enabled"] = True
+        self.cfg["auto_ban_exempt_proxies"] = "proxy"
+        self._seed_cool()
+        self.assertEqual(self.decide("1.1.1.1", name="proxy"), (True, ""))
+        self.assertNotIn("proxy", engine._burst)
+
+    def test_trusted_ip_skips_cool_and_burst(self):
+        self.cfg["proxy_cool_enabled"] = True
+        self._trusted_patch.stop()
+        self._trusted_patch = mock.patch.object(
+            engine, "_trusted_login_ids", return_value={"1.1.1.1"})
+        self._trusted_patch.start()
+        self._seed_cool()
+        self.assertEqual(self.decide("1.1.1.1", name="proxy"), (True, ""))
+        self.assertNotIn("proxy", engine._burst)
+
+    def test_non_exempt_ip_and_proxy_keep_cool_behavior(self):
+        self.cfg["proxy_cool_enabled"] = True
+        self.cfg["auto_ban_exempt_proxies"] = "trusted-*"
+        self._seed_cool()
+        self.assertEqual(self.decide("1.1.1.1", name="proxy"),
+                         (False, "proxy_cool"))
+        self.assertEqual(engine._burst["proxy"]["conns"], 1)
+        self.assertEqual(self.decide("1.1.1.1", name="trusted-proxy"),
+                         (True, ""))
+        self.assertNotIn("trusted-proxy", engine._burst)
+
+    def test_exempt_proxy_does_not_hide_other_proxy_for_same_ip(self):
+        self.cfg["proxy_cool_enabled"] = True
+        self.cfg["auto_ban_exempt_proxies"] = "trusted-proxy"
+        engine._cool["other-proxy"] = {
+            "until": time.time() + 60, "known": frozenset(),
+            "since": time.time(), "conns": 0,
+        }
+        self.assertEqual(self.decide("1.1.1.1", name="trusted-proxy"),
+                         (True, ""))
+        self.assertEqual(self.decide("1.1.1.1", name="other-proxy"),
+                         (False, "proxy_cool"))
+        self.assertNotIn("trusted-proxy", engine._burst)
+        self.assertEqual(engine._burst["other-proxy"]["conns"], 1)
 
     def test_cool_blocks_new_ip(self):
         self.cfg["proxy_cool_enabled"] = True

@@ -167,41 +167,76 @@ def _in_trusted_cidr(ip, cfg):
 
     调用频率：每个送审 IP 一次（不是每个连接），一次 DB 只读查询可接受。
     """
+    return bool(_in_config_cidrs(ip, cfg) or _in_learned_cidrs(ip))
+
+
+def _in_config_cidrs(ip, cfg):
+    """IP 是否落在**人工配置**的可信网段 `ai_trusted_cidrs` 里。
+
+    命中返回匹配到的网段字符串，否则返回 ""。运维手动声明、确定性，不读库。
+    与 _in_learned_cidrs 分开，是为了让审计与面板能区分「人工配置」和「AI 学到」。
+    """
     try:
         obj = ipaddress.ip_address(ip)
     except ValueError:
-        return False
-    cands = []
+        return ""
     raw = str(cfg.get("ai_trusted_cidrs") or "").strip()
-    if raw:
-        cands.extend(p for p in re.split(r"[,;\s]+", raw) if p)
-    learned = []
+    if not raw:
+        return ""
+    for part in re.split(r"[,;\s]+", raw):
+        if not part:
+            continue
+        try:
+            if obj in ipaddress.ip_network(part, strict=False):
+                return part
+        except ValueError:
+            continue
+    return ""
+
+
+def _in_learned_cidrs(ip):
+    """IP 是否落在**自动学习表** `trusted_cidr` 里（AI 判过 CDN 回源的 IP/段会自己记下）。
+
+    命中返回该条目的 cidr，否则返回 ""；命中时刷新 last_seen 并按来源续期
+    （续期上限 created_at + 90 天）。学习表查询已过滤过期条目，误学可自愈。
+    读学习表失败按未命中处理，不影响主流程。
+    """
     try:
-        # 学习表查询已过滤过期条目：过期记录不再参与匹配，误学可自愈
+        obj = ipaddress.ip_address(ip)
+    except ValueError:
+        return ""
+    try:
         learned = list(store.list_trusted_cidr_strings())
     except Exception:
-        pass                      # 读学习表失败不影响主流程
-    for part in cands:
-        try:
-            if obj in ipaddress.ip_network(part, strict=False):
-                return True
-        except ValueError:
-            continue
+        return ""
     for part in learned:
         try:
-            if obj in ipaddress.ip_network(part, strict=False):
-                # 命中学习表：刷新 last_seen 并按来源续期（续期上限 created_at + 90 天）
-                try:
-                    store.touch_trusted_cidr(part)
-                except Exception:
-                    pass
-                return True
+            hit = obj in ipaddress.ip_network(part, strict=False)
         except ValueError:
             continue
-    return False
+        if hit:
+            try:
+                store.touch_trusted_cidr(part)
+            except Exception:
+                pass
+            return part
+    return ""
 
 
-def _learn_trusted(ip, reason, source="behavior", subnet=False):
+# 同段升级为整段可信（/24）所需的最小强证据 /32 个数。
+# 强证据 = keyword / model / manual（口径见 store.count_trusted_in_subnet），弱证据不计。
+# 为什么是 3 而不是 2：model 层的旁证允许「全 Web 类型 + >=2 个代理名」（见 _cdn_origin_hit
+# 的 web_multi），所以一个多站探测的 Web 来源就能贡献一个强证据名额；门槛定在 2 时，
+# 同段凑两个即整段信任 24 小时，放大器成本太低。提到 3 让「误判 + 邻近误判」需要连续三次。
+# 为什么不改成「必须至少一条 keyword 证据」：2026-11 整站 522 的根因正是 ESA 回源 IP 的
+# 归属地文本只写「阿里云」、不含 CDN 字样，关键字层完全落空，只有当 model 层 + 行为旁证
+# 能认出来；要求 keyword 等于让那类来源永远升不了级，事故会重演。
+# 为什么不做成 config.DEFAULTS 配置项：这是安全内部阈值而非运维旋钮，暴露成配置项要同步
+# 两个面板的设置页与配置校验，而误配成 1 就等于把放大器开满，收益远不及代价。
+_TRUST_SUBNET_MIN_IPS = 3
+
+
+def _learn_trusted(ip, reason, source="behavior", review_id=0):
     """把 IP（或它所在的 /24）记入「可信回源网段」，以后不再自动封。
 
     这只是**观察到的经验**，不改变本次处置——本次是否跳过封禁由调用方决定。
@@ -209,35 +244,34 @@ def _learn_trusted(ip, reason, source="behavior", subnet=False):
 
     source 为学习来源（keyword / model / behavior / subnet / manual），决定条目 TTL。
     调用方只应对强证据调用本函数：关键字命中，或模型判 cdn_origin 且有旁证。
-    subnet=True 时直接学 /24（保留兼容；同段熔断已不再调用）。
+    review_id 是本次处置写入的审查记录 id（0 = 无关联），一并存进学习条目，
+    排障时从「学过这个网段」能直接回查是哪次审查造成的。
 
-    自动升级：只学 /32 时，同一 /24 里有**第 2 个**未过期的强证据 /32，就把整个 /24
-    也记下（source=subnet，24 小时 TTL，命中续期，上限 created_at + 90 天）。
+    自动升级：只学 /32 时，同一 /24 里未过期的强证据 /32 达到 `_TRUST_SUBNET_MIN_IPS`
+    （当前 3）个，就把整个 /24 也记下（source=subnet，24 小时 TTL，命中续期，
+    上限 created_at + 90 天）。
     为什么：CDN 边缘节点是成批出现的（事故里 61.241.14.x 有 26 个），
     逐个 /32 记会让每个新节点先被封一次才学会；整段信任面更大，
-    所以只按强证据计数，并给短 TTL，不再活跃即自然过期。
+    所以只按强证据计数、用更高的数量门槛、并给短 TTL，不再活跃即自然过期。
     """
     try:
         obj = ipaddress.ip_address(ip)
     except ValueError:
         return None
     try:
-        if subnet and obj.version == 4:
-            return store.add_trusted_cidr(
-                str(ipaddress.ip_network(str(obj) + "/24", strict=False)), reason,
-                source="subnet")
-        learned = store.add_trusted_cidr(str(obj), reason, source=source)
-        # 同段已有第 2 个强证据回源 IP -> 升级为整段可信（短 TTL）
+        learned = store.add_trusted_cidr(str(obj), reason, source=source,
+                                         ai_review_id=review_id)
+        # 同段强证据回源 IP 达到门槛 -> 升级为整段可信（短 TTL）
         if obj.version == 4:
             prefix = str(ipaddress.ip_network(str(obj) + "/24", strict=False))
             try:
                 n = store.count_trusted_in_subnet(prefix)
             except Exception:
                 n = 0
-            if n >= 2:
+            if n >= _TRUST_SUBNET_MIN_IPS:
                 store.add_trusted_cidr(
                     prefix, "同段已学到 %d 个强证据回源 IP，升级为整段可信（%s）"
-                    % (n, (reason or "")[:60]), source="subnet")
+                    % (n, (reason or "")[:60]), source="subnet", ai_review_id=review_id)
         return learned
     except Exception:
         return None
@@ -467,24 +501,39 @@ def _apply_action(ip, verdict, category, reason, it, cfg):
         label = _hit_label(cdn_src, cdn_detail)
         if cdn_src == "model" and cdn_detail:
             label = "model，旁证 " + cdn_detail
+        # 先写审查记录拿到 id，再写学习条目：学习条目要指回「哪次审查学到的」，
+        # 顺序反了就得学习后再回填（多一次 UPDATE，且中途失败会留下无主条目）。
+        rev_id = store.add_ai_review(
+            0, ip, verdict, "CDN 回源（%s），跳过自动处置" % label,
+            "skipped", cfg.get("ai_model", ""))
         # 只有强证据才学习：关键字命中，或模型判 cdn_origin 且有旁证。
         # 行为层单独命中只跳过本次：「混访多站」是启发式，持久化成信任可被扫描器利用。
         if cdn_src in ("keyword", "model") and cfg.get("ai_learn_cdn", True):
             _learn_trusted(ip, "CDN 回源（%s）：%s" % (label, (reason or "")[:80]),
-                           source=cdn_src)
-        store.add_ai_review(0, ip, verdict, "CDN 回源（%s），跳过自动处置" % label,
-                            "skipped", cfg.get("ai_model", ""))
+                           source=cdn_src, review_id=rev_id)
         return {"ip": ip, "verdict": verdict, "category": category, "reason": reason,
                 "action": "skipped", "mode": "cdn", "ssh": ssh,
                 "geo": it.get("geo", ""), "conns": it.get("conns", 0)}
 
-    # 显式可信网段（配置 ai_trusted_cidrs）：确定性保护，不依赖模型判断。
-    # 站点前置 CDN/WAF 时，源站看到的全是节点 IP，按 IP 封禁 = 封所有真实用户。
-    if verdict in ("malicious", "suspicious") and _in_trusted_cidr(ip, cfg):
-        store.add_ai_review(0, ip, verdict, "命中可信网段（ai_trusted_cidrs），跳过自动处置",
-                            "skipped", cfg.get("ai_model", ""))
+    # 可信网段保护：确定性，不依赖模型判断。站点前置 CDN/WAF 时，源站看到的全是
+    # 节点 IP，按 IP 封禁 = 封所有真实用户。两个来源分开记审计：
+    #   - mode=trusted：人工配置 ai_trusted_cidrs；
+    #   - mode=learned：AI 自动学习表 trusted_cidr。
+    t_hit, t_mode, t_note = "", "", ""
+    if verdict in ("malicious", "suspicious"):
+        t_hit = _in_config_cidrs(ip, cfg)
+        if t_hit:
+            t_mode = "trusted"
+            t_note = "命中人工配置的可信网段（ai_trusted_cidrs：%s），跳过自动处置" % t_hit
+        else:
+            t_hit = _in_learned_cidrs(ip)
+            if t_hit:
+                t_mode = "learned"
+                t_note = "命中 AI 学习的可信回源网段（%s），跳过自动处置" % t_hit
+    if t_hit:
+        store.add_ai_review(0, ip, verdict, t_note, "skipped", cfg.get("ai_model", ""))
         return {"ip": ip, "verdict": verdict, "category": category, "reason": reason,
-                "action": "skipped", "mode": "trusted", "ssh": ssh,
+                "action": "skipped", "mode": t_mode, "ssh": ssh,
                 "geo": it.get("geo", ""), "conns": it.get("conns", 0)}
 
     # 登录即信任：面板登录过的 IP 也不自动处置。

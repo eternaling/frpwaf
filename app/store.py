@@ -114,8 +114,8 @@ CREATE TABLE IF NOT EXISTS trusted_cidr (
     last_seen INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_trusted_cidr_seen ON trusted_cidr(last_seen);
--- source / expires_at / first_reason 三列由 _migrate_trusted_cidr 幂等补齐（新库旧库同一路径），
--- expires_at 索引也在迁移里建：旧库执行本脚本时该列尚不存在。
+-- source / expires_at / first_reason / ai_review_id 四列由 _migrate_trusted_cidr 幂等补齐
+-- （新库旧库同一路径），expires_at 索引也在迁移里建：旧库执行本脚本时该列尚不存在。
 -- 登录即信任：面板登录成功后把来源 IP 记进来（带过期时间）。
 -- 解决「在外面开发、IP 不固定、连数据库被自己的自动封禁误封」：
 -- 换网络后只要登录一次面板，当前 IP 就自动获得豁免，不用手加白名单。
@@ -185,16 +185,22 @@ _TRUSTED_CIDR_NEW_COLS = (
     ("expires_at", "ALTER TABLE trusted_cidr ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0"),
     # 首次学习理由，冲突更新不覆盖
     ("first_reason", "ALTER TABLE trusted_cidr ADD COLUMN first_reason TEXT DEFAULT ''"),
+    # 首次学到该段的 ai_review.id（0 = 无关联：老库存量、人工配置、升级产生的整段行）。
+    # 只存首次来源，命中续期与冲突更新都不改写，排障时据此回查当时那次审查。
+    # 不加外键约束：ai_review 由 trim_ai_review 定期裁剪，硬约束会让删除失败或级联丢学习条目；
+    # 记录被裁掉后本列留下悬空 id，面板按 0/空 处理即可。
+    ("ai_review_id", "ALTER TABLE trusted_cidr ADD COLUMN ai_review_id INTEGER NOT NULL DEFAULT 0"),
 )
 
 
 def _migrate_trusted_cidr(c):
-    """给 trusted_cidr 补 source / expires_at / first_reason 三列（幂等，可重复执行）。
+    """给 trusted_cidr 补 source / expires_at / first_reason / ai_review_id 四列（幂等，可重复执行）。
 
     先查 PRAGMA table_info，缺列才 ALTER（裸 ALTER 重复执行会报 duplicate column）。
-    本次补上 expires_at 时，存量行统一标 legacy 并给 7 天有效期：旧逻辑写入的条目
-    含弱证据学习结果，需在一周内由强证据重新学到，否则自然过期。
+    本次补上 expires_at 时，存量行统一标 legacy；而 legacy 条目在结束时**直接清掉**，
+    原因见 purge_legacy_trusted_cidrs()。
     expires_at 索引放在这里而不是 SCHEMA：旧库执行 SCHEMA 时该列还不存在，会中断建表脚本。
+    后补的 ai_review_id 对存量行一律取默认 0（无关联），不改写、不删除任何存量条目。
     """
     try:
         cols = {r[1] for r in c.execute("PRAGMA table_info(trusted_cidr)").fetchall()}
@@ -217,6 +223,8 @@ def _migrate_trusted_cidr(c):
             c.execute("UPDATE trusted_cidr SET first_reason=COALESCE(reason,'') "
                       "WHERE COALESCE(first_reason,'')=''")
         c.execute("CREATE INDEX IF NOT EXISTS idx_trusted_cidr_exp ON trusted_cidr(expires_at)")
+        # 旧版本误学的 legacy 条目在启动时直接清掉（幂等，老的已迁移库也会被清）
+        c.execute("DELETE FROM trusted_cidr WHERE source='legacy'")
         c.commit()
     except sqlite3.Error:
         try:
@@ -251,7 +259,7 @@ def _connect():
         _conn.execute("PRAGMA journal_size_limit=16777216")     # checkpoint 后截断至 ≤16MB
         _conn.executescript(SCHEMA)
         _migrate_ip_list(_conn)   # 旧库：cidr 全局唯一 -> UNIQUE(cidr,list_type)
-        _migrate_trusted_cidr(_conn)   # trusted_cidr 补 source / expires_at / first_reason
+        _migrate_trusted_cidr(_conn)   # trusted_cidr 补 source / expires_at / first_reason / ai_review_id
         _conn.commit()
     except sqlite3.Error:
         pass
@@ -680,15 +688,17 @@ def _trust_expiry(source, now):
     return 0 if ttl == 0 else now + ttl
 
 
-def add_trusted_cidr(cidr, reason="", hits=1, source="behavior"):
+def add_trusted_cidr(cidr, reason="", hits=1, source="behavior", ai_review_id=0):
     """记下一条「可信回源网段」（已存在则累加命中次数）。
 
     cidr 会被规范化（单 IP 归一为 /32）。非法值抛 ValueError，由调用方决定怎么处理。
     source 决定有效期（见 TRUST_TTL）；未声明来源按最弱的 behavior（24 小时）处理，
     更强的来源必须由调用方显式声明。
+    ai_review_id 是首次学到该段的审查记录 id（0 = 无关联），用于面板/排障回查来源。
 
     冲突更新规则：
       - first_reason 只在首次写入时填，之后不覆盖（审计需要保留最初的学习理由）；
+      - ai_review_id 同理只在首次写入时填，已有值不改写（空值才补，避免后次学习顶替来源）；
       - 来源取新旧中较强者；manual 条目保持永久；
       - 未过期：expires_at 只延长不缩短，且不超过 created_at + 90 天；
       - 已过期（尚未被清理）或已超出 90 天窗口：按重新学习处理，重置 created_at 与 expires_at。
@@ -704,11 +714,12 @@ def add_trusted_cidr(cidr, reason="", hits=1, source="behavior"):
         row = c.execute(
             "SELECT source, expires_at, created_at FROM trusted_cidr WHERE cidr=?",
             (cidr,)).fetchone()
+        rev_id = int(ai_review_id or 0)
         if row is None:
             c.execute(
                 "INSERT INTO trusted_cidr(cidr, reason, hits, created_at, last_seen, "
-                "source, expires_at, first_reason) VALUES(?,?,?,?,?,?,?,?)",
-                (cidr, reason, int(hits), now, now, src, exp, reason))
+                "source, expires_at, first_reason, ai_review_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                (cidr, reason, int(hits), now, now, src, exp, reason, rev_id))
         else:
             old_src = row[0] or "legacy"
             old_exp = int(row[1] or 0)
@@ -723,9 +734,10 @@ def add_trusted_cidr(cidr, reason="", hits=1, source="behavior"):
             c.execute(
                 "UPDATE trusted_cidr SET hits=hits+?, reason=?, last_seen=?, source=?, "
                 "expires_at=?, created_at=?, "
-                "first_reason=CASE WHEN COALESCE(first_reason,'')='' THEN ? ELSE first_reason END "
+                "first_reason=CASE WHEN COALESCE(first_reason,'')='' THEN ? ELSE first_reason END, "
+                "ai_review_id=CASE WHEN COALESCE(ai_review_id,0)=0 THEN ? ELSE ai_review_id END "
                 "WHERE cidr=?",
-                (int(hits), reason, now, new_src, new_exp, created, reason, cidr))
+                (int(hits), reason, now, new_src, new_exp, created, reason, rev_id, cidr))
         c.commit()
     return cidr
 
@@ -751,11 +763,29 @@ def list_trusted_cidr_strings():
         (int(time.time()),))]
 
 
+def count_trusted_cidrs():
+    """未过期学习条目数（面板计数用）。只读。
+
+    用 SELECT COUNT(*) 而不是 len(list_trusted_cidr_strings())：后者为了一个数字
+    把整表拉进内存，学习表接近上限时面板每次刷新都白白多搬一遍数据。
+    过期口径与 list_trusted_cidrs / list_trusted_cidr_strings 一致。
+    """
+    rows = _query_ro(
+        "SELECT COUNT(*) AS n FROM trusted_cidr WHERE expires_at = 0 OR expires_at > ?",
+        (int(time.time()),))
+    try:
+        return int((rows[0] or {}).get("n") or 0)
+    except (IndexError, TypeError, ValueError):
+        return 0
+
+
 def touch_trusted_cidr(cidr):
     """学习表命中：hits+1、刷新 last_seen，并按来源 TTL 续期。
 
     续期只延长不缩短，且不超过 created_at + 90 天；manual（永久）不变；
     legacy 不续期——旧逻辑学到的条目必须由强证据重新学到才能留下。
+    只动 hits / last_seen / expires_at：ai_review_id 记的是**首次**来源，命中续期不得改写它，
+    否则一条被反复命中的老条目会被最近一次无关审查顶掉来源。
     返回是否找到该条目。
     """
     try:
@@ -811,9 +841,13 @@ def purge_expired_trusted_cidrs(cap=TRUSTED_CIDR_CAP):
 
 
 def count_trusted_in_subnet(prefix):
-    """已学习表里落在给定 /24 内的条目数（用于判断是否升级为整段可信）。只读。
+    """已学习表里落在给定 /24 内的强证据 /32 个数（供调用方判定是否升级）。只读。
 
-    只计未过期的强证据 /32（keyword / model / manual），弱证据不参与升级。
+    本函数只负责「数」，不含门槛：升级阈值由调用方（ai._learn_trusted 的
+    `_TRUST_SUBNET_MIN_IPS`）决定，放这里会变成第二处硬编码。
+
+    只计未过期的强证据 /32（`TRUST_STRONG_SOURCES`：keyword / model / manual），
+    弱证据（behavior）与已学到的 /24 行本身都不计入，所以重复数不会因为已经升级过而膨胀。
     prefix 传 `a.b.c.0/24`；用 LIKE 前缀近似（trusted_cidr 里存的是单 IP 或少数 CIDR），
     不会把 /16 之类的宽条目算进来 —— 这里只想知道「同段有几个具体回源 IP 被学到」。
     """
@@ -821,10 +855,14 @@ def count_trusted_in_subnet(prefix):
         base = str(prefix).split("/")[0].rsplit(".", 1)[0] + "."
     except (AttributeError, IndexError):
         return 0
-    rows = _query_ro(
-        "SELECT COUNT(*) AS n FROM trusted_cidr WHERE cidr LIKE ? AND cidr LIKE '%/32' "
-        "AND source IN ('keyword','model','manual') AND (expires_at = 0 OR expires_at > ?)",
-        (base + "%", int(time.time())))
+    ph = ",".join("?" * len(TRUST_STRONG_SOURCES))
+    # 拼接的只有 ? 占位符（由 TRUST_STRONG_SOURCES 长度生成），值全部走参数绑定；
+    # 不用 % 格式化是为了避开 SQL 里的 `%/32` 字面量。S608 对这种占位符拼接是误报。
+    sql = ("SELECT COUNT(*) AS n FROM trusted_cidr"  # noqa: S608
+           " WHERE cidr LIKE ? AND cidr LIKE '%/32'"
+           " AND source IN (" + ph + ")"
+           " AND (expires_at = 0 OR expires_at > ?)")
+    rows = _query_ro(sql, (base + "%",) + tuple(TRUST_STRONG_SOURCES) + (int(time.time()),))
     try:
         return int((rows[0] or {}).get("n") or 0)
     except (IndexError, TypeError, ValueError):
@@ -845,6 +883,26 @@ def clear_trusted_cidrs():
     """清空所有学习的可信网段，返回删除条数。"""
     cur = _exec("DELETE FROM trusted_cidr")
     return cur.rowcount
+
+
+def purge_legacy_trusted_cidrs():
+    """删除 `source='legacy'` 的学习条目，返回删除条数。幂等，可重复调用。
+
+    legacy 是 2026-11 P0 修复**之前**的产物：那时 `_is_cdn_origin()` 第 3 层只要
+    「碰过 ≥2 个代理」就判回源，没有 `proxy_type` 类型检查，于是纯 tcp 来源也会被
+    写成可信回源段（生产实证：177 次全 tcp、零拒绝的 IP 被记为 /32）。
+
+    为什么要清掉而不是留着等过期：这类条目会被**两处**豁免同时认账——AI 处置
+    （`ai._in_learned_cidrs`）与引擎的自动封禁（`engine._in_trusted_cidr`），留着
+    等于给一个按现行口径根本不算回源的 IP 长期免封。而 `touch_trusted_cidr` 按设计
+    不给 legacy 续期，说明它本身就在等被清掉。
+
+    类型硬否决上线后不可能再产生 legacy（`_trust_source` 也拒绝写入 legacy），
+    所以这里全量删除是安全的。由启动迁移 `_migrate_trusted_cidr` 调用一次。
+    """
+    cur = _exec("DELETE FROM trusted_cidr WHERE source='legacy'")
+    n = cur.rowcount
+    return n if isinstance(n, int) and n > 0 else 0
 
 
 # ---------------- 登录即信任（豁免自动封禁） ----------------
@@ -883,6 +941,24 @@ def trusted_login_ips_with_expiry():
     return _query_ro(
         "SELECT ip, expires_at, created_at FROM trust_login_ip WHERE expires_at>? "
         "ORDER BY expires_at DESC", (int(time.time()),))
+
+
+def trusted_login_expiry(ip):
+    """某 IP 登录信任的到期时间戳；不存在、已过期或 IP 非法时返回 0。只读。
+
+    供面板「访问即信任」做按 IP 去重：剩余有效期还长就不重写、不记审计。
+    """
+    try:
+        obj = str(ipaddress.ip_address((ip or "").strip()))
+    except ValueError:
+        return 0
+    rows = _query_ro(
+        "SELECT expires_at FROM trust_login_ip WHERE ip=? AND expires_at>?",
+        (obj, int(time.time())))
+    try:
+        return int((rows[0] or {}).get("expires_at") or 0)
+    except (IndexError, TypeError, ValueError):
+        return 0
 
 
 def untrust_login_ip(ip):
@@ -1272,14 +1348,22 @@ def release_ban(ban_id):
 
 
 def count_recent_bans_in_subnet(subnet, window_sec):
-    """窗口内同一网段下被自动封禁的**不同 IP** 数量（同段熔断用，只读）。
+    """窗口内同一网段下被 **AI 临时封禁** 的不同 IP 数量（同段熔断用，只读）。
 
     subnet 传 CIDR（如 `61.241.14.0/24`），用 SQL 前缀匹配近似：
     把 CIDR 拆成前 3 段做 `ip LIKE 'a.b.c.%'`。比在应用层遍历所有 ban_log 便宜得多，
     且 /24 场景下与真正的网段判断等价（ban_log 里存的是单 IP，不是 CIDR）。
 
-    只统计**自动处置**写下的记录（reason 以 `ai:` 开头）：手工封禁是人工判断，
-    不应被自动熔断屏蔽。
+    口径（以代码为准）：只统计 `ban_log` 里 reason 以 `ai:` 开头的记录，即 AI 判
+    suspicious 后写下的**临时封禁**。以下不计入：
+      - AI 永久处置（malicious，或 SSH 从严的 suspicious）：走 `add_ip` 写 `ip_list`
+        黑名单，而 `add_ip` 只写 `ip_list`、不写 `ban_log`；
+      - 引擎自动封禁（reason 为 `auto:` / `auto_ssh:` / `auto_cc:` / `auto_scan:`）；
+      - 手工封禁（人工判断，不应被自动熔断屏蔽）。
+    已定口径：永久黑名单**不计入**同段熔断。同一 /24 的 IP 若都被判 malicious 直接永久
+    拉黑，不会推高这个计数，熔断也不会因此触发。原因：熔断的用途是防止 CDN/共享出口
+    被临时封禁成片误伤；malicious 属高置信判定，若计入，会让同段恶意 IP 越多、
+    熔断越早触发，反而替该段后续的攻击者挡掉处置。
     """
     now = int(time.time())
     since = now - int(window_sec)
@@ -1441,12 +1525,19 @@ def trim_proxy_stat(days=90):
 
 # ---------------- ai_review ----------------
 def add_ai_review(batch_id, ip, verdict, reason, action, model):
-    _exec(
+    """写一条 AI 审查记录，返回其 id。
+
+    返回 id 是为了让调用方把「哪次审查学到的回源网段」记进 trusted_cidr.ai_review_id：
+    学习条目与审查记录在同一处置分支里产生，先写审查记录拿到 id、再写学习条目即可关联。
+    写入失败仍由 sqlite3 异常向外抛（与改前一致，不在这里静默）。
+    """
+    cur = _exec(
         "INSERT INTO ai_review(ts,batch_id,ip,verdict,reason,action,model)"
         " VALUES(?,?,?,?,?,?,?)",
         (int(time.time()), int(batch_id or 0), ip or "", verdict or "", reason or "",
          action or "", model or ""),
     )
+    return int(cur.lastrowid or 0)
 
 
 def list_ai_review(limit=200):
