@@ -82,12 +82,19 @@
   .fw-cols{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}
   .fw-col{display:flex;flex-direction:column;gap:14px;min-width:0}
   .fw-wrap pre.fw-fill{height:calc(100vh - 320px);min-height:260px;max-height:none}
-  .fw-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px}
+  /* 统计卡片网格：单张卡最小 170px，列数由 auto-fit 按容器宽度自动决定
+     （宽屏多列、窄屏减列折行），不会把卡片挤得过窄导致文字溢出。
+     卡片之外的说明文字必须放在 .fw-stats 外面（见 #fwStatsNote）：grid 容器里的
+     flex-basis:100% 不生效，说明会被当成一个普通单元格塞进 auto-fit 的窄列，
+     逐字换行并被撑成一条竖排文字。 */
+  .fw-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
   .fw-stats .st{background:#fff;border:1px solid #e8eaed;border-radius:8px;padding:12px 14px;
     box-shadow:0 1px 2px rgba(16,24,40,.03)}
   .fw-stats .st .k{color:#94a3b8;font-size:12px;margin-bottom:6px}
   .fw-stats .st .v{font-size:22px;font-weight:700;color:#1f2937}
   .fw-stats .st .v.err{color:#d33} .fw-stats .st .v.pri{color:#2d8cf0}
+  /* 卡片副行（如内核丢弃的字节数）：不额外占主数值，也不与主数值同权重 */
+  .fw-stats .st .s{color:#94a3b8;font-size:12px;margin-top:2px}
   .fw-seg{display:inline-flex;border:1px solid #d9dee5;border-radius:6px;overflow:hidden}
   .fw-seg button{background:#fff;border:none;padding:5px 14px;font-size:13px;color:#595959;cursor:pointer}
   .fw-seg button.on{background:#2d8cf0;color:#fff}
@@ -146,6 +153,8 @@
           </div>
         </div>
         <div class="fw-stats" id="fwStats"></div>
+        <!-- 统计口径/攻击类型说明：整宽、在卡片网格之外，避免被 grid 当成单元格挤压 -->
+        <div id="fwStatsNote"></div>
         <div class="fw-cols">
           <div class="fw-col">
             <div class="fw-card">
@@ -718,6 +727,73 @@
             </div>
           </div>
           <div class="fw-card fw-span-2">
+            <h3>系统端口检测 <span style="color:#999;font-size:12px;font-weight:400">非 frp 端口（22/6379/8888 等）的来源识别，默认关闭 + 默认只观察</span></h3>
+            <div class="fw-grid cols-3">
+              <div>
+                <label><input type="checkbox" id="s_sys_detect_enabled"> 启用系统端口检测</label>
+                <div class="fw-tip" style="margin-top:6px">从系统认证日志（auth.log / secure）增量识别非 frp 端口上的敏感端口探测与高频登录失败，按「单来源滑窗计数」判定，达阈值才处置。关闭时完全不做统计。</div>
+                <label style="margin-top:12px"><input type="checkbox" id="s_sys_detect_dry_run"> 观察模式（只记录、不封禁）</label>
+                <div class="fw-tip" id="fwSysDryWarn" style="margin-top:6px;color:#d33"><b>关闭观察模式 = 真的会封 IP</b>：处置经内核下发，<b>DROP 是全端口的</b>——一旦某个来源被误判，22 / 7080 / 8888 会一起进不去，面板也打不开，只能上云厂商控制台或 VNC 救机器。<br>所以关掉前请：① 把常用出口 IP 写进下面的保护名单；② 先看「观察记录」里最近 24 小时的「本应封禁」量是否可信。切换时会再弹一次二次确认。</div>
+                <label style="margin-top:12px"><input type="checkbox" id="s_sys_trust_ssh_login"> 成功 SSH 登录写登录信任</label>
+                <div class="fw-tip" style="margin-top:6px">认证成功的来源会记入登录信任（复用「登录信任有效期」，0 秒 = 关闭），期限内不被自动封禁。失败的登录永不写入。</div>
+              </div>
+              <div class="fw-kv" style="grid-template-columns:120px 1fr">
+                <div class="k">失败次数阈值</div>
+                <div><input id="s_sys_ssh_threshold" class="bt-input-text" type="number" min="0" style="width:100px"></div>
+                <div class="k">计数窗口（秒）</div>
+                <div><input id="s_sys_ssh_window" class="bt-input-text" type="number" min="1" style="width:100px"></div>
+                <div class="k">封禁时长（秒）</div>
+                <div><input id="s_sys_ssh_ban_seconds" class="bt-input-text" type="number" min="0" style="width:100px"></div>
+                <div class="k">每小时上限</div>
+                <div><input id="s_sys_ban_max_per_hour" class="bt-input-text" type="number" min="0" style="width:100px"></div>
+                <div class="k">轮询间隔（秒）</div>
+                <div><input id="s_sys_ssh_poll_interval" class="bt-input-text" type="number" min="1" style="width:100px"></div>
+                <div class="k">单条封禁上限</div>
+                <div><input id="s_sys_ban_max_seconds" class="bt-input-text" type="number" min="0" style="width:100px"></div>
+              </div>
+              <div>
+                <div class="k" style="color:#595959;margin-bottom:6px">永不封禁网段</div>
+                <textarea id="s_sys_protect_ips" class="bt-input-text" rows="5" placeholder="支持单个 IP 或 CIDR，逗号/换行分隔\n例如：112.48.13.214" style="width:100%;font-family:Menlo,Consolas,monospace;font-size:12px;resize:vertical"></textarea>
+                <div class="fw-tip" style="margin-top:6px">这里的来源<b>永不封禁</b>（插件端会把单个 IP 规范成 /32）。格式非法会被拒绝保存，不会写坏配置。清空等于放弃这层保护，保存时会二次确认。</div>
+              </div>
+            </div>
+            <div class="fw-tip">参数含义：阈值 <b>0 = 只计数不处置</b>（不触发任何处置，可用于纯观察）；阈值写非数字会回退默认值；窗口 <b>必须 ≥1</b>（写 0 会回退默认，否则会出现「显示 0 秒、实际按默认值算」的偏差）；封禁时长超过「单条封禁上限」时按上限封；「每小时上限」是全局熔断，避免整段被扫时批量误伤。判定前还会依次过白名单、登录信任、可信回源段、保护名单与当前活跃会话，任一命中都不封。</div>
+            <div class="fw-row" style="margin-top:14px">
+              <button class="btn btn-success btn-sm" onclick="fwSaveSysdetect()">保存系统端口检测</button>
+              <button class="btn btn-default btn-sm" onclick="fwLoadSysdetect()">重新加载</button>
+              <button class="btn btn-default btn-sm" onclick="fwSysEventPage(0)">刷新观察记录</button>
+            </div>
+          </div>
+          <div class="fw-card fw-span-2">
+            <h3>观察记录 <span style="color:#999;font-size:12px;font-weight:400">最近 24 小时「本应封禁 / 已封禁 / 被豁免」分布，用来判断阈值是否合适</span></h3>
+            <div class="fw-tip" id="fwSysSummary" style="margin:0 0 10px;background:#fafafa;border-radius:6px;padding:8px 10px">加载中…</div>
+            <div class="fw-row">
+              <span class="fw-tip" style="margin:0">来源 IP</span>
+              <input id="fwSysIp" class="bt-input-text" placeholder="精确匹配，留空=全部" style="width:190px">
+              <span class="fw-tip" style="margin:0 0 0 8px">处置</span>
+              <select id="fwSysAction" class="bt-input-text" style="width:130px">
+                <option value="">全部</option>
+                <option value="observed">本应封禁</option>
+                <option value="banned">已封禁</option>
+                <option value="skipped">被豁免</option>
+              </select>
+              <span class="fw-tip" style="margin:0 0 0 8px">每页</span>
+              <select id="fwSysLimit" class="bt-input-text" style="width:90px">
+                <option value="20">20 条</option>
+                <option value="50" selected>50 条</option>
+                <option value="100">100 条</option>
+              </select>
+              <button class="btn btn-success btn-sm" onclick="fwSysEventPage(0)">查询</button>
+              <button class="btn btn-default btn-sm" onclick="fwSysEventReset()">重置筛选</button>
+              <button class="btn btn-default btn-sm" onclick="fwSysEventClear()">清空观察记录</button>
+            </div>
+            <div class="fw-table-wrap" style="max-height:360px">
+              <table class="fw-table"><thead><tr><th style="width:150px">时间</th><th style="width:150px">来源 IP</th><th style="width:150px">归属地</th><th style="width:90px" class="c">命中/窗口</th><th style="width:120px">处置</th><th>原因</th></tr></thead>
+              <tbody id="fwSysEventBody"><tr><td colspan="6" style="color:#bbb;text-align:center">加载中…</td></tr></tbody></table>
+            </div>
+            <div class="fw-row" style="margin-top:10px" id="fwSysPager"></div>
+          </div>
+          <div class="fw-card fw-span-2">
             <h3>代理级冷却拦截 <span style="color:#999;font-size:12px;font-weight:400">分布式突发处置，默认关闭</span></h3>
             <div class="fw-grid cols-2">
               <div>
@@ -880,7 +956,7 @@ document.querySelectorAll('.fw-main .bt-w-menu p').forEach(function(p){
     if(t==='protect'){ fwLoadCdnTrust(); fwLoadSelfProtect(true); }
     if(t==='connlog'){ fwLogLoadProxies(); fwLoadBurst(); fwLogPage(0); }
     if(t==='proxy'){ fwLoadProxies(); }
-    if(t==='settings'){ fwLoadPolicy(); fwLoadAdmin(); }
+    if(t==='settings'){ fwLoadPolicy(); fwLoadAdmin(); fwLoadSysdetect(); fwSysEventPage(0); }
     if(t==='about'){ fwLoadAbout(); }
     if(t==='frp'){ fwFrpLoad(); }
   };
@@ -968,22 +1044,82 @@ function fwLoadOverview(){
   fwSend('waf_overview', {}, function(r){
     var d=(r&&r.data)||{};
     fwRenderSecNotice(d);
+    // 内核丢弃量是百万~千万级，原样打印会挤爆卡片：按万/亿收写
+    var kern = d.kern_drop_available
+      ? fwFmtBig(d.kern_dropped||0)
+      : '—';
+    var kernSub = d.kern_drop_available
+      ? fwFmtBytes(d.kern_dropped_bytes||0)+' · '+fwRateText(d)
+      : '读不到内核计数';
+    var perm = Number(d.black_count||0), temp = Number(d.active_bans||0);
     var cards=[
       ['今日连接', d.today_conns||0, 'pri'],
-      ['今日拦截', d.today_rejected||0, 'err'],
+      ['今日应用层拦截', d.today_rejected||0, 'err'],
       ['今日独立IP', d.today_uniq_ip||0, ''],
-      ['生效封禁', d.active_bans||0, 'err'],
-      ['黑名单', d.black_count||0, ''],
+      ['生效封禁', temp, 'err'],
+      ['近24h新增封禁', d.bans_24h||0, (d.bans_24h?'err':''),
+        '黑名单 '+perm+' 条 · 临时封禁 '+temp+' 条生效'],
       ['白名单', d.white_count||0, ''],
-      ['累计连接', d.total_conns||0, '']
+      ['近24h连接', fwFmtBig(d.conns_24h||0), '',
+        '真累计 '+fwFmtBig(d.conns_total||0)],
+      ['内核层已丢弃', kern, d.kern_drop_available?'err':'', kernSub]
     ];
+    // 卡片与说明必须分属两个容器：说明一旦塞进 grid，flex-basis:100% 在 grid 容器里
+    // 不生效，它会被当成一个普通单元格挤进 auto-fit 的窄列，逐字换行并把整行卡片撑高。
     document.getElementById('fwStats').innerHTML = cards.map(function(c){
-      return '<div class="st"><div class="k">'+c[0]+'</div><div class="v '+(c[2]||'')+'">'+c[1]+'</div></div>';
-    }).join('')
-      +'<div class="fw-tip" style="flex-basis:100%;margin:6px 0 0">攻击类型封禁：CC '+(d.auto_ban_cc_enabled?'已启用':'关闭')
+      return '<div class="st"><div class="k">'+c[0]+'</div><div class="v '+(c[2]||'')+'">'+c[1]+'</div>'
+        +(c[3]?'<div class="s">'+c[3]+'</div>':'')+'</div>';
+    }).join('');
+    document.getElementById('fwStatsNote').innerHTML =
+      '<div class="fw-tip" style="margin:8px 0 0">统计口径：'
+      +'「近24h连接」是最近 24 小时内（滑动窗口）WAF 处理过的连接尝试数，不受日志裁剪影响；'
+      +'「真累计」是自部署以来 WAF 处理过的全部连接尝试数（含被拒绝的连接），'
+      +'取自数据库自增序列，删旧日志不会让它变小。'
+      +'「近24h新增封禁」是最近 24 小时新增的封禁条目数（临时封禁与永久名单各计一条），'
+      +'体现当下威胁趋势。副行的「黑名单 N 条」是永久名单的条目总数（即名单规模，不代表正在生效的封禁）；'
+      +'真正生效中的封禁数只看「生效封禁」卡片。'
+      +'「今日应用层拦截」只统计到达 WAF 的连接；'
+      +'被内核链 FRPWAF_BLOCK 直接丢弃的包连不到 frps，不会产生日志，单独记在「内核层已丢弃」（IPv4+IPv6 合计），'
+      +'副行的「近 1 分钟」是最近 60 秒平均丢弃速率（计数刚重置时不显示负值，只显示 —）。'
+      +'显示 — 表示当前环境读不到内核计数，如非 root、未启用内核封禁或缺少 iptables。'
+      +'拦截页（REDIRECT）模式下的流量不计入内核丢弃计数。'
+      +'</div>'
+      +'<div class="fw-tip" style="margin:4px 0 0">攻击类型封禁：CC '+(d.auto_ban_cc_enabled?'已启用':'关闭')
       +' · 端口扫描 '+(d.auto_ban_scan_enabled?'已启用':'关闭')
       +' · 敏感服务爆破 '+(d.auto_ban_ssh_enabled?'已启用':'关闭')+'</div>';
   });
+}
+/* 近 1 分钟丢弃速率文案：数据缺失（None）时必须显示「—」而不是 0，
+   0 是「真的一包没丢」这个结论，而 None 是「还没测到」（刚启动/计数刚回退）。 */
+function fwRateText(d){
+  var r = d.kern_drop_rate;
+  // 拦截页（REDIRECT）模式下 DROP 规则已摘，链计数本就不增长，速率恒为 0：
+  // 不标注会被误读成「最近没人在被丢包」。
+  var mode = (d.kern_drop_mode==='redirect') ? '（拦截页模式）' : '';
+  if(r===null || r===undefined) return '近 1 分钟 —'+mode;
+  return '近 1 分钟 '+fwFmtPerSec(r)+' 包/秒'+mode;
+}
+function fwFmtPerSec(r){
+  r = Number(r)||0;
+  if(r<0) return '0';
+  if(r>=100) return String(Math.round(r));
+  // 最多 3 位小数，并去掉末尾的 0：0.1 显示「0.1」而不是「0.100」
+  var s = r.toFixed(r>=10?1:3).replace(/0+$/,'').replace(/\.$/,'');
+  return s===''?'0':s;
+}
+// 大数字缩写：内核丢弃计数可达千万级
+function fwFmtBig(n){
+  n = Number(n)||0;
+  if(n>=100000000) return (n/100000000).toFixed(2)+' 亿';
+  if(n>=10000) return (n/10000).toFixed(1)+' 万';
+  return String(n);
+}
+function fwFmtBytes(b){
+  b = Number(b)||0;
+  if(b>=1073741824) return (b/1073741824).toFixed(2)+' GB';
+  if(b>=1048576) return (b/1048576).toFixed(1)+' MB';
+  if(b>=1024) return (b/1024).toFixed(1)+' KB';
+  return b+' B';
 }
 function fwLoadDashLogs(){
   fwSend('conn_logs', {limit:15, offset:0}, function(r){
@@ -1404,13 +1540,19 @@ function fwLoadProxies(){
 /* ---- 准入策略 / 密码 ---- */
 var FW_POLICY_BOOL=['blacklist_enabled','whitelist_enabled','auto_ban_enabled','rate_limit_enabled','fw_sync_enabled','ai_enabled',
   'auto_ban_cc_enabled','auto_ban_scan_enabled','auto_ban_ssh_enabled','proxy_cool_enabled',
-  'block_page_enabled','block_page_ban_enabled','block_page_risk_enabled','block_page_404_enabled'];
+  'block_page_enabled','block_page_ban_enabled','block_page_risk_enabled','block_page_404_enabled',
+  'sys_detect_enabled','sys_detect_dry_run','sys_trust_ssh_login'];
 var FW_POLICY_INT=['auto_ban_window','auto_ban_threshold','auto_ban_seconds','rate_limit_per_sec','log_max_rows',
   'auto_ban_cc_window','auto_ban_cc_threshold','auto_ban_cc_seconds',
   'auto_ban_scan_window','auto_ban_scan_threshold','auto_ban_scan_seconds',
   'auto_ban_ssh_window','auto_ban_ssh_threshold',
   'burst_window','proxy_cool_min_conns','proxy_cool_uniq_threshold','proxy_cool_single_pct','proxy_cool_seconds',
-  'block_page_port'];
+  'block_page_port',
+  'sys_ssh_threshold','sys_ssh_window','sys_ssh_ban_seconds','sys_ban_max_per_hour',
+  'sys_ssh_poll_interval','sys_ban_max_seconds'];
+// 字符串字段清单：曾在一轮改动里被误删，导致 fwLoadPolicy / fwSavePolicy 抛 ReferenceError
+// （页面看起来没报错，但「保存策略」静默失效）。新增字符串字段必须加在这里。
+var FW_POLICY_STR=['github_repo','block_page_redirect_ports','sys_ssh_log','sys_protect_ips'];
 var FW_POLICY_BOOL_EXTRA=['strict_addr'];
 function fwLoadPolicy(){
   fwSend('get_policy', {}, function(r){
@@ -1434,9 +1576,223 @@ function fwSavePolicy(){
     if(k==='github_repo') return;
     var e=document.getElementById('s_'+k); if(e) b[k]=(e.value||'').trim();
   });
+  // sys_* 字段归「系统端口检测」卡片自己的保存按钮（fwSaveSysdetect）。
+  // 这里必须跳过：该卡的保存带「关闭观察模式 / 清空保护名单」的二次确认，
+  // 若从本按钮一并提交，就多了一条绕过确认的路径（两个按钮规则不一致）。
+  // 加载不受影响：fwLoadPolicy 仍会用 FW_POLICY_* 把 sys_* 回填到表单。
+  Object.keys(b).forEach(function(k){ if(k.indexOf('sys_')===0) delete b[k]; });
   fwSend('save_policy', b, function(r){
     bt_tools.msg((r&&r.msg)||'已保存', (r&&r.status)); fwLoadPolicy();
   });
+}
+
+/* ---- 系统端口检测（非 frp 端口）----
+   开关/参数回显与保存走与准入策略同一套 get_policy / save_policy，
+   但本卡的保存**只提交 sys_* 字段**，不碰其它策略键（避免误覆盖）。
+   观察记录走独立的 sysdetect 只读接口（带分页/筛选/汇总）。 */
+var fwSysPrevProtect=null;      // 上一次加载到的保护名单，用于「清空」二次确认
+var fwSysPage=1, fwSysPages=0;
+var FWSYS_LIMIT=50;
+/* 处置结果的展示文案（后端 action 原值 → 中文）；未知值原样展示，便于发现新口径 */
+var FWSYS_ACTION_TEXT={
+  'observed':'本应封禁（观察模式）',
+  'banned':'已封禁',
+  'skipped:whitelist':'豁免：白名单',
+  'skipped:trust-login':'豁免：登录信任',
+  'skipped:trusted-cidr':'豁免：可信回源段',
+  'skipped:protect-cidr':'豁免：保护名单',
+  'skipped:active-session':'豁免：当前活跃会话',
+  'skipped:non-public':'跳过：非公网地址',
+  'skipped:already-banned':'跳过：已在封禁中',
+  'skipped:circuit':'豁免：每小时熔断',
+  'skipped:db-error':'失败：写入封禁出错'
+};
+function fwSysActionText(a){
+  a=String(a||'');
+  return FWSYS_ACTION_TEXT[a]||a||'-';
+}
+function fwSysWrap(kind, msg){
+  bt_tools.msg(msg, kind);
+}
+/* 字段清单统一从 FW_POLICY_* 按前缀过滤，避免与准入策略两份名单漂移 */
+function fwSysFields(list){
+  return list.filter(function(k){ return k.indexOf('sys_')===0; });
+}
+/* 观察模式的醒目标注：关闭时提示从灰底警告升级为红底 */
+function fwSysSyncDryWarn(){
+  var box=document.getElementById('fwSysDryWarn');
+  var el=document.getElementById('s_sys_detect_dry_run');
+  if(!box||!el) return;
+  if(el.checked){
+    box.style.background='#fafafa';
+    box.style.color='#595959';
+  }else{
+    box.style.background='#fff1f0';
+    box.style.color='#d33';
+  }
+}
+/* 关闭观察模式的二次确认：先恢复勾选，只有点了「确定」才真正改变界面状态，
+   这样用户取消时界面与配置不会出现「看起来已关闭」的错觉。 */
+function fwSysBindDryConfirm(){
+  var el=document.getElementById('s_sys_detect_dry_run');
+  if(!el||el.getAttribute('data-fw-bound')==='1') return;
+  el.setAttribute('data-fw-bound','1');
+  el.onchange=function(){
+    if(el.checked){ fwSysSyncDryWarn(); return; }
+    el.checked=true;
+    layer.confirm(
+      '<b>关闭「观察模式」= 真的会封 IP。</b><br><br>'
+      +'处置经内核下发，<b>DROP 是全端口的</b>：一旦某个来源被误判，'
+      +'22 / 7080 / 8888 会一起进不去，面板也打不开，只能上云厂商控制台或 VNC 救机器。<br><br>'
+      +'请先确认：① 常用出口 IP 已写进保护名单；② 「观察记录」里最近 24 小时的'
+      +'「本应封禁」量可信（无自己的来源）。<br><br>确定要关闭观察模式吗？',
+      {icon:3, title:'危险操作'},
+      function(i){
+        layer.close(i);
+        el.checked=false;   // 确认后才真正关掉
+        fwSysSyncDryWarn();
+      });
+  };
+}
+function fwLoadSysdetect(){
+  fwSysBindDryConfirm();
+  fwSend('get_policy', {}, function(r){
+    var c=(r&&r.data)||{};
+    fwSysFields(FW_POLICY_BOOL).forEach(function(k){
+      var e=document.getElementById('s_'+k);
+      if(e) e.checked=(c[k]===undefined?false:!!c[k]);
+    });
+    fwSysFields(FW_POLICY_INT).forEach(function(k){
+      var e=document.getElementById('s_'+k); if(e) e.value=(c[k]===undefined?'':c[k]);
+    });
+    var p=document.getElementById('s_sys_protect_ips');
+    if(p) p.value=(c.sys_protect_ips===undefined?'':c.sys_protect_ips);
+    fwSysPrevProtect=(p?p.value:'');
+    fwSysSyncDryWarn();
+  });
+}
+function fwSaveSysdetect(){
+  var b={};
+  fwSysFields(FW_POLICY_BOOL).forEach(function(k){
+    var e=document.getElementById('s_'+k); if(e) b[k]=!!e.checked;
+  });
+  fwSysFields(FW_POLICY_INT).forEach(function(k){
+    var e=document.getElementById('s_'+k); if(e) b[k]=parseInt(e.value||'0',10)||0;
+  });
+  // 窗口必须 ≥1（后端会把 <1 回退成默认值，那会变成「保存成功但数字变了」）；
+  // 阈值 0 是合法的「只计数不处置」，不在这里拦。
+  if(b.sys_ssh_window!==undefined && b.sys_ssh_window<1){
+    fwSysWrap(false, '计数窗口必须 ≥ 1 秒');
+    return;
+  }
+  var p=document.getElementById('s_sys_protect_ips');
+  var prot=(p?p.value:'').trim();
+  if(p) b.sys_protect_ips=prot;
+  // 清空保护名单 = 放弃这层保护，必须二次确认
+  if(p && !prot && fwSysPrevProtect){
+    layer.confirm(
+      '保护名单当前不为空，清空后将<b>没有任何来源被豁免</b>。'
+      +'若此时关闭观察模式，误判会直接把来源（包括你自己的出口 IP）封掉，'
+      +'而内核 DROP 是全端口的。<br><br>确定要清空保护名单吗？',
+      {icon:3, title:'危险操作'},
+      function(i){ layer.close(i); fwSysSaveSend(b); });
+    return;
+  }
+  fwSysSaveSend(b);
+}
+function fwSysSaveSend(b){
+  fwSend('save_policy', b, function(r){
+    fwSysWrap(r&&r.status, (r&&r.msg)||'已保存');
+    if(r&&r.status){ fwLoadSysdetect(); fwSysEventPage(0); }
+  });
+}
+function fwSysEventReset(){
+  var ip=document.getElementById('fwSysIp'); if(ip) ip.value='';
+  var ac=document.getElementById('fwSysAction'); if(ac) ac.value='';
+  fwSysEventPage(0);
+}
+function fwSysEventClear(){
+  layer.confirm('确定清空全部观察记录？此操作不可恢复（只删记录，不解封任何 IP，也不改开关）。',
+    {icon:3, title:'提示'}, function(i){
+      layer.close(i);
+      fwSend('sysdetect_clear', {}, function(r){
+        fwSysWrap(r&&r.status, (r&&r.msg)||'已清空');
+        fwSysEventPage(0);
+      });
+    });
+}
+function fwSysEventPage(page){
+  var ipEl=document.getElementById('fwSysIp');
+  var acEl=document.getElementById('fwSysAction');
+  var lmEl=document.getElementById('fwSysLimit');
+  FWSYS_LIMIT=parseInt((lmEl&&lmEl.value)||'50',10)||50;
+  // 参数用对象传（插件桥会转成请求参数，后端按 getattr 读取）
+  var q={limit:FWSYS_LIMIT, page:(page>0?page:1)};
+  if(ipEl&&ipEl.value.trim()) q.ip=ipEl.value.trim();
+  if(acEl&&acEl.value) q.action=acEl.value;
+  fwSend('sysdetect', q, function(r){
+    var d=(r&&r.data)||{};
+    var rows=d.events||[];
+    var sum=d.summary||{};
+    fwSysRenderSummary(sum,d.status||{});
+    var body=document.getElementById('fwSysEventBody');
+    if(body){
+      body.innerHTML = rows.length
+        ? rows.map(function(x){
+            var act=String(x.action||'');
+            var actHtml=(act.indexOf('skipped')===0)
+              ? '<span style="color:#8c8c8c">'+fwEsc(fwSysActionText(act))+'</span>'
+              : (act==='banned'?'<span style="color:#d33;font-weight:600">'+fwEsc(fwSysActionText(act))+'</span>'
+                : '<span style="color:#ad6800">'+fwEsc(fwSysActionText(act))+'</span>');
+            var hits=fwEsc(x.hits||0)+' / '+fwEsc(x.window_sec||0)+'s';
+            return '<tr><td class="nw">'+fwEsc(fwFmtTime(x.ts))+'</td>'
+              +'<td class="mono">'+fwEsc(x.ip||'')+'</td>'
+              +'<td class="dim">'+fwEsc(x.geo||'-')+'</td>'
+              +'<td class="c">'+hits+'</td>'
+              +'<td>'+actHtml+'</td>'
+              +'<td class="remark">'+fwEsc(x.reason||'-')+'</td></tr>';
+          }).join('')
+        : '<tr><td colspan="6" style="color:#999;text-align:center;line-height:1.9">'
+          +'观察期尚未触发，说明当前阈值下没有来源达线。<br>可以：① 保持观察继续等（非 frp 端口的探测并不均匀）；'
+          +'② 临时把「失败次数阈值」调低 + 窗口缩短后保存，再看这里是否出现「本应封禁」记录。'
+          +'</td></tr>';
+    }
+    fwSysRenderPager(d);
+  });
+}
+function fwSysRenderSummary(sum, st){
+  var box=document.getElementById('fwSysSummary');
+  if(!box) return;
+  var hours=sum.hours||24;
+  var reasons=sum.skipped_reasons||{};
+  var parts=[];
+  Object.keys(reasons).sort().forEach(function(k){
+    parts.push(fwSysActionText('skipped:'+k)+' '+reasons[k]);
+  });
+  var cfg=(st&&st.config)||{};
+  var mode = cfg.sys_detect_enabled ? (cfg.sys_detect_dry_run?'观察模式（不封禁）':'已开启封禁') : '检测已关闭';
+  var tail = st&&st.tail ? String(st.tail.path||'(未找到日志)') : '-';
+  box.innerHTML='<b>最近 '+hours+' 小时</b>：本应封禁 <b>'+(sum.observed||0)+'</b> 条 · '
+    +'实际封禁 <b style="color:#d33">'+(sum.banned||0)+'</b> 条 · '
+    +'被豁免 '+(sum.skipped||0)+' 条'
+    +(parts.length?('（'+fwEsc(parts.join('、'))+'）'):'')
+    +'<br><span style="color:#999">当前状态：'+fwEsc(mode)
+    +' · 日志：'+fwEsc(tail)+' · 近 1 小时新增封禁 '+(st.bans_last_hour||0)+' 条</span>';
+}
+function fwSysRenderPager(d){
+  var box=document.getElementById('fwSysPager');
+  if(!box) return;
+  var page=d.page||1, pages=d.pages||0, total=d.total||0;
+  fwSysPage=page; fwSysPages=pages;
+  if(pages<=1){
+    box.innerHTML='<span class="fw-tip" style="margin:0">共 '+total+' 条</span>';
+    return;
+  }
+  box.innerHTML='<button class="btn btn-default btn-sm" onclick="fwSysEventPage('+(page-1)+')"'
+    +(page<=1?' disabled':'')+'>上一页</button>'
+    +'<span class="fw-tip" style="margin:0 8px">第 '+page+' / '+pages+' 页，共 '+total+' 条</span>'
+    +'<button class="btn btn-default btn-sm" onclick="fwSysEventPage('+(page+1)+')"'
+    +(page>=pages?' disabled':'')+'>下一页</button>';
 }
 /* ---- 关于 / 在线升级 ---- */
 /* 概览引导：跳转到指定菜单项（复用菜单点击逻辑） */
@@ -1590,8 +1946,36 @@ function fwLoadKernBan(){
     info.innerHTML =
       '<div class="k">同步开关</div><div>'+(d.enabled?'已开启':'已关闭')+'</div>'+
       '<div class="k">规则状态</div><div>'+(d.rule?'已生效 ✓':'未生效')+'</div>'+
-      '<div class="k">已下发封禁</div><div>IPv4 <b>'+(d.set4||0)+'</b> 条 · IPv6 <b>'+(d.set6||0)+'</b> 条</div>';
+      '<div class="k">已下发封禁</div><div>IPv4 <b>'+(d.set4||0)+'</b> 条 · IPv6 <b>'+(d.set6||0)+'</b> 条</div>'+
+      '<div class="k">来源计数</div><div>'+(d.counters?'已启用（可按来源归因）'
+        :'未启用（存量集合自动重建后可用；重建不丢拦截，仅毫秒级不经过内核）')+'</div>'+
+      '<div class="k">丢弃来源</div><div>'+fwKernTop(d.top)+'</div>';
   });
+}
+/* 按丢弃包数排序的来源 Top N（数据来源：内核集合每个条目的计数器）。
+   “读不到”、“计数未启用”、“暂无命中”是三种完全不同的实情，不能都用空白拾过去。 */
+function fwKernTop(top){
+  top = top || {};
+  if(!top.available)
+    return '<span style="color:#999">当前环境读不到内核计数</span>';
+  if(!top.counters)
+    return '<span style="color:#999">集合尚未启用计数：下一次同步会自动做一次性重建，'
+      +'重建期间拦截不断（应用层仍在拒绝）</span>';
+  var items = top.items||[];
+  if(!items.length)
+    return '<span style="color:#999">暂无命中记录</span>';
+  var rows = items.map(function(x){
+    return '<tr><td class="mono">'+fwEsc(x.member)+'</td>'
+      +'<td class="c">'+(x.packets||0)+'</td>'
+      +'<td>'+fwFmtBytes(x.bytes||0)+'</td>'
+      +'<td>'+((x.timeout||0)>0?fwFmtDur(x.timeout):'永久')+'</td></tr>';
+  }).join('');
+  return '<details><summary style="cursor:pointer;color:#1677d2">展开 Top '+items.length
+    +'（按内核丢弃包数排序）</summary>'
+    +'<div class="fw-table-wrap" style="margin-top:6px;max-height:260px">'
+    +'<table class="fw-table"><thead><tr><th>来源</th><th class="c" style="width:110px">丢弃包数</th>'
+    +'<th style="width:90px">字节</th><th style="width:110px">剩余封禁</th></tr></thead>'
+    +'<tbody>'+rows+'</tbody></table></div></details>';
 }
 function fwKernBanSync(){
   layer.confirm('确认立即同步内核封禁规则？（高危操作，将写入操作审计）', {icon:3, title:'提示'}, function(i){

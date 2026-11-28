@@ -28,12 +28,39 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/overview` | 统计 + 运行信息（version/uptime/各开关/admin_user/geo_available/engine_errors/frp_remote_denied/**invalid_addr**，以及 `http_addr`/`http_port`/`frp_handler_addr`/`frp_handler_port`/`max_concurrent`/`handler_max_concurrent`/`remote_access`/`password_change_required`/**strict_addr**/**ai_allow_private**） |
+| GET | `/api/overview` | 统计 + 运行信息（version/uptime/各开关/admin_user/geo_available/engine_errors/frp_remote_denied/**invalid_addr**，以及 `http_addr`/`http_port`/`frp_handler_addr`/`frp_handler_port`/`max_concurrent`/`handler_max_concurrent`/`remote_access`/`password_change_required`/**strict_addr**/**ai_allow_private**/**kern_dropped**/**kern_dropped_bytes**/**kern_drop_available**） |
 | GET | `/api/version` | `{code:0, version}` |
 
 `invalid_addr` 是**进程内当日计数**：`remote_addr` 无法解析为 IP 的次数。它本该恒为 `0`，
 持续增长说明 frps 回调格式变了、黑白名单与自动封禁正在静默失效（每次刷新还会限频记一条日志）。
 配套开关 `strict_addr`（解决方式）与 `ai_allow_private` 也由本接口回传，供前端渲染开关态。
+
+内核层丢弃计数（2026-11 新增，只增不改）：
+
+| 字段 | 含义 |
+|---|---|
+| `kern_dropped` | 内核链 `FRPWAF_BLOCK` 累计丢弃**包数**（IPv4 + IPv6 合计） |
+| `kern_dropped_bytes` | 对应的**字节数** |
+| `kern_drop_available` | 是否读到计数。false 时前端显示 `—`（非 root / 无 iptables / 链不存在 / 命令超时均为此状态） |
+| `kern_drop_rate` | 近 60 秒平均丢弃速率（包/秒，浮点）。**`null` 表示「还没测到」**（刚启动、样本不足、计数刚被 flush 归零、读不到计数），前端渲染 `—`；计数回退时绝不返回负数 |
+| `kern_drop_rate_window` | 上述速率实际使用的窗口秒数（未测到为 0） |
+| `kern_drop_mode` | 当前处置模式 `drop` / `redirect` / `off`（读不到配置时为空串）。`redirect` 模式下 DROP 规则已摘除，链计数本就不增长，前端标注「（拦截页模式）」避免被误读成「无人攻击」 |
+
+连接口径（2026-11 新增，同样只增不改）：
+
+| 字段 | 含义 |
+|---|---|
+| `conns_24h` | 近 24 小时（滑动窗口）连接尝试数，走 `idx_conn_log_ts`；不随 `log_max_rows` 饱和 |
+| `conns_total` | **真累计**：`sqlite_sequence.seq`（`conn_log` 自建库以来插入过的总条数，含已被裁剪的与被拒绝的）。`DELETE`/`VACUUM` 都不回退；老库读不到时退化为现存行数 |
+| `bans_24h` | 近 24 小时新增的封禁**条目数**（`ban_log` 新记录 + 新增黑名单条目，各计一条，不去重 IP） |
+| `total_conns` | `conn_log` **现存行数**（受 `log_max_rows` 裁剪）。**保留仅为兼容旧前端/旧插件版本**，面板已不再把它当主值（旧文案「日志窗口连接」已废弃） |
+
+> 为什么要单独给这几个字段：命中 `FRPWAF_BLOCK` 的包在 `INPUT` 链就被 DROP，
+> 到不了 frps，**不会写 `conn_log`**，所以「今日拦截」（`today_rejected`）只能统计
+> 到达 WAF 的连接。取数、缓存与降级约定见 `docs/05` §7.3。
+> 同理 `total_conns` 是 `conn_log` **现存行数**（受 `log_max_rows` 裁剪），
+> 一旦线上日志达到上限就会停在上限附近（实测 50001），既不是「最近一天」也不是
+> 「历史累计」——所以面板主值改用 `conns_24h` + `conns_total` 组合。
 
 ### 3. 配置
 
@@ -142,8 +169,29 @@ ai_timeout`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/kernban` | `{available, enabled, mode, set4, set6, rule, redirect, redirect_ports}`（`mode`: `drop` / `redirect` / `off`） |
+| GET | `/api/kernban` | `{available, enabled, mode, set4, set6, rule, redirect, redirect_ports, counters, top}`（`mode`: `drop` / `redirect` / `off`） |
 | POST | `/api/kernban/sync` | 按开关同步（DROP / nat REDIRECT / 清理）；写审计日志 |
+
+`counters`：集合是否已启用成员计数器（`ipset ... counters`）。存量集合会在首次
+审计轮做一次性重建，未完成前为 `false`。
+
+`top`：按内核丢弃包数排序的来源归因（只读，10 秒缓存；两个面板共用同一实现
+`firewall.top_sources()`）：
+
+```json
+{
+  "available": true,        // 能否读到内核集合
+  "counters": true,         // 集合是否带 counters（false 时 items 必为空）
+  "sampled_at": 1795843209,
+  "items": [
+    {"member": "192.0.2.1", "packets": 3310000, "bytes": 193000000, "timeout": 0}
+  ]
+}
+```
+
+> `timeout` 为 0 表示永久封禁，大于 0 是剩余秒数（临时封禁在延长时会 `del + add`
+> 重建条目，那一刻它的计数会归零，属于已知且可接受的限制）。
+> 面板把 `items` 放在「内核封禁」页的折叠块里（默认收起，不揽占概览空间）。
 
 ### 11. AI
 
@@ -174,6 +222,8 @@ ai_timeout`。
 |---|---|---|
 | GET | `/api/about` | `{name, version, author, repo, license, runtime}` |
 | GET | `/api/syslog?limit=N` | `data/frpwaf.log` 尾部（limit 1~2000，默认 200）→ `{lines, total}` |
+| GET | `/api/sysdetect?limit=N&offset=M&page=P&ip=X&action=Y&hours=H` | 系统端口（非 frp 端口）检测状态 + 观察记录。`data` 为当前配置/读取位置/滑窗计数/活跃会话；`events` 为 `sys_event` 列表（`action` 支持前缀过滤：`observed`/`banned`/`skipped`）；分页返回 `total`/`limit`/`offset`/`page`/`pages`（`page` 仅在未给 `offset` 时生效，`limit` 默认 50、上限 500）；`summary` 为最近 `hours` 小时的汇总（`total`/`observed`/`banned`/`skipped`/`skipped_reasons`），**汇总不跟随 ip/action 筛选**，否则无法判断阈值是否合适。只读 |
+| POST | `/api/sysdetect` | `{action:"clear"}` 清空观察记录（只动 `sys_event`，**不解封任何 IP**，写入审计）；未知 action → `{code:1}`。开关与阈值一律走 `/api/config` |
 | POST | `/api/service` | `{action:"restart"\|"stop"}`；延迟约 2s 执行（避免当前请求被自身重启打断）；写审计 |
 | GET | `/api/upgrade/check` | 检查 GitHub 最新版本（取 `github_repo`；POST 时可用入参 `repo` **仅做只读对比**）→ `{ok,current,latest,has_update,tarball,url,notes,pkg,asset_names}`；`pkg` 为可校验的发布包（`{name,url,size,sha256,hash_source}`），无锤点时返回 `verify_hint`（「该发布缺少校验信息…」） |
 | POST | `/api/upgrade/apply` | **提交**在线升级任务（选定带 sha256 锤点的包 → 下载校验 → 解包+结构校验 → 备份 → 覆盖程序 → 重启；失败自动回滚，**不覆盖 data/**）；写审计。**立即返回 job 状态，不再返回升级结果**：`{code:0,msg:"升级任务已提交，正在后台执行（可轮询进度）",data:{job_id,started:true}}`。**仓库只取配置 `github_repo`**，请求体的 `repo` 被忽略（不一致会写一条拒绝审计）。**发布缺校验锤点时升级会在后台失败**（任务状态 `ok:false` + 「该发布缺少校验信息…」）；升级备份只保留最近 3 份并清理包内已不存在的陈旧 `.py`。**覆盖时按目标目录分开**：运行目录（`/opt/frpwaf`）只落 `app/`、`web/`，7 个面板载荷（`frpwaf_main.py`/`index.html`/`info.json`/`install.sh`/`uninstall.sh`/`frpwaf.init`/`frpwaf.service`）只写插件目录并清掉运行目录里的历史副本（见 [04 §3.10](04-数据模型与配置项.md)） |
@@ -391,6 +441,10 @@ ai_timeout`。
 `about`、`upgrade_check`、`upgrade_apply`（**提交后台任务**，立即返回 `data`=job 状态）、
 `upgrade_status`（轮询升级任务状态）。
 
+> `waf_overview` 与 Web 端 `/api/overview` 同源：除 `store.stats()` 的统计字段外，
+> 同样回传 `kern_dropped` / `kern_dropped_bytes` / `kern_drop_available`
+> （均由 `app/firewall.py::drop_fields()` 提供，两端口径一致）。
+
 > `get_policy` / `save_policy` 的布尔键含 `auto_ban_cc_enabled` / `auto_ban_scan_enabled` /
 > `auto_ban_ssh_enabled` / `proxy_cool_enabled` / `block_page_enabled` / `block_page_ban_enabled` /
 > `block_page_risk_enabled` / `block_page_404_enabled`，整型键含三组窗口/阈值/时长参数、
@@ -433,6 +487,7 @@ ai_timeout`。
   "rate_limit_enabled":false,"admin_user":"admin","geo_available":true,
   "auto_ban_cc_enabled":true,"auto_ban_scan_enabled":true,"auto_ban_ssh_enabled":true,
   "proxy_cool_enabled":false,
+  "kern_dropped":3310123,"kern_dropped_bytes":203423744,"kern_drop_available":true,
   "engine_errors":0,"frp_remote_denied":0}}
 
 // GET /api/config（机密已过滤/掩码）

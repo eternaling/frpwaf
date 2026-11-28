@@ -1623,6 +1623,13 @@ class frpwaf_main:
             fw = _app("firewall")
             st = fw.status()
             st["enabled"] = bool(self._cfg().get("fw_sync_enabled", True))
+            # 按丢弃次数排序的来源 Top N（与 Web 端 /api/kernban 同一实现）。
+            # 取数失败只降级该键，不影响状态本身的展示。
+            try:
+                st["top"] = fw.top_sources()
+            except Exception:
+                st["top"] = {"available": False, "counters": False,
+                             "sampled_at": 0, "items": []}
             return {"status": True, "data": st}
         except Exception:
             return {"status": True, "data": {"available": False, "enabled": False}}
@@ -2037,6 +2044,14 @@ class frpwaf_main:
                 "strict_addr": bool(cfg.get("strict_addr", False)),
                 "ai_allow_private": self._ai_allow_private(cfg),
             })
+            # 内核层丢弃计数：被 INPUT 链 DROP 的包到不了 frps，不会写 conn_log，
+            # 只能从 iptables 计数器单独取（与 Web 端 /api/overview 同一实现）。
+            # 取数失败只降级这三个字段，不影响概览其余内容。
+            try:
+                st.update(_app("firewall").drop_fields())
+            except Exception:
+                st.update({"kern_dropped": 0, "kern_dropped_bytes": 0,
+                           "kern_drop_available": False})
             return {"status": True, "data": st}
         except Exception:
             return {"status": True, "data": {}}
@@ -2293,10 +2308,16 @@ class frpwaf_main:
                    # 地址解析失败时拒连（fail-closed）；默认 False = 保持现状放行
                    "strict_addr",
                    # AI 接口是否允许私有/回环地址；默认 True（AI 网关常是内网自建）
-                   "ai_allow_private"]
+                   "ai_allow_private",
+                   # 系统端口（非 frp 端口）检测：检测总开关 / 观察模式 / SSH 登录写信任
+                   "sys_detect_enabled", "sys_detect_dry_run", "sys_trust_ssh_login"]
     # 默认值为 True 的开关：cfg 缺键时必须回显 true，不能笼统按 False 处理
     # （否则存量配置升级后设置页会把「实际允许」显示成「已禁止」）。
-    POLICY_BOOL_DEFAULT = {"ai_allow_private": True}
+    # sys_detect_dry_run / sys_trust_ssh_login 默认 True：前者保证「即使开了总开关也
+    # 先只观察」，后者是「别把自己锁在门外」的前提（内核 DROP 是全端口的）。
+    POLICY_BOOL_DEFAULT = {"ai_allow_private": True,
+                           "sys_detect_dry_run": True,
+                           "sys_trust_ssh_login": True}
     POLICY_INT = ["auto_ban_window", "auto_ban_threshold", "auto_ban_seconds",
                   "rate_limit_per_sec", "log_max_rows",
                   "auto_ban_cc_window", "auto_ban_cc_threshold", "auto_ban_cc_seconds",
@@ -2304,8 +2325,14 @@ class frpwaf_main:
                   "auto_ban_ssh_window", "auto_ban_ssh_threshold",
                   "burst_window", "proxy_cool_min_conns", "proxy_cool_uniq_threshold",
                   "proxy_cool_single_pct", "proxy_cool_seconds",
-                  "block_page_port"]
-    POLICY_STR = ["github_repo", "block_page_redirect_ports"]
+                  "block_page_port",
+                  # 系统端口检测：阈值/窗口/封禁时长/每小时上限/轮询间隔/单轮行数
+                  "sys_ssh_threshold", "sys_ssh_window", "sys_ssh_ban_seconds",
+                  "sys_ban_max_seconds", "sys_ban_max_per_hour",
+                  "sys_ssh_poll_interval", "sys_ssh_max_lines"]
+    POLICY_STR = ["github_repo", "block_page_redirect_ports",
+                  # 系统端口检测：日志路径（留空=自动探测）与永不封禁网段
+                  "sys_ssh_log", "sys_protect_ips"]
 
     def get_policy(self, get=None):
         """读取准入策略（实际生效值，供设置页回显）。"""
@@ -2352,6 +2379,22 @@ class frpwaf_main:
                 patch["proxy_cool_seconds"] = 10
             if "proxy_cool_single_pct" in patch and patch["proxy_cool_single_pct"] > 100:
                 patch["proxy_cool_single_pct"] = 100
+            # ---- 系统端口检测（非 frp 端口）----
+            # 保护网段必须 CIDR 合法：它决定「谁永远不会被内核丢弃」，而 DROP 是
+            # **全端口**的。写坏了不会报错，只会让保护静默失效——正是把自己
+            # 锁在门外的路径。故非法条目**整批拒绝**（不是丢掉坏行后照写）。
+            if "sys_protect_ips" in patch:
+                ok_cidr, norm_cidr, bad_cidr = _app("config").cidr_list_error(
+                    patch["sys_protect_ips"])
+                if not ok_cidr:
+                    return public.returnMsg(
+                        False, "保护网段含非法 CIDR：%s（支持单个 IP 或 a.b.c.d/n 形式）"
+                        % "、".join(bad_cidr))
+                patch["sys_protect_ips"] = norm_cidr
+            # 阈值/窗口不需要在接口层另做钳制：`config.save()` 内的
+            # normalize_sysdetect 会把非数字阈值回退默认、把窗口 <1 回退默认，
+            # 而 0 作为阈值是已文档化的「只计数不处置」，必须原样保留（不能被静默抬高）。
+            self._audit_sysdetect(patch)
             self._set_cfg(patch)
             try:
                 _app("engine").invalidate_cache()
@@ -2365,6 +2408,135 @@ class frpwaf_main:
             return public.returnMsg(True, "策略已保存")
         except Exception:
             return self._fail("保存失败")
+
+    # ---------------- 系统端口（非 frp 端口）检测 ----------------
+    def _audit_sysdetect(self, patch):
+        """系统端口检测的高危变更写审计（只记状态跳变，不记普通保存）。
+
+        为何只记跳变：观察期里 owner 会反复调阈值，每次保存都写一条只会把
+        真正的危险操作（关观察模式 / 清空保护网段）淹没在噪声里。
+        """
+        try:
+            old = self._cfg_effective()
+        except Exception:
+            old = {}
+
+        def _b(v, default):
+            try:
+                return _to_bool(v)
+            except Exception:
+                return default
+
+        if _b(old.get("sys_detect_dry_run"), True) and \
+                not _b(patch.get("sys_detect_dry_run", True), True):
+            self._audit("系统端口检测：**关闭观察模式**（此后命中阈值的来源会被真封禁，"
+                        "而且内核 DROP 是全端口的）；当前保护网段 %s"
+                        % (str(patch.get("sys_protect_ips",
+                                         old.get("sys_protect_ips") or "") or "（空）")))
+        if _b(old.get("sys_detect_enabled"), False) and \
+                not _b(patch.get("sys_detect_enabled", False), False):
+            self._audit("系统端口检测：关闭检测总开关（不再从 auth.log 统计失败事件）")
+        if _b(old.get("sys_trust_ssh_login"), True) and \
+                not _b(patch.get("sys_trust_ssh_login", True), True):
+            self._audit("系统端口检测：关闭「SSH 登录写信任」（成功登录不再自动免封）")
+        if "sys_protect_ips" in patch:
+            self._audit_protect_ips(old.get("sys_protect_ips"),
+                                    patch.get("sys_protect_ips"))
+
+    def _audit_protect_ips(self, old_raw, new_raw):
+        """保护网段变更的审计（只在「清空」与「变少」时写）。"""
+        def _n(raw):
+            parts = str(raw or "").replace("\n", ",").replace(";", ",").split(",")
+            return len([p for p in parts if p.strip()])
+
+        old_raw = str(old_raw or "").strip()
+        new_raw = str(new_raw or "").strip()
+        if old_raw == new_raw:
+            return
+        if not new_raw:
+            self._audit("系统端口检测：清空保护网段（原先 %d 条），现已无任何免封地址"
+                        % _n(old_raw))
+        elif _n(new_raw) < _n(old_raw):
+            self._audit("系统端口检测：保护网段由 %d 条减为 %d 条"
+                        % (_n(old_raw), _n(new_raw)))
+
+    def _sysdetect_args(self, get):
+        """解析插件端 `sysdetect` 接口的分页/筛选参数，返回 (limit, offset, ip, action, hours)。
+
+        非法值一律回退默认而不报错：这是个只读展示接口，不该因为少传/传错一个
+        参数就整页红一片。分页同时接受 offset 与 page（page 仅在未给 offset 时生效），
+        与 `/api/sysdetect` 的口径保持一致，两端前端可以共用一套参数。
+        """
+        def _arg(name, default=""):
+            try:
+                v = getattr(get, name, None)
+            except Exception:
+                return default
+            return default if v is None else v
+
+        def _num(name, default, lo, hi):
+            try:
+                v = int(_arg(name, default) or default)
+            except (TypeError, ValueError):
+                v = default
+            return default if v < lo or v > hi else v
+
+        limit = _num("limit", 50, 1, 500)
+        offset = _num("offset", 0, 0, 10 ** 9)
+        page = _num("page", 0, 0, 10 ** 9)
+        if not str(_arg("offset", "") or "").strip() and page > 0:
+            offset = (page - 1) * limit
+        hours = _num("hours", 24, 1, 720)
+        return (limit, offset, str(_arg("ip", "") or "").strip(),
+                str(_arg("action", "") or "").strip(), hours)
+
+    def sysdetect(self, get=None):
+        """系统端口检测的只读数据：状态 + 观察记录分页 + 时间窗汇总。
+
+        本方法**只读**：开关/参数一律走 save_policy（那里有 CIDR 与阈值校验）。
+        为何插件端单独写一份：插件进程与 daemon 是两个进程，但读同一个 SQLite
+        （`store` 的只读连接）与同一份配置，所以无需经 HTTP 绕一圈。
+        """
+        limit, offset, ip, action, hours = self._sysdetect_args(get)
+        st = self._store()
+        try:
+            events = st.list_sys_event(limit, ip=ip or None,
+                                       action=action or None, offset=offset)
+        except Exception:
+            events = []
+        try:
+            total = st.count_sys_event(ip=ip or None, action=action or None)
+        except Exception:
+            total = 0
+        try:
+            # 汇总与列表筛选解耦：owner 要看的是「整体分布」，跟着 IP 筛选变
+            # 就没法回答「阈值是不是定得太松」这个问题。
+            summary = st.summary_sys_event(int(time.time()) - hours * 3600)
+        except Exception:
+            summary = {}
+        summary["hours"] = hours
+        try:
+            status = _app("sysdetect").status()
+        except Exception:
+            status = {}
+        try:
+            _app("geo").enrich(events)
+        except Exception:
+            pass
+        pages = int((total + limit - 1) // limit) if total > 0 else 0
+        return {"status": True, "data": {
+            "status": status, "events": events, "total": total,
+            "limit": limit, "offset": offset, "page": (offset // limit) + 1,
+            "pages": pages, "summary": summary}}
+
+    def sysdetect_clear(self, get=None):
+        """清空观察记录（只删 `sys_event`，不解封任何 IP、不改开关）。"""
+        try:
+            n = self._store().purge_sys_event()
+        except Exception:
+            return self._fail("清空观察记录失败")
+        self._audit("清空系统端口检测观察记录（%d 条）" % n)
+        return public.returnMsg(True, "已清空观察记录（%d 条）" % n)
 
     # ---------------- 静态拦截页 / GitHub 在线升级 / 关于 ----------------
     def _upgrade_repo(self, get=None):

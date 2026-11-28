@@ -41,6 +41,7 @@ Bug N 为 2026-10-09 Windows 打包 CRLF 污染批次；
 | Y | `app/daemon.py` / `app/engine.py` / `app/store.py` / `app/config.py` | `1245817` | 待发布 | 待提交 |
 | Z | `app/store.py` | `034379d` | 待发布 | 待提交 |
 | AA | `app/job.py` / `app/daemon.py` / `frpwaf_main.py` / 双端面板 | `74c0702` / `e56a97e` / `4f252a1` | 待发布 | 待提交 |
+| AC | `index.html` | 待提交 | 待发布 | 待提交 |
 
 > A、B 随 `cedf595` 一起提交并打 Tag `v1.3.7`；C、D、E 随后修复，随 Tag
 > `v1.3.8` 一起提交（见 [13-变更历史与版本.md](13-变更历史与版本.md) §2/§4）。
@@ -1469,6 +1470,74 @@ AI 模块没有。事后看更根本的问题是：**只校验 URL 文本、不�
 
 ---
 
+## Bug AB（2026-12-02）：概览卡片区的口径说明被塞进 grid 容器，版面塌陷
+
+**现象**：插件端概览页 8 张统计卡片挤成一行，而「统计口径：……」那一大段说明被压成
+最右侧一条**竖直的文字列**（逐字换行、几乎不可读），并把整页高度撑得很长。
+
+**根因**：`.fw-stats` 是 `display:grid`（`repeat(auto-fit,minmax(130px,1fr))`），而渲染
+代码把说明 div 连同卡片一起拼进了同一个容器的 `innerHTML`：
+
+```js
+document.getElementById('fwStats').innerHTML = cards.map(...).join('')
+  + '<div class="fw-tip" style="flex-basis:100%;margin:6px 0 0">统计口径：…</div>';
+```
+
+`flex-basis` 是 flex 属性，在 grid 容器里完全无效。于是说明 div 被当成一个普通网格
+单元格参与 auto-fit 排布，落在最窄的一列里被逐字折行。
+
+实测（Chromium，视口 1400、卡片区宽 1158px、6 列 × 183px）把说明追加进网格后：
+
+| 指标 | 说明在网格内（旧） | 说明在网格外（新） |
+|---|---|---|
+| 说明宽度 | 183px（单列） | 1173px（整宽） |
+| 说明高度 | 518px | 108px（两段说明合计） |
+| 同行卡片高度 | 117px → **524px**（被撑高 4.5 倍） | 117px |
+
+**修复**：说明移出网格——`index.html` 在 `#fwStats` 之后新增 `#fwStatsNote` 容器，
+统计口径与攻击类型两段说明整宽渲染在那里，网格只放卡片。同时把 `minmax(130px,1fr)`
+提到 `minmax(170px,1fr)`，避免 1200px 左右仍挤成一行 8 列导致文字溢出。
+
+**顺带修掉的同类问题**：同一渲染函数里的第二段说明（「攻击类型封禁」）也是用
+`flex-basis:100%` 塞进网格，一并移出。全仓库再无非网格容器里的该写法。
+
+**顺带修掉的口径误导**：「近24h新增封禁」副行原为
+`当前生效 (perm+temp)（临时 temp · 永久名单 perm）`，把**黑名单条目数**与
+**生效封禁数**相加后称作「当前生效」，与同一行的「生效封禁 = 0」卡片自相矛盾。
+改为 `黑名单 N 条 · 临时封禁 M 条生效`，口径说明同步注明「黑名单条数即名单规模，
+不代表正在生效的封禁；生效封禁数只看「生效封禁」卡片」。两端同步。
+
+**回归防线**：`tests/test_panel_overview_copy.py::PanelStatsLayoutTest` 用文本断言钉住
+「说明容器在网格之外」「网格 innerHTML 不含 `.fw-tip`」「两端都不再有内联 flex-basis」
+「副行不再出现 `当前生效` + `(perm+temp)` 拼接」。
+
+## Bug AC（2026-12）：插件端 `FW_POLICY_STR` 声明被误删，「保存策略」全部静默失效
+
+**现象**：插件端设置页点「保存策略」没任何反应——不报错、不提示、配置也不变。
+因为没有任何报错信息，很容易被当成「网络慢了」或「本来就保存了」。
+
+**根因**：提交 `294c07c`（加 `strict_addr` / `ai_allow_private` 开关）改动
+`FW_POLICY_BOOL` / `FW_POLICY_INT` 时，把紧跟其后的
+
+```js
+var FW_POLICY_STR=['github_repo','block_page_redirect_ports'];
+```
+
+整行删掉了，但 `fwLoadPolicy` / `fwSavePolicy` 仍在调用 `FW_POLICY_STR.forEach(...)`。
+于是两个函数执行到那一行就抛 `ReferenceError`：
+
+- `fwLoadPolicy`：布尔与整数已经回填完，字符串字段（`github_repo`、拦截页重定向
+  端口）永远回显为空；
+- `fwSavePolicy`：**`fwSend('save_policy', …)` 在抛错之后，所以一次也没发出去**，
+  整个保存链路死掉。
+
+**修复**：恢复声明，并把新增的字符串字段一并加入（`sys_ssh_log`、`sys_protect_ips`），
+同时加注释说明「新增字符串字段必须加在这里」及其失效后果。
+
+**回归防线**：`tests/test_sysdetect_panel.py::PanelSysdetectCopyTest`
+`.test_panel_policy_str_list_declared` 断言 `var FW_POLICY_STR=[` 存在且包含新增键。
+（只钉声明存在——断言具体内容会随字段增长而频繁失效。）
+
 ## 附：历史遗留的其它修复（早期版本，非本轮）
 
 这些在更早的提交中已修复，一并记录：
@@ -1511,3 +1580,5 @@ AI 模块没有。事后看更根本的问题是：**只校验 URL 文本、不�
 | Y | `app/daemon.py` / `app/engine.py` / `app/store.py` / `app/config.py` | 地址解析失败静默放行（无告警）；IPv4-mapped 未归一化致黑名单整段失效 | 高（黑名单失效且无告警） |
 | Z | `app/store.py` | 备份文件名只精确到秒，同秒连续备份互相覆盖 → 「保留 7 份」策略失效 | 中（备份静默失效，需回滚时才发现） |
 | AA | `app/job.py` / `app/daemon.py` / `frpwaf_main.py` / 双端面板 | 升级/测试连接在请求线程内同步执行，超 60s 代理超时 → 页面报失败而后台已成功，诱发重复操作 | 中（不影响正确性，影响用户判断） |
+| AB | `index.html` / `web/index.html` | 概览把口径说明拼进 `display:grid` 容器（`flex-basis:100%` 在 grid 无效）→ 说明被压成竖排文字列并把同行卡片撑高 4.5 倍；副行把名单条目数与生效封禁数相加称「当前生效」 | 中（版面塌陷 + 口径误导） |
+| AC | `index.html` | `FW_POLICY_STR` 声明被误删 → `fwLoadPolicy`/`fwSavePolicy` 抛 `ReferenceError`，「保存策略」一次也没发出去且无任何报错 | 高（配置修改完全失效且静默） |

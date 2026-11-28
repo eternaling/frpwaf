@@ -69,6 +69,7 @@ ROUTES = {
     "/api/kernban": (200, 200),
     "/api/blockpage": (200, 200),
     "/api/syslog": (200, 200),
+    "/api/sysdetect": (200, 200),         # GET 状态+事件 / POST action=clear，未知 action 回 200+code1
     "/api/burst": (200, 200),
     "/api/proxies": (200, 200),
     # ---- 名单 / 日志 / 封禁 ----
@@ -318,9 +319,9 @@ class RouteContractTest(RouteTestCase):
 
     def test_every_route_is_registered(self):
         """契约表覆盖 `_api` 里的每一条 path（漏测的路由会在重构时裸奔）。"""
-        # 32 = `daemon._ROUTES` 的 30 条 + `/api/login` + `/api/logout`
+        # 33 = `daemon._ROUTES` 的 31 条 + `/api/login` + `/api/logout`
         # （后两者在 `_route` 里就处理掉了，不会到 `_api`）
-        self.assertEqual(len(ROUTES), 32)
+        self.assertEqual(len(ROUTES), 33)
         # 前缀相近的几组路由：路由表是 dict.get 精确匹配，长路径不会被短路径吃掉。
         # 断言保留在这里，防止将来有人改回 startswith 前缀匹配。
         for long_path, short_path in (
@@ -812,10 +813,16 @@ class ResponseShapeTest(RouteTestCase):
         for key in ("version", "uptime", "http_addr", "http_port", "frp_handler_port",
                     "blacklist_enabled", "whitelist_enabled", "auto_ban_enabled",
                     "rate_limit_enabled", "password_change_required", "admin_user",
-                    "engine_errors", "invalid_addr", "strict_addr", "geo_available"):
+                    "engine_errors", "invalid_addr", "strict_addr", "geo_available",
+                    "kern_dropped", "kern_dropped_bytes", "kern_drop_available"):
             self.assertIn(key, data, "缺少字段 " + key)
         self.assertIsInstance(data["password_change_required"], bool)
         self.assertEqual(data["admin_user"], "admin")
+        # 内核丢弃计数：本测试把 firewall.available 打桩为 False（不碰宿主内核），
+        # 所以这里必须是「降级为不可用」而不是报错或返回 None。
+        self.assertIs(data["kern_drop_available"], False)
+        self.assertEqual(data["kern_dropped"], 0)
+        self.assertEqual(data["kern_dropped_bytes"], 0)
 
     def test_job_status_structure(self):
         """/api/upgrade/status 与 /api/ai/test/status 回 job 状态结构。"""

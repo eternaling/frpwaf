@@ -57,11 +57,17 @@
            background:transparent;white-space:nowrap;z-index:30}
   .fw-sign a{color:inherit;text-decoration:none}
   .fw-sign a:hover{color:var(--pri);text-decoration:underline}
-  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
+  /* 单张卡最小 170px：与插件端 .fw-stats 同口径，避免副行文案被挤成多行把卡片拉高 */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:18px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px}
   .card .k{color:var(--muted);font-size:12px;margin-bottom:6px}
   .card .v{font-size:23px;font-weight:700}
   .card .v.ok{color:var(--ok)} .card .v.err{color:var(--err)} .card .v.pri{color:var(--pri)}
+  /* 卡片副行（如内核丢弃的字节数）：不额外占主数值，也不与主数值同权重 */
+  .card .s{color:var(--muted);font-size:12px;margin-top:2px}
+  /* 概览统计口径说明（与插件端 fw-tip 同口径） */
+  .dash-note{color:var(--muted);font-size:12px;line-height:1.6;margin:-6px 0 18px}
+  .dash-note code{color:var(--txt)}
   .box{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
        padding:16px;margin-bottom:18px}
   .box h2{font-size:14px;margin:0 0 12px;display:flex;align-items:center;gap:10px}
@@ -183,6 +189,7 @@
     <!-- 概览 -->
     <section id="tab-dash">
       <div class="cards" id="statCards"></div>
+      <div class="dash-note">统计口径：「近24h连接」是最近 24 小时（滑动窗口）内 WAF 处理过的连接尝试数，不受日志裁剪影响；「真累计」是自部署以来 WAF 处理过的全部连接尝试数（含被拒绝的连接），取自数据库自增序列，删旧日志不会让它变小。「近24h新增封禁」是最近 24 小时新增的封禁条目数（临时封禁与永久名单各计一条），体现当下威胁趋势。副行的「黑名单 N 条」是永久名单的条目总数（即名单规模，不代表正在生效的封禁）；真正生效中的封禁数只看「生效封禁」卡片。「今日应用层拦截」只统计到达 WAF 的连接；被内核链 <code>FRPWAF_BLOCK</code> 直接丢弃的包连不到 frps，不会产生日志，单独记在「内核层已丢弃」（IPv4+IPv6 合计），副行的「近 1 分钟」是最近 60 秒平均丢弃速率（计数刚重置时不显示负值，只显示 —）；显示 — 表示当前环境读不到内核计数（如非 root、未启用内核封禁或缺少 iptables）。</div>
       <div class="box">
         <h2>运行信息
           <span class="grow"></span>
@@ -381,7 +388,8 @@
           <button class="sm" onclick="kbSync()">立即同步</button>
         </h2>
         <div id="kbInfo" class="grid3"></div>
-        <p class="muted" style="margin:12px 0 0">内核级封禁（ipset+iptables）把命中封禁的 IP 在内核层直接丢包；关闭后若拦截页开启，则改为 REDIRECT 展示封禁页。需 root + ipset/iptables。</p>
+        <div id="kbTop" style="margin-top:14px"></div>
+        <p class="muted" style="margin:12px 0 0">内核级封禁（ipset+iptables）把命中封禁的 IP 在内核层直接丢包；关闭后若拦截页开启，则改为 REDIRECT 展示封禁页。需 root + ipset/iptables。集合启用 counters 后可展开「丢弃来源 Top」看谁被丢得最多（需先完成一次性集合重建；重建期间拦截不断）。</p>
       </div>
     </section>
 
@@ -479,6 +487,56 @@
         </div>
         <p class="muted" style="margin:10px 0 0;font-size:12px">误伤提示：出口 IP 变化的真实用户（移动网络切换、动态 IP、CDN 回源）可能被拒。建议先在「连接日志 → 突发观测」观察 1-2 天，确认流量性质且可接受偶发误伤后再启用；白名单 IP 不受影响。</p>
         <div class="row" style="margin-top:14px"><button onclick="saveSettings()">保存策略</button></div>
+        <h2 style="margin-top:18px">系统端口检测 <span class="stat-badge">非 frp 端口（22/6379/8888 等）的来源识别，默认关闭 + 默认只观察</span></h2>
+        <div class="switch"><input type="checkbox" id="s_sys_detect_enabled"><label for="s_sys_detect_enabled">启用系统端口检测</label></div>
+        <p class="muted" style="margin:8px 0 0;font-size:12px">从系统认证日志（auth.log / secure）增量识别非 frp 端口上的敏感端口探测与高频登录失败，按「单来源滑窗计数」判定，达阈值才处置。关闭时完全不做统计。</p>
+        <div class="switch" style="margin-top:12px"><input type="checkbox" id="s_sys_detect_dry_run"><label for="s_sys_detect_dry_run">观察模式（只记录、不封禁）</label></div>
+        <p id="fwSysDryWarn" style="margin:8px 0 0;font-size:12px;line-height:1.7;padding:8px 10px;border-radius:6px;background:var(--panel2);border:1px solid var(--line)"><b style="color:var(--err)">关闭观察模式 = 真的会封 IP</b>：处置经内核下发，<b>DROP 是全端口的</b>——一旦某个来源被误判，22 / 7080 / 8888 会一起进不去，面板也打不开，只能上云厂商控制台或 VNC 救机器。<br>所以关掉前请：① 把常用出口 IP 写进下面的保护名单；② 先看「观察记录」里最近 24 小时的「本应封禁」量是否可信。切换时会再弹一次二次确认。</p>
+        <div class="switch" style="margin-top:12px"><input type="checkbox" id="s_sys_trust_ssh_login"><label for="s_sys_trust_ssh_login">成功 SSH 登录写登录信任</label></div>
+        <p class="muted" style="margin:8px 0 0;font-size:12px">认证成功的来源会记入登录信任（复用「登录信任有效期」，0 秒 = 关闭），期限内不被自动封禁。失败的登录永不写入。</p>
+        <div class="grid3" style="margin-top:14px">
+          <div class="field"><label>失败次数阈值</label><input id="s_sys_ssh_threshold" type="number" min="0"></div>
+          <div class="field"><label>计数窗口（秒）</label><input id="s_sys_ssh_window" type="number" min="1"></div>
+          <div class="field"><label>封禁时长（秒）</label><input id="s_sys_ssh_ban_seconds" type="number" min="0"></div>
+          <div class="field"><label>每小时上限</label><input id="s_sys_ban_max_per_hour" type="number" min="0"></div>
+          <div class="field"><label>轮询间隔（秒）</label><input id="s_sys_ssh_poll_interval" type="number" min="1"></div>
+          <div class="field"><label>单条封禁上限（秒）</label><input id="s_sys_ban_max_seconds" type="number" min="0"></div>
+        </div>
+        <div class="field" style="margin-top:14px"><label>永不封禁网段（单个 IP 或 CIDR，逗号/换行分隔）</label>
+          <textarea id="s_sys_protect_ips" rows="4" placeholder="例如：112.48.13.214"></textarea></div>
+        <p class="muted" style="margin:8px 0 0;font-size:12px">这里的来源<b>永不封禁</b>（单个 IP 会规范成 /32）。格式非法会被拒绝保存，不会写坏配置。清空等于放弃这层保护，保存时会二次确认。</p>
+        <p class="muted" style="margin:8px 0 0;font-size:12px">参数含义：阈值 <b>0 = 只计数不处置</b>（不触发任何处置，可用于纯观察）；阈值写非数字会回退默认值；窗口 <b>必须 ≥1</b>（写 0 会回退默认，否则会出现「显示 0 秒、实际按默认值算」的偏差）；封禁时长超过「单条封禁上限」时按上限封；「每小时上限」是全局熔断，避免整段被扫时批量误伤。判定前还会依次过白名单、登录信任、可信回源段、保护名单与当前活跃会话，任一命中都不封。</p>
+        <div class="row" style="margin-top:14px">
+          <button onclick="saveSysdetect()">保存系统端口检测</button>
+          <button class="ghost sm" onclick="loadSysdetect()">重新加载</button>
+          <button class="ghost sm" onclick="sysEventPage(0)">刷新观察记录</button>
+        </div>
+        <h2 style="margin-top:18px">观察记录 <span class="stat-badge">最近 24 小时「本应封禁 / 已封禁 / 被豁免」分布</span></h2>
+        <p id="fwSysSummary" style="margin:0 0 10px;font-size:12px;line-height:1.7;padding:8px 10px;border-radius:6px;background:var(--panel2)">加载中…</p>
+        <div class="row">
+          <div class="field"><label>来源 IP</label><input id="fwSysIp" placeholder="精确匹配，留空=全部" style="width:190px"></div>
+          <div class="field"><label>处置</label>
+            <select id="fwSysAction" style="width:130px">
+              <option value="">全部</option>
+              <option value="observed">本应封禁</option>
+              <option value="banned">已封禁</option>
+              <option value="skipped">被豁免</option>
+            </select></div>
+          <div class="field"><label>每页</label>
+            <select id="fwSysLimit" style="width:90px">
+              <option value="20">20 条</option>
+              <option value="50" selected>50 条</option>
+              <option value="100">100 条</option>
+            </select></div>
+          <button onclick="sysEventPage(0)" style="margin-top:18px">查询</button>
+          <button class="ghost sm" style="margin-top:18px" onclick="sysEventReset()">重置筛选</button>
+          <button class="ghost sm" style="margin-top:18px" onclick="sysEventClear()">清空观察记录</button>
+        </div>
+        <div class="scroll" style="max-height:360px">
+          <table><thead><tr><th style="width:150px">时间</th><th style="width:150px">来源 IP</th><th style="width:150px">归属地</th><th style="width:90px">命中/窗口</th><th style="width:130px">处置</th><th>原因</th></tr></thead>
+          <tbody id="fwSysEventBody"><tr><td class="muted" colspan="6">加载中…</td></tr></tbody></table>
+        </div>
+        <div class="row" id="fwSysPager" style="margin-top:10px"></div>
       </div>
       <div class="box">
         <h2>监听与安全 <span class="stat-badge">改地址/端口后立即切换监听，无需重启</span></h2>
@@ -592,6 +650,16 @@ function fmtTime(ts){ if(!ts) return '-'; const d=new Date(ts*1000);
   const p=n=>String(n).padStart(2,'0');
   return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; }
 function fmtDur(s){ s=+s||0; if(s<60)return s+'秒'; if(s<3600)return (s/60).toFixed(0)+'分'; if(s<86400)return (s/3600).toFixed(1)+'时'; return (s/86400).toFixed(1)+'天'; }
+/* 大数字缩写：内核丢弃计数可达千万级（与插件端 fwFmtBig / fwFmtBytes 同口径） */
+function fmtBig(n){ n=Number(n)||0;
+  if(n>=100000000) return (n/100000000).toFixed(2)+' 亿';
+  if(n>=10000) return (n/10000).toFixed(1)+' 万';
+  return String(n); }
+function fmtBytes(b){ b=Number(b)||0;
+  if(b>=1073741824) return (b/1073741824).toFixed(2)+' GB';
+  if(b>=1048576) return (b/1048576).toFixed(1)+' MB';
+  if(b>=1024) return (b/1024).toFixed(1)+' KB';
+  return b+' B'; }
 
 /* ---- 登录 / 强制改密 ---- */
 async function doLogin(){
@@ -648,7 +716,8 @@ function loadTab(tab){
   $('#tab-'+tab).classList.remove('hide');
   ({dash:loadDash, list:()=>loadList(curListType), logs:()=>{loadLogProxies();loadLogs(0);loadBurst();},
     bans:loadBans, ai:loadAI, kernban:loadKernban, service:()=>{}, syslog:loadSyslog,
-    geoq:loadGeo, proxies:loadProxies, settings:loadSettings, about:loadAbout}[tab]||(()=>{}))();
+    geoq:loadGeo, proxies:loadProxies, about:loadAbout,
+    settings:()=>{loadSettings(); sysEventPage(0);}}[tab]||(()=>{}))();
 }
 
 /* ---- 概览 ---- */
@@ -656,11 +725,20 @@ async function loadDash(){
   try{
     const r = await api('/api/overview'); const d=r.data;
     $('#whoami').textContent = '管理员：'+(d.admin_user||'已登录');
+    const kern = d.kern_drop_available ? fmtBig(d.kern_dropped||0) : '—';
+    const kernSub = d.kern_drop_available
+      ? fmtBytes(d.kern_dropped_bytes||0)+' · '+rateText(d)
+      : '读不到内核计数';
+    const perm = Number(d.black_count||0), temp = Number(d.active_bans||0);
     $('#statCards').innerHTML = [
-      ['今日连接', d.today_conns, 'pri'], ['今日拦截', d.today_rejected, 'err'],
-      ['今日独立IP', d.today_uniq_ip, ''], ['生效封禁', d.active_bans, 'err'],
-      ['黑名单', d.black_count, ''], ['白名单', d.white_count, ''],
-    ].map(([k,v,c])=>`<div class="card"><div class="k">${esc(k)}</div><div class="v ${c}">${esc(v)}</div></div>`).join('');
+      ['今日连接', d.today_conns, 'pri'], ['今日应用层拦截', d.today_rejected, 'err'],
+      ['今日独立IP', d.today_uniq_ip, ''], ['生效封禁', temp, 'err'],
+      ['近24h新增封禁', d.bans_24h, d.bans_24h?'err':'',
+        '黑名单 '+perm+' 条 · 临时封禁 '+temp+' 条生效'],
+      ['白名单', d.white_count, ''],
+      ['近24h连接', fmtBig(d.conns_24h||0), '', '真累计 '+fmtBig(d.conns_total||0)],
+      ['内核层已丢弃', kern, d.kern_drop_available?'err':'', kernSub],
+    ].map(([k,v,c,s])=>`<div class="card"><div class="k">${esc(k)}</div><div class="v ${c}">${esc(v)}</div>${s?`<div class="s">${esc(s)}</div>`:''}</div>`).join('');
     $('#sysInfo').innerHTML = [
       ['版本', d.version], ['运行时长', fmtDur(d.uptime)],
       ['面板地址', (d.http_addr||'')+':'+(d.http_port||'')],
@@ -681,6 +759,20 @@ async function loadDash(){
       || '<tr><td class="muted" colspan="6">暂无记录</td></tr>';
   }catch(e){ if(e.message!=='unauthorized') toast('概览加载失败：'+e.message,'err'); }
 }
+/* 近 1 分钟丢弃速率文案：None 必须渲染成「—」而不是 0（0 是结论，— 是未知）。
+   与插件端 fwRateText / fwFmtPerSec 同口径，避免两端文案漂移。 */
+function rateText(d){
+  const r = d.kern_drop_rate;
+  // 拦截页（REDIRECT）模式下 DROP 规则已摘，链计数本就不增长，速率恒为 0。
+  const mode = (d.kern_drop_mode==='redirect') ? '（拦截页模式）' : '';
+  if(r===null || r===undefined) return '近 1 分钟 —'+mode;
+  return '近 1 分钟 '+fmtPerSec(r)+' 包/秒'+mode;
+}
+function fmtPerSec(r){ r=Number(r)||0;
+  if(r<0) return '0';
+  if(r>=100) return String(Math.round(r));
+  const s = r.toFixed(r>=10?1:3).replace(/0+$/,'').replace(/\.$/,'');
+  return s===''?'0':s; }
 function logRow(x){
   return `<tr><td class="muted">${fmtTime(x.ts)}</td><td>${esc(x.ip)}</td><td class="muted">${esc(x.geo||'-')}</td><td>${esc(x.proxy_name||'-')}</td>
     <td><span class="tag ${x.action==='allow'?'allow':'reject'}">${esc(x.action)}</span></td>
@@ -1063,7 +1155,7 @@ async function geoQuery(){
     $('#geoResult').innerHTML = [
       ['IP', d.ip], ['归属地', d.geo||'未知'],
       ['国家/地区', d.country||'-'], ['省份', d.province||'-'], ['城市', d.city||'-'],
-      ['运营商', d.isp||'-'], ['历史连接', d.total_conns], ['近24h连接', d.today_conns],
+      ['运营商', d.isp||'-'], ['日志内连接数', d.total_conns], ['近24h连接', d.today_conns],
     ].map(([k,v])=>`<div class="field"><label>${esc(k)}</label><div>${esc(v)}</div></div>`).join('');
   }catch(e){ if(e.message!=='unauthorized') $('#geoResult').innerHTML = `<div class="muted">${esc(e.message)}</div>`; }
 }
@@ -1081,19 +1173,26 @@ async function loadProxies(){
 
 /* ---- 设置 ---- */
 const SET_BOOL = ['blacklist_enabled','whitelist_enabled','auto_ban_enabled','rate_limit_enabled','fw_sync_enabled',
-  'auto_ban_cc_enabled','auto_ban_scan_enabled','auto_ban_ssh_enabled','proxy_cool_enabled','strict_addr'];
+  'auto_ban_cc_enabled','auto_ban_scan_enabled','auto_ban_ssh_enabled','proxy_cool_enabled','strict_addr',
+  'sys_detect_enabled','sys_detect_dry_run','sys_trust_ssh_login'];
 const SET_INT = ['auto_ban_window','auto_ban_threshold','auto_ban_seconds','rate_limit_per_sec','log_max_rows',
   'auto_ban_cc_window','auto_ban_cc_threshold','auto_ban_cc_seconds',
   'auto_ban_scan_window','auto_ban_scan_threshold','auto_ban_scan_seconds',
   'auto_ban_ssh_window','auto_ban_ssh_threshold',
-  'burst_window','proxy_cool_min_conns','proxy_cool_uniq_threshold','proxy_cool_single_pct','proxy_cool_seconds'];
+  'burst_window','proxy_cool_min_conns','proxy_cool_uniq_threshold','proxy_cool_single_pct','proxy_cool_seconds',
+  'sys_ssh_threshold','sys_ssh_window','sys_ssh_ban_seconds','sys_ban_max_per_hour',
+  'sys_ssh_poll_interval','sys_ban_max_seconds'];
 async function loadSettings(){
   try{
     const r = await api('/api/config'); const c=r.data;
-    SET_BOOL.forEach(k=>$('#s_'+k).checked=!!c[k]);
-    SET_INT.forEach(k=>$('#s_'+k).value=c[k]);
+    SET_BOOL.forEach(k=>{ const e=$('#s_'+k); if(e) e.checked=!!c[k]; });
+    SET_INT.forEach(k=>{ const e=$('#s_'+k); if(e) e.value=c[k]; });
+    const p = $('#s_sys_protect_ips');
+    if(p) p.value = (c.sys_protect_ips===undefined?'':c.sys_protect_ips);
     loadCurUser();
     loadListen(c);
+    sysBindDryConfirm();
+    sysSyncDryWarn();
   }catch(e){ if(e.message!=='unauthorized') toast('设置加载失败：'+e.message,'err'); }
 }
 /* 监听与安全（P0-1 允许远程访问 / P0-3 回调分端口与并发闸门） */
@@ -1126,10 +1225,171 @@ async function loadCurUser(){
 }
 async function saveSettings(){
   const b={};
-  SET_BOOL.forEach(k=>b[k]=$('#s_'+k).checked);
-  SET_INT.forEach(k=>b[k]=+$('#s_'+k).value||0);
+  SET_BOOL.forEach(k=>{ const e=$('#s_'+k); if(e) b[k]=e.checked; });
+  SET_INT.forEach(k=>{ const e=$('#s_'+k); if(e) b[k]=+e.value||0; });
+  const p=$('#s_sys_protect_ips');
+  if(p) b.sys_protect_ips=p.value.trim();
+  // sys_* 字段归「系统端口检测」卡片自己的保存按钮（saveSysdetect）。
+  // 这里必须跳过：该卡的保存带「关闭观察模式 / 清空保护名单」的二次确认，
+  // 若从本按钮一并提交，就多了一条绕过确认的路径。
+  // 加载不受影响：loadSettings 仍会用 SET_BOOL/SET_INT 把 sys_* 回填到表单。
+  Object.keys(b).forEach(k=>{ if(k.indexOf('sys_')===0) delete b[k]; });
   try{ const r=await api('/api/config','POST',b); toast(r.msg,'ok'); }
   catch(e){ toast(e.message,'err'); }
+}
+
+/* ---- 系统端口检测（非 frp 端口）----
+   与插件端同一套字段与文案；保存时**只提交 sys_* 字段**，不碰其它策略键。
+   观察记录读 /api/sysdetect（带分页/筛选/汇总）。 */
+const SYS_BOOL = SET_BOOL.filter(k=>k.indexOf('sys_')===0);
+const SYS_INT = SET_INT.filter(k=>k.indexOf('sys_')===0);
+var sysPrevProtect=null;   // 上一次加载到的保护名单（用于「清空」二次确认）
+var SYS_LIMIT=50;
+const SYS_ACTION_TEXT = {
+  'observed':'本应封禁（观察模式）',
+  'banned':'已封禁',
+  'skipped:whitelist':'豁免：白名单',
+  'skipped:trust-login':'豁免：登录信任',
+  'skipped:trusted-cidr':'豁免：可信回源段',
+  'skipped:protect-cidr':'豁免：保护名单',
+  'skipped:active-session':'豁免：当前活跃会话',
+  'skipped:non-public':'跳过：非公网地址',
+  'skipped:already-banned':'跳过：已在封禁中',
+  'skipped:circuit':'豁免：每小时熔断',
+  'skipped:db-error':'失败：写入封禁出错'
+};
+function sysActionText(a){ a=String(a||''); return SYS_ACTION_TEXT[a]||a||'-'; }
+/* 观察模式的醒目标注：关闭时提示框改成红底，避免「以为还在观察」 */
+function sysSyncDryWarn(){
+  const box=$('#fwSysDryWarn'), el=$('#s_sys_detect_dry_run');
+  if(!box||!el) return;
+  if(el.checked){ box.style.background='var(--panel2)'; box.style.borderColor='var(--line)'; }
+  else { box.style.background='rgba(239,68,68,.12)'; box.style.borderColor='var(--err)'; }
+}
+/* 关闭观察模式的二次确认：先恢复勾选，只有点了确认才真的关掉，
+   这样用户取消时界面与配置不会出现「看起来已关闭」的错觉。 */
+function sysBindDryConfirm(){
+  const el=$('#s_sys_detect_dry_run');
+  if(!el || el.dataset.fwBound==='1') return;
+  el.dataset.fwBound='1';
+  el.addEventListener('change', ()=>{
+    if(el.checked){ sysSyncDryWarn(); return; }
+    el.checked = true;
+    const ok = confirm(
+      '关闭「观察模式」= 真的会封 IP。\n\n'
+      + '处置经内核下发，DROP 是全端口的：一旦某个来源被误判，'
+      + '22 / 7080 / 8888 会一起进不去，面板也打不开，只能上云厂商控制台或 VNC 救机器。\n\n'
+      + '请先确认：① 常用出口 IP 已写进保护名单；② 「观察记录」里最近 24 小时的'
+      + '「本应封禁」量可信（无自己的来源）。\n\n'
+      + '确定要关闭观察模式吗？');
+    if(!ok){ sysSyncDryWarn(); return; }
+    el.checked = false;
+    sysSyncDryWarn();
+  });
+}
+async function loadSysdetect(){
+  sysBindDryConfirm();
+  try{
+    const c = (await api('/api/config')).data || {};
+    SYS_BOOL.forEach(k=>{ const e=$('#s_'+k); if(e) e.checked=!!c[k]; });
+    SYS_INT.forEach(k=>{ const e=$('#s_'+k); if(e) e.value=c[k]; });
+    const p=$('#s_sys_protect_ips');
+    if(p){ p.value = (c.sys_protect_ips===undefined?'':c.sys_protect_ips); }
+    sysPrevProtect = p ? p.value : null;
+    sysSyncDryWarn();
+  }catch(e){ if(e.message!=='unauthorized') toast('系统端口检测加载失败：'+e.message,'err'); }
+}
+async function saveSysdetect(){
+  const b={};
+  SYS_BOOL.forEach(k=>{ const e=$('#s_'+k); if(e) b[k]=e.checked; });
+  SYS_INT.forEach(k=>{ const e=$('#s_'+k); if(e) b[k]=+e.value||0; });
+  // 窗口必须 ≥1（后端会把 <1 回退成默认值，那会变成「保存成功但数字变了」）；
+  // 阈值 0 是合法的「只计数不处置」，不在这里拦。
+  if(b.sys_ssh_window!==undefined && b.sys_ssh_window<1){
+    return toast('计数窗口必须 ≥ 1 秒','err');
+  }
+  const p=$('#s_sys_protect_ips');
+  if(p) b.sys_protect_ips=p.value.trim();
+  if(p && !b.sys_protect_ips && sysPrevProtect){
+    if(!confirm('保护名单当前不为空，清空后将没有任何来源被豁免。\n'
+      + '若此时关闭观察模式，误判会直接把来源（包括你自己的出口 IP）封掉，'
+      + '而内核 DROP 是全端口的。\n\n确定要清空保护名单吗？')) return;
+  }
+  try{
+    const r = await api('/api/config','POST',b);
+    toast(r.msg||'已保存', (r.code? 'err':'ok'));
+    if(!r.code){ loadSysdetect(); sysEventPage(0); }
+  }catch(e){ toast(e.message,'err'); }
+}
+function sysEventReset(){
+  const ip=$('#fwSysIp'), ac=$('#fwSysAction');
+  if(ip) ip.value='';
+  if(ac) ac.value='';
+  sysEventPage(0);
+}
+async function sysEventClear(){
+  if(!confirm('确定清空全部观察记录？此操作不可恢复（只删记录，不解封任何 IP，也不改开关）。')) return;
+  try{
+    const r = await api('/api/sysdetect','POST',{action:'clear'});
+    toast(r.msg||'已清空','ok');
+    sysEventPage(0);
+  }catch(e){ toast(e.message,'err'); }
+}
+async function sysEventPage(page){
+  const lm=$('#fwSysLimit');
+  SYS_LIMIT = parseInt((lm&&lm.value)||'50',10)||50;
+  const ipEl=$('#fwSysIp'), acEl=$('#fwSysAction');
+  let q = 'limit='+SYS_LIMIT+'&page='+(page>0?page:1);
+  if(ipEl && ipEl.value.trim()) q += '&ip='+encodeURIComponent(ipEl.value.trim());
+  if(acEl && acEl.value) q += '&action='+encodeURIComponent(acEl.value);
+  try{
+    const r = await api('/api/sysdetect?'+q);
+    const rows = r.events||[];
+    sysRenderSummary(r.summary||{}, r.data||{});
+    const body=$('#fwSysEventBody');
+    if(body){
+      body.innerHTML = rows.map(x=>{
+        const act=String(x.action||'');
+        const label=esc(sysActionText(act));
+        const cell = act.indexOf('skipped')===0
+          ? `<span class="muted">${label}</span>`
+          : (act==='banned' ? `<span style="color:var(--err);font-weight:600">${label}</span>`
+                            : `<span style="color:var(--warn)">${label}</span>`);
+        return `<tr><td>${esc(fmtTime(x.ts))}</td><td>${esc(x.ip||'')}</td>`
+          + `<td class="muted">${esc(x.geo||'-')}</td>`
+          + `<td>${esc(x.hits||0)} / ${esc(x.window_sec||0)}s</td>`
+          + `<td>${cell}</td><td class="muted">${esc(x.reason||'-')}</td></tr>`;
+      }).join('') || `<tr><td class="muted" colspan="6" style="line-height:1.9;white-space:normal">`
+        + `观察期尚未触发，说明当前阈值下没有来源达线。<br>`
+        + `可以：① 保持观察继续等（非 frp 端口的探测并不均匀）；`
+        + `② 临时把「失败次数阈值」调低 + 窗口缩短后保存，再看这里是否出现「本应封禁」记录。</td></tr>`;
+    }
+    sysRenderPager(r);
+  }catch(e){ if(e.message!=='unauthorized') toast('观察记录加载失败：'+e.message,'err'); }
+}
+function sysRenderSummary(sum, st){
+  const box=$('#fwSysSummary');
+  if(!box) return;
+  const hours=sum.hours||24, reasons=sum.skipped_reasons||{};
+  const parts=Object.keys(reasons).sort().map(k=>sysActionText('skipped:'+k)+' '+reasons[k]);
+  const cfg=(st&&st.config)||{};
+  const mode = cfg.sys_detect_enabled ? (cfg.sys_detect_dry_run?'观察模式（不封禁）':'已开启封禁') : '检测已关闭';
+  const tail = (st&&st.tail) ? String(st.tail.path||'(未找到日志)') : '-';
+  box.innerHTML = `最近 ${hours} 小时：本应封禁 <b>${sum.observed||0}</b> 条 · `
+    + `实际封禁 <b style="color:var(--err)">${sum.banned||0}</b> 条 · `
+    + `被豁免 ${sum.skipped||0} 条`
+    + (parts.length ? '（'+esc(parts.join('、'))+'）' : '')
+    + `<br><span class="muted">当前状态：${esc(mode)} · 日志：${esc(tail)}`
+    + ` · 近 1 小时新增封禁 ${esc(st.bans_last_hour||0)} 条</span>`;
+}
+function sysRenderPager(d){
+  const box=$('#fwSysPager');
+  if(!box) return;
+  const page=d.page||1, pages=d.pages||0, total=d.total||0;
+  if(pages<=1){ box.innerHTML=`<span class="muted" style="font-size:12px">共 ${total} 条</span>`; return; }
+  box.innerHTML = `<button class="ghost sm" onclick="sysEventPage(${page-1})" ${page<=1?'disabled':''}>上一页</button>`
+    + `<span class="muted" style="font-size:12px">第 ${page} / ${pages} 页，共 ${total} 条</span>`
+    + `<button class="ghost sm" onclick="sysEventPage(${page+1})" ${page>=pages?'disabled':''}>下一页</button>`;
 }
 async function changePwd(){
   const old=$('#pwOld').value, nw=$('#pwNew').value;
@@ -1250,8 +1510,30 @@ async function loadKernban(){
       ['IPv4 条目', d.set4], ['IPv6 条目', d.set6],
       ['INPUT 规则', d.rule?'已挂载':'未挂载'], ['REDIRECT 规则', d.redirect?'已挂载':'未挂载'],
       ['REDIRECT 端口', (d.redirect_ports||[]).join(', ')||'-'], ['内核开关', d.enabled?'开':'关'],
+      ['来源计数', d.counters?'已启用':'未启用（存量集合自动重建后可用，不丢拦截）'],
     ].map(kvCard).join('');
+    renderKbTop(d.top);
   }catch(e){ toast(e.message||'加载失败','err'); }
+}
+/* 按内核丢弃包数排序的来源 Top N。三种实情分开表达：读不到 / 计数未启用 / 暂无命中。 */
+function renderKbTop(top){
+  const box = $('#kbTop');
+  if(!box) return;
+  top = top || {};
+  if(!top.available){ box.innerHTML = '<div class="muted">当前环境读不到内核计数，无法归因。</div>'; return; }
+  if(!top.counters){
+    box.innerHTML = '<div class="muted">集合尚未启用成员计数：下一次同步会做一次性重建（先建带计数的临时集合→填满成员→切换规则），重建期间应用层仍在拒绝，拦截能力不丢。同步后刷新本页即可看到。</div>';
+    return;
+  }
+  const items = top.items||[];
+  if(!items.length){ box.innerHTML = '<div class="muted">暂无命中记录（被封禁来源还没被内核丢过包）。</div>'; return; }
+  box.innerHTML = '<details><summary style="cursor:pointer;color:#1677d2;font-size:13px">展开丢弃来源 Top '+items.length+'（按包数排序，样本时间 '+fmtTime(top.sampled_at)+'）</summary>'
+    +'<div class="scroll" style="margin-top:8px"><table><thead><tr>'
+    +'<th>来源</th><th>丢弃包数</th><th>字节</th><th>剩余封禁</th></tr></thead><tbody>'
+    +items.map(x=>'<tr><td>'+esc(x.member)+'</td><td>'+esc(x.packets||0)+'</td>'
+      +'<td>'+esc(fmtBytes(x.bytes||0))+'</td>'
+      +'<td>'+esc((x.timeout||0)>0?fmtDur(x.timeout):'永久')+'</td></tr>').join('')
+    +'</tbody></table></div></details>';
 }
 async function kbSync(){
   if(!confirm('立即同步内核封禁规则？（高危操作，写入审计日志）')) return;

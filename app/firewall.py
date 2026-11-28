@@ -74,6 +74,13 @@ _MEMBERS = {}
 _sets_ok = False
 _sets_checked_at = 0.0
 _MISSING = object()
+# 集合 counters 能力状态（用于「按来源归因」）：
+#   unknown     - 未探测（进程刚启动）
+#   ok          - 集合已带 counters，稳态不再探测
+#   unsupported - 内核/ipset 不支持 counters，保持旧格式，不再尝试
+#   failed      - 一次性重建迁移失败且已回填，本进程不再重试（重启后再试）
+# 只有审计轮才会碰它，稳态 0 fork 的性质不受影响。
+_counters_state = "unknown"
 # _have() 的结果缓存：稳态下每轮会问十几次 PATH，缓存 5 分钟足够，
 # 又能在补装 ip6tables 后自愈（不缓存负结果到进程结束）。
 _WHICH_TTL = 300.0
@@ -227,19 +234,35 @@ def _norm(cidr):
     return str(net), net.version
 
 
+def _set_args(setname, v6=False, counters=True):
+    """`ipset create` 的 argv。counters 让集合按成员累计包数/字节数。
+
+    `-exist` 让存量集合不被视为错误（但它**不会**给已存在的集合补上 counters，
+    这就是 `_ensure_counters()` 要做一次性重建的原因）。
+    """
+    args = ["ipset", "create", setname, "hash:net"]
+    if v6:
+        args += ["family", "inet6"]
+    args += ["timeout", "0"]
+    if counters:
+        args += ["counters"]
+    args.append("-exist")
+    return args
+
+
 def _ensure_sets(force=False):
     """创建 ipset 集合（幂等；不含 iptables 规则）。
 
     已确认存在时直接返回（稳态 0 fork）；force 用于审计发现集合丢失后重建。
+    新建的集合带 `counters`，用于按来源归因被丢弃的流量（存量集合的升级见
+    `_ensure_counters()`）。
     """
     global _sets_ok
     if _sets_ok and not force:
         return True
-    ok = _apply(["ipset", "create", SET4, "hash:net", "timeout", "0", "-exist"],
-                "ipset.create4")
+    ok = _apply(_set_args(SET4), "ipset.create4")
     if _have("ip6tables"):
-        ok = _apply(["ipset", "create", SET6, "hash:net", "family", "inet6",
-                     "timeout", "0", "-exist"], "ipset.create6") and ok
+        ok = _apply(_set_args(SET6, v6=True), "ipset.create6") and ok
     _sets_ok = ok
     return ok
 
@@ -436,23 +459,82 @@ def _apply_rules(shape, ports, block_port):
 # ---------------------------------------------------------------------------
 # 集合内容同步
 # ---------------------------------------------------------------------------
+# `ipset list` 的表头/非成员行（小写比较）；`create ` 是 `ipset save` 的集合定义行。
+_IPSET_SKIP_PREFIX = (
+    "add ",  # 单独处理（save 形态）
+    "create ", "name:", "type:", "revision:", "header:",
+    "size in memory:", "references:", "number of entries:", "members:",
+)
+# 成员行里可识别的键（值紧跟在后面一个 token）
+_IPSET_KEYS = ("timeout", "packets", "bytes")
+
+
+def _parse_members(text, setname=None):
+    """解析 ipset 输出的成员行，返回 {成员: {timeout, packets, bytes}}。
+
+    必须同时吃下两种输出形态，否则集合一旦启用 counters 就解析不出成员：
+
+      ipset save（本模块同步/审计用的就是它）
+          add frpwaf_block 192.0.2.1 timeout 3500
+          add frpwaf_block 192.0.2.1 packets 7 bytes 588 timeout 3500   # 有 counters
+      ipset list（面板展示用，Members: 之后每行以成员开头）
+          192.0.2.1
+          192.0.2.1 timeout 3500
+          192.0.2.1 packets 7 bytes 588
+          192.0.2.1 timeout 3500 packets 7 bytes 588
+
+    因此解析不依赖 token 顺序与个数：成员固定在第 1（add 形态是第 2）列，
+    剩下的 token 成对地认 timeout/packets/bytes，不认识的跳过。
+    无法被 ipaddress 识别的行（表头残行、垃圾输出）直接丢弃。
+    """
+    res = {}
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if low.startswith("add "):
+            toks = line.split()
+            if len(toks) < 3:
+                continue
+            if setname is not None and toks[1] != setname:
+                continue                     # 多集合一起 save 时只认自己
+            member, rest = toks[2], toks[3:]
+        else:
+            if low.startswith(_IPSET_SKIP_PREFIX[1:]):
+                continue
+            toks = line.split()
+            member, rest = toks[0], toks[1:]
+        try:
+            ipaddress.ip_network(member, strict=False)
+        except ValueError:
+            continue
+        item = {"timeout": 0, "packets": 0, "bytes": 0}
+        i = 0
+        while i < len(rest) - 1:
+            key = rest[i].lower()
+            if key in _IPSET_KEYS:
+                try:
+                    item[key] = int(rest[i + 1])
+                except (TypeError, ValueError):
+                    pass
+                i += 2
+                continue
+            i += 1
+        res[member] = item
+    return res
+
+
 def _members(setname):
-    """返回 {member: timeout}，timeout<=0 表示永久。集合不存在时返回 None。"""
+    """返回 {member: timeout}，timeout<=0 表示永久。集合不存在时返回 None。
+
+    解析交给 `_parse_members`：启用 counters 之后 `ipset save` 的成员行会多出
+    `packets N bytes N`，这里只取 timeout 比对，计数不会因为对账被清掉。
+    """
     rc, out, _ = _run(["ipset", "save", setname])
     if rc != 0:
         return None
-    res = {}
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) >= 3 and parts[0] == "add" and parts[1] == setname:
-            t = 0
-            if "timeout" in parts:
-                try:
-                    t = int(parts[parts.index("timeout") + 1])
-                except (ValueError, IndexError):
-                    t = 0
-            res[parts[2]] = t
-    return res
+    return {m: v["timeout"] for m, v in _parse_members(out, setname).items()}
 
 
 def _abs_deadlines(cur, now):
@@ -531,7 +613,7 @@ def _reconcile(setname, want, cur=None):
             base = memo
 
     cmds = []
-    for m, exp in base.items():
+    for m in base:
         if m in want:
             continue
         # 已到期也必须主动 del，不能指望集合自身的 per-entry timeout：
@@ -560,12 +642,162 @@ def _reconcile(setname, want, cur=None):
     return True
 
 
+def _set_has_counters(setname):
+    """集合是否启用 counters（读 `ipset list -t` 的 Header 行）。
+
+    返回 True/False；集合不存在或输出无法识别时返回 None（视为「未知」，不做任何
+    改造）——宁可下一轮再看，也不能凭猜拆除一个正在拦截的集合。
+    """
+    rc, out, _ = _run(["ipset", "list", "-t", setname])
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        if line.strip().lower().startswith("header:"):
+            return "counters" in line.lower()
+    return None
+
+
+def _restore_rules():
+    """按当前配置重新挂 filter/nat 规则（集合换名后必须立刻调用）。
+
+    同时作废规则记忆（_RULES.mode = None）：否则 `_apply_rules()` 会因为在
+    VERIFY_INTERVAL 内命中记忆而直接返回 True，规则就真的丢了。
+    """
+    _RULES.update({"mode": None, "ports": (), "block_port": 0, "checked_at": 0.0})
+    try:
+        from . import config
+        cfg = config.get()
+    except Exception:
+        return False
+    mode = _mode(cfg)
+    if mode == "off":
+        return True                     # 关闭态本就不该有规则
+    if mode == "redirect":
+        ports = _redirect_ports(cfg)
+        if ports:
+            try:
+                block_port = int(cfg.get("block_page_port") or 7081)
+            except (TypeError, ValueError):
+                block_port = 7081
+            ok = _ensure_redirect(ports, block_port)
+            return _clear_drop() and ok
+    # drop 模式：先把 DROP 规则挂回去，再去清 nat（顺序很关键——换名后越早恢复
+    # DROP，内核丢包的空白就越短）
+    ok = _ensure_drop()
+    return _clear_redirect() and ok
+
+
+def _counters_failed(tmps):
+    """重建失败兜底：按目标快照重建集合与规则，保证拦截不中断。
+
+    tmps : [(集合名, 临时集合名, 目标快照)]
+    失败是「改造没做成」，绝不允许是「防护没了」：这里先把旧集合重新确保存在
+    （极端情况下降级为不带 counters），再把目标快照全量回填，最后重挂规则。
+    """
+    global _counters_state, _sets_ok
+    _counters_state = "failed"
+    _emit("集合 counters 改造未完成，已按数据库快照回填成员并重挂规则（拦截保持有效）")
+    ok = True
+    for setname, tmp, want in tmps:
+        _run(["ipset", "destroy", tmp])
+        _MEMBERS.pop(tmp, None)
+        if not _apply(_set_args(setname, setname == SET6), "ipset.create4"):
+            # 内核不支持 counters：退回旧格式，保证集合存在
+            _apply(_set_args(setname, setname == SET6, counters=False), "ipset.create4")
+        ok = _reconcile(setname, want, cur={}) and ok
+    _sets_ok = False        # 下一轮 _ensure_sets() 重新确认集合存在
+    return _restore_rules() and ok
+
+
+def _migrate_counters(sets):
+    """把无 counters 的存量集合重建为带 counters 的集合（一次性迁移）。
+
+    ipset 不支持给已存在的集合补加 counters（`create -exist` 会静默忽略），
+    所以必须 destroy 后重建。重建时序（关键：不允许「集合空了但没回填」的窗口）：
+
+      1. 先建临时集合 `<set>_mig`（带 counters），并一次性 restore 把本次要下发的
+         成员全填进去。这一步变慢也不影响拦截，旧集合仍在内核里生效；
+      2. 摘下引用旧集合的 iptables 规则（ipset 拒绝 destroy 仍被引用的集合），
+         旧集合仍在、只是不再参与匹配；
+      3. destroy 旧集合 -> rename 临时集合为正式名（名字必须换回，否则规则里的
+         --match-set 名对不上）；
+      4. 立刻重挂规则（_restore_rules），窗口到此结束。
+
+    真正的防护空窗只在第 2～4 步之间（destroy + rename + 挂规则共几条命令，
+    毫秒级）；而这期间应用层（engine.decide）仍在按同一份名单拒绝连接，
+    只是失去「在内核就丢包、省掉 TCP 握手」的加成。
+
+    任一步失败 -> _counters_failed()：回填成员并重挂规则，绝不留空集合。
+    """
+    global _counters_state
+    tmps = []
+    for setname, want in sets:
+        tmp = setname + "_mig"
+        if not _apply(_set_args(tmp, setname == SET6), "ipset.create.mig"):
+            # 内核/ipset 版本不支持 counters：旧集合原封不动，放弃改造
+            _run(["ipset", "destroy", tmp])
+            _counters_state = "unsupported"
+            _emit("当前 ipset 不支持 counters，跳过来源归因改造（拦截能力不受影响）")
+            return True
+        tmps.append((setname, tmp, want))
+        if not _reconcile(tmp, want, cur={}):
+            return _counters_failed(tmps)      # 临时集合没填满：不拆旧的
+    # 摘掉引用旧集合的规则（ipset 拒绝 destroy 仍被引用的集合）。
+    # 顺序：先清 nat（不影响 DROP 拦截），最后摘 DROP，让「无 DROP 规则」的
+    # 窗口紧贴 destroy/rename，缩到最小。
+    _clear_redirect()
+    _clear_drop()
+    for setname, tmp, want in tmps:
+        _run(["ipset", "destroy", setname])
+        rc, _out, err = _run(["ipset", "rename", tmp, setname])
+        if rc != 0:
+            _report_failure("ipset.rename." + setname,
+                            ["ipset", "rename", tmp, setname], rc, err)
+            return _counters_failed(tmps)
+        _MEMBERS.pop(tmp, None)
+        _MEMBERS[setname] = dict(want)
+    _restore_rules_ok = _restore_rules()
+    _counters_state = "ok"
+    _emit("内核封禁集合已升级为带 counters 的格式（按来源归因可用）")
+    # 规则没挂回去不算成功：把失败带进 _sync_sets 的返回值，面板/日志才看得见
+    # （下一轮同步会因 _RULES.mode=None 立即重试）
+    return _restore_rules_ok
+
+
+def _ensure_counters(want4, want6):
+    """确保集合带 counters（只在审计轮调用，稳态 0 fork）。
+
+    返回 True 表示「已具备 counters 或无需/无法改造」——本函数不参与同步成败，
+    因为 counters 只服务于面板归因展示，不能因为它连累封禁同步的返回值。
+    """
+    global _counters_state
+    if _counters_state in ("ok", "unsupported", "failed"):
+        return True
+    sets = [(SET4, want4)]
+    if _have("ip6tables"):
+        sets.append((SET6, want6))
+    need = False
+    for setname, _want in sets:
+        has = _set_has_counters(setname)
+        if has is None:
+            return True         # 读不到：下一轮审计再看，不动正在生效的集合
+        if not has:
+            need = True
+    if not need:
+        _counters_state = "ok"
+        return True
+    return _migrate_counters(sets)
+
+
 def _sync_sets(want4, want6):
     """确保集合存在并下发差量；每 VERIFY_INTERVAL 秒做一次全量核对。"""
     global _sets_checked_at
     now = time.time()
     audit = (now - _sets_checked_at >= VERIFY_INTERVAL)
     ok = _ensure_sets()
+    if audit:
+        # 存量集合的 counters 升级只在这里做：它需要重建集合，不能进稳态路径
+        ok = _ensure_counters(want4, want6) and ok
     for setname, want in ((SET4, want4), (SET6, want6)):
         if setname == SET6 and not _have("ip6tables"):
             continue
@@ -824,9 +1056,13 @@ def teardown():
 
 
 def status():
-    """返回给界面展示的状态。"""
+    """返回给界面展示的状态。
+
+    `counters` 表示集合是否带成员计数器（来源归因可用）；存量集合未升级前为
+    False，面板据此提示「计数未启用」。
+    """
     info = {"available": available(), "enabled": False, "mode": "off",
-            "set4": 0, "set6": 0, "rule": False,
+            "set4": 0, "set6": 0, "rule": False, "counters": False,
             "redirect": False, "redirect_ports": []}
     if not info["available"]:
         return info
@@ -847,8 +1083,286 @@ def status():
                         info[key] = int(line.split(":", 1)[1].strip())
                     except ValueError:
                         pass
+                elif (line.strip().lower().startswith("header:")
+                      and "counters" in line.lower()):
+                    info["counters"] = True
     rc, _, _ = _run(["iptables", "-C", "INPUT", "-j", CHAIN])
     info["rule"] = (rc == 0)
     rc, _, _ = _run(["iptables", "-t", "nat", "-C", "PREROUTING", "-j", NAT_CHAIN])
     info["redirect"] = (rc == 0)
     return info
+
+
+# 概览页轮询读计数器：缓存窗口内只 fork 一次（与 config/engine 的短 TTL 同风格）。
+# 计数器只增不减，几秒延迟不影响展示结论，所以缓存比实时性更重要。
+DROP_STATS_TTL = 8.0
+# `-L` 是只读查询，但仍然是 fork：超时必须短，概览接口不能被它拖住。
+DROP_STATS_TIMEOUT = 3
+_drop_stat = {"at": 0.0, "cached": None}
+_drop_stat_lock = threading.Lock()
+
+# 速率副线：把每次「真正取值」的 (时刻, 包数) 并入一个近 60 秒的采样环，
+# 用「最旧样本 -> 最新样本」的差分算包/秒（概览 8 秒一次，环里通常 7~8 点）。
+DROP_RATE_WINDOW = 60.0        # 统计窗口（秒），与面板文案「近 1 分钟」对应
+DROP_RATE_MIN_SPAN = 2.0       # 两个样本间隔过短则不出速率（除零以外的噪声保护）
+_drop_ring = []                # [(at, pkts)]，按时间升序
+_drop_ring_lock = threading.Lock()
+
+
+def _drop_rate_reset():
+    """清空采样环（内核计数不可用时调用，避免下次恢复时拿陈样本算差分）。"""
+    with _drop_ring_lock:
+        del _drop_ring[:]
+
+
+def _drop_rate_sample(at, pkts):
+    """把一次采样并入 60 秒环，返回 (包/秒, 实测窗口秒数)。
+
+    计数回退必须当异常处理：`flush()` 里的 `iptables -F CHAIN`、规则重建、
+    teardown 都会让链计数归零，直接相减会得到负数（实测能算出 -3310614）。
+    此时丢弃旧采样、以本次为新基线，返回 (None, 0) 让面板显示 `—`，
+    绝不把负数抛到界面上（那会被误读成「负向丢弃」）。
+    """
+    with _drop_ring_lock:
+        if _drop_ring and pkts < _drop_ring[-1][1]:
+            del _drop_ring[:]                  # 计数回退：旧样本作废
+            _drop_ring.append((at, pkts))
+            return None, 0.0
+        _drop_ring.append((at, pkts))
+        cutoff = at - DROP_RATE_WINDOW
+        while len(_drop_ring) > 1 and _drop_ring[0][0] < cutoff:
+            _drop_ring.pop(0)                  # 只留窗口内的样本
+        first_at, first_pkts = _drop_ring[0]
+        span = at - first_at
+        if span < DROP_RATE_MIN_SPAN:
+            return None, 0.0
+        return round((pkts - first_pkts) / span, 3), round(span, 1)
+
+
+# iptables 的计数列在 `-v` 下会写成 3311K / 194M 这种缩写，而那套后缀是
+# **十进制**（1000/1e6/1e9），不是 1024 进制——直接 int() 会抛 ValueError，
+# 被吞掉后整个计数器就变 0（上线后卡片恒显示 0，而测试用完整整数样本看不出来）。
+_COUNTER_UNITS = {"k": 1000, "m": 1000 ** 2, "g": 1000 ** 3, "t": 1000 ** 4}
+
+
+def _parse_counter(text):
+    """解析计数列（`3310526` 或 `3311K` / `194M`），无法解析返回 None。
+
+    取数已经加了 `-x` 要求精确值，这里仍然容错解析缩写：老版本 iptables 与个别
+    发行版对 `-x` 的处理不一致，且不能因为参数被人改动就静默退回 0。
+    负数与非法值一律视为解析失败（返回 None），由调用方跳过该行。
+    """
+    s = (text or "").strip()
+    if not s:
+        return None
+    unit = 1
+    if s[-1].lower() in _COUNTER_UNITS:
+        unit = _COUNTER_UNITS[s[-1].lower()]
+        s = s[:-1]
+    try:
+        val = float(s)
+    except ValueError:
+        return None
+    if val < 0:
+        return None
+    return int(val * unit)
+
+
+def _parse_drop_counters(text):
+    """解析 `-L <chain> -v -n [-x]` 的输出，返回 (包数, 字节数, 数据行数)。
+
+    只认「前两列都是可解析计数」的行：表头 `pkts bytes target prot opt in out
+    source destination` 与 `Chain <name> (N references)` 都会被跳过，其余无法
+    解析的行同样跳过——宁可少算一行，也不要让整个概览因为一行怪输出失败
+    （计数器只用于展示，不是决策依据）。
+
+    两列必须**同时**可解析才计入：否则 `3311K 194M` 与 `0.0.0.0/0` 这类行会把
+    包数与字节数撕裂成不同行的组合。
+    """
+    pkts = 0
+    nbytes = 0
+    rows = 0
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if not s or s.startswith(("Chain", "pkts")):
+            continue
+        parts = s.split()
+        if len(parts) < 2:
+            continue
+        p = _parse_counter(parts[0])
+        b = _parse_counter(parts[1])
+        if p is None or b is None:
+            continue
+        pkts += p
+        nbytes += b
+        rows += 1
+    return pkts, nbytes, rows
+
+
+def _read_drop_counters():
+    """真正去读一次内核链计数器，返回 {available, pkts, bytes}。
+
+    IPv4 与 IPv6 两条链的计数**相加**（同一个「被丢弃的包」只会走其中一族）。
+    任何一步不可用（非 root、没有 iptables、链不存在、命令超时）都只让
+    available=False，绝不抛异常：这是展示用取数，不能把概览整体打成 500。
+
+    只用 `-L`（只读）。绝不为了看计数去 `-Z` 清零或改规则——那会毁掉别人的计数。
+    """
+    out = {"available": False, "pkts": 0, "bytes": 0}
+    try:
+        if not available():
+            return out
+        tools = []
+        if _have("iptables"):
+            tools.append("iptables")
+        if _have("ip6tables"):
+            tools.append("ip6tables")
+        seen = 0
+        for tool in tools:
+            # `-x` 是「精确计数、不缩写」。没有它，`-v` 会把计数写成 `3311K` /
+            # `194M`，解析就拿不到可用数字（实测真机如此）。
+            rc, text, _err = _run([tool, "-L", CHAIN, "-v", "-n", "-x"],
+                                  timeout=DROP_STATS_TIMEOUT)
+            if rc != 0:
+                # 链不存在 / 权限不足 / 超时：跳过这一族，不影响另一族
+                continue
+            p, b, _rows = _parse_drop_counters(text)
+            out["pkts"] += p
+            out["bytes"] += b
+            seen += 1
+        out["available"] = seen > 0
+    except Exception:
+        return {"available": False, "pkts": 0, "bytes": 0}
+    return out
+
+
+def drop_stats(force=False):
+    """内核链累计丢弃计数 + 近 1 分钟速率（带 TTL 缓存），供面板概览展示。
+
+    `force=True` 跳过缓存重新读（人工刷新/同步后立即回显用）。
+    缓存只在 TTL 到期或显式 force 时失效；fork 在锁外进行，避免并发的
+    概览请求相互串行等待。
+
+    返回值在旧的三个键之外新增：
+      - rate / rate_window：近 60 秒平均丢弃速率（包/秒）。取不到或计数回退时
+        rate=None（面板显示 `—`），绝不返回负数；
+      - mode：drop / redirect / off，用于向面板说明「redirect 模式下内核丢弃
+        计数本就不增长」（不然 0 包/秒会被误读成「没人在攻击」）。
+    """
+    now = time.time()
+    with _drop_stat_lock:
+        cached = _drop_stat["cached"]
+        if cached is not None and not force and now - _drop_stat["at"] < DROP_STATS_TTL:
+            return dict(cached)
+    res = _read_drop_counters()
+    at = time.time()
+    if res.get("available"):
+        rate, window = _drop_rate_sample(at, int(res.get("pkts") or 0))
+    else:
+        _drop_rate_reset()
+        rate, window = None, 0.0
+    res = dict(res, rate=rate, rate_window=window, mode=_current_mode())
+    with _drop_stat_lock:
+        _drop_stat["at"] = now
+        _drop_stat["cached"] = res
+    return dict(res)
+
+
+def _current_mode():
+    """当前内核处置模式；读不到配置时返回空串（面板按未知处理）。"""
+    try:
+        from . import config
+        return _mode(config.get())
+    except Exception:
+        return ""
+
+
+def drop_fields(force=False):
+    """概览接口的内核计数字段（插件端与 Web 端共用，避免两端口径漂移）。
+
+    `kern_drop_rate` 为 None 表示「还没测得」（刚启动 / 计数刚回退 / 读不到），
+    面板必须渲染成 `—` 而不是 0——0 是一个结论，`—` 是「不知道」。
+    """
+    st = drop_stats(force=force)
+    rate = st.get("rate")
+    return {"kern_dropped": int(st.get("pkts") or 0),
+            "kern_dropped_bytes": int(st.get("bytes") or 0),
+            "kern_drop_available": bool(st.get("available")),
+            "kern_drop_rate": (None if rate is None else float(rate)),
+            "kern_drop_rate_window": float(st.get("rate_window") or 0),
+            "kern_drop_mode": str(st.get("mode") or "")}
+
+
+# 来源归因：`ipset list` 的成员行带 packets/bytes（需集合创建时带 counters）。
+# 与概览同一风格：短 TTL 缓存，避免「切到内核封禁页」就 fork 两次。
+TOP_TTL = 10.0
+TOP_MAX = 50
+_top_stat = {"at": 0.0, "cached": None}
+_top_stat_lock = threading.Lock()
+
+
+def _read_top():
+    """读一次两族集合的成员计数，返回 {available, counters, items}。
+
+    items 已按丢弃包数降序排序（同包数按成员名排序，保证输出稳定）。
+    只读 `ipset list`，不改任何状态；任何异常/不可用一律降级为空结果。
+    """
+    out = {"available": False, "counters": False, "items": []}
+    try:
+        if not available():
+            return out
+        items = []
+        seen = 0
+        for setname in (SET4, SET6):
+            if setname == SET6 and not _have("ip6tables"):
+                continue
+            rc, text, _err = _run(["ipset", "list", setname],
+                                  timeout=DROP_STATS_TIMEOUT)
+            if rc != 0:
+                continue
+            seen += 1
+            for line in text.splitlines():
+                if (line.strip().lower().startswith("header:")
+                        and "counters" in line.lower()):
+                    out["counters"] = True
+            for member, v in _parse_members(text, setname).items():
+                if not v["packets"] and not v["bytes"]:
+                    continue                # 没命中过（或未启用 counters）
+                items.append({"member": member, "packets": v["packets"],
+                              "bytes": v["bytes"], "timeout": v["timeout"]})
+        out["available"] = seen > 0
+        items.sort(key=lambda x: (-x["packets"], x["member"]))
+        out["items"] = items
+    except Exception:
+        return {"available": False, "counters": False, "items": []}
+    return out
+
+
+def top_sources(limit=10, force=False):
+    """按内核丢弃包数排序的来源 Top N（只读，10 秒缓存）。
+
+    `counters=False` 表示集合尚未带计数器（面板据此提示「需重建集合」或
+    「拦截计数未启用」），此时 items 必然为空；两者要分开表达，不能都用空列表
+    糊弄过去——那是「不知道」而不是「没有攻击来源」。
+    """
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 10
+    limit = max(1, min(limit, TOP_MAX))
+    now = time.time()
+    with _top_stat_lock:
+        cached = _top_stat["cached"]
+        if cached is not None and not force and now - _top_stat["at"] < TOP_TTL:
+            res, at = cached, _top_stat["at"]
+        else:
+            res, at = None, now
+    if res is None:
+        res = _read_top()
+        with _top_stat_lock:
+            _top_stat["at"] = at
+            _top_stat["cached"] = res
+    return {"available": bool(res.get("available")),
+            "counters": bool(res.get("counters")),
+            "sampled_at": int(at),
+            "items": [dict(x) for x in (res.get("items") or [])[:limit]]}

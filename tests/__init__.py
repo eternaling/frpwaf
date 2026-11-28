@@ -24,7 +24,7 @@ _BOOT_HOME = tempfile.mkdtemp(prefix="frpwaf-tests-boot-")
 # 必须在 import app.* 之前设置（见模块 docstring）
 os.environ["FRPWAF_HOME"] = _BOOT_HOME
 
-from app import config, engine, firewall, store  # noqa: E402
+from app import config, engine, firewall, store, sysdetect  # noqa: E402
 
 
 def new_home(test=None):
@@ -85,6 +85,19 @@ def reset_caches():
     firewall._sets_checked_at = 0.0
     firewall._which_cache.clear()
     firewall._fail_log.clear()
+    # 集合 counters 能力探测状态（否则上个用例的「已确认 / 已放弃」会漏到下一个用例）
+    firewall._counters_state = "unknown"
+    # 概览用的内核计数器缓存与速率采样环（否则上个用例的打桩结果会漏到下一个用例）
+    firewall._drop_stat["at"] = 0.0
+    firewall._drop_stat["cached"] = None
+    del firewall._drop_ring[:]
+    # 来源归因缓存
+    firewall._top_stat["at"] = 0.0
+    firewall._top_stat["cached"] = None
+    # 系统端口检测：tail 位置 / 滑窗计数 / 活跃会话 / 限频告警时间
+    # （不清就会把上个用例的「已认领」计数与跳末尾位置带进下一个用例）
+    sysdetect.reset_state()
+    sysdetect._alert_at.clear()
 
 
 def under_temp(path):

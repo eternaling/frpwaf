@@ -124,6 +124,25 @@ CREATE TABLE IF NOT EXISTS trust_login_ip (
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL
 );
+-- 系统端口（非 frp 端口）检测事件：只增不改，供「先观察再收紧」时看真实分布。
+-- 为什么单独一张表而不写 conn_log：conn_log 会被 ai._collect() 按 IP 聚合送审，
+-- 而系统端口事件没有 proxy_name/proxy_type，写进去既污染 AI 判据，也会让
+-- store.bump_proxy() 的代理统计出现假条目。
+-- action 取值：observed（试运行，本应封禁）/ banned / skipped:<原因>。
+CREATE TABLE IF NOT EXISTS sys_event (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    ip TEXT NOT NULL,
+    source TEXT DEFAULT '',        -- sshd / conn / hook
+    port INTEGER DEFAULT 0,
+    hits INTEGER DEFAULT 0,        -- 窗口内命中次数
+    window_sec INTEGER DEFAULT 0,
+    action TEXT DEFAULT '',
+    reason TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_sys_event_ts ON sys_event(ts);
+CREATE INDEX IF NOT EXISTS idx_sys_event_ip ON sys_event(ip);
+CREATE INDEX IF NOT EXISTS idx_sys_event_action ON sys_event(action, id);
 """
 
 
@@ -977,6 +996,156 @@ def clear_trusted_login_ips():
     return cur.rowcount
 
 
+# ---------------- 系统端口检测事件（sys_event） ----------------
+
+def add_sys_event(ts, ip, source="", port=0, hits=0, window_sec=0,
+                  action="", reason=""):
+    """写一条系统端口检测事件（试运行/已处置都写），返回其 id。
+
+    「只观察不封禁」模式唯一的可观测产物就是这张表：没有它，dry-run 期间
+    无从判断阈值定得对不对。写入失败照常向外抛，由调用方限频告警。
+    """
+    cur = _exec(
+        "INSERT INTO sys_event(ts,ip,source,port,hits,window_sec,action,reason)"
+        " VALUES(?,?,?,?,?,?,?,?)",
+        (int(ts or time.time()), str(ip or ""), source or "", int(port or 0),
+         int(hits or 0), int(window_sec or 0), action or "", reason or ""),
+    )
+    return int(cur.lastrowid or 0)
+
+
+def list_sys_event(limit=200, ip=None, action=None, offset=0):
+    """系统端口检测事件（面板展示，只读）。支持按 IP / action 前缀过滤 + 偏移分页。
+
+    分页用 `offset` 而不是页码：排序键是自增 id（`ORDER BY id DESC`），
+    新事件不断插入时页码会整体漂移（翻页看到重复/漏项）；偏移分页同样会漂，
+    但至少“新事件只影响前面几页”，是面板场景里代价最小的一种。
+    """
+    sql = "SELECT * FROM sys_event"
+    args = []
+    cond = []
+    if ip:
+        cond.append("ip=?")
+        args.append(str(ip))
+    if action:
+        # 前缀过滤：面板「只看本应封禁」传 observed，「只看已封禁」传 banned，
+        # 「只看被豁免」传 skipped 即可命中 skipped:<原因> 全部条目。
+        cond.append("substr(action,1,?)=?")
+        args.extend([len(str(action)), str(action)])
+    if cond:
+        sql += " WHERE " + " AND ".join(cond)
+    sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+    args.append(int(limit))
+    args.append(max(0, int(offset or 0)))
+    return _query_ro(sql, tuple(args))
+
+
+def summary_sys_event(since=0):
+    """时间区间内的事件汇总（面板顶部「阈值是否合适」的判断依据，只读）。
+
+    返回：
+        {"since": ts, "total": n, "observed": n, "banned": n, "skipped": n,
+         "skipped_reasons": {"whitelist": n, ...}}
+
+    `skipped` 的 action 形如 `skipped:<原因>`（见 sysdetect._protected_reason），
+    按冒号后的原因分组：观察期看到一堆 `protect-cidr` 说明保护段写生效了，
+    一堆 `trust-login` 说明 owner 自己一直命中，而 `circuit` 多说明该调熔断上限。
+
+    用 GROUP BY action 让数据库做聚合（不把全表拉进内存）：sys_event 会被后台
+    tick 裁剪到 5000 条，但 24 小时窗口内仍可能有几千条。
+    """
+    sql = "SELECT action, COUNT(*) AS n FROM sys_event"
+    args = []
+    try:
+        since = int(since or 0)
+    except (TypeError, ValueError):
+        since = 0
+    if since > 0:
+        sql += " WHERE ts>=?"
+        args.append(since)
+    sql += " GROUP BY action"
+    rows = _query_ro(sql, tuple(args))
+    out = {"since": since, "total": 0, "observed": 0, "banned": 0,
+           "skipped": 0, "skipped_reasons": {}}
+    for r in rows:
+        try:
+            n = int((r or {}).get("n") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        action = str((r or {}).get("action") or "")
+        out["total"] += n
+        if action == "observed":
+            out["observed"] += n
+        elif action == "banned":
+            out["banned"] += n
+        elif action.startswith("skipped"):
+            out["skipped"] += n
+            why = action.split(":", 1)[1] if ":" in action else "unknown"
+            out["skipped_reasons"][why] = \
+                out["skipped_reasons"].get(why, 0) + n
+    return out
+
+
+def count_sys_event(ip=None, action=None):
+    """事件条数（概览/健康检查用；条件口径与 list_sys_event 一致）。"""
+    sql = "SELECT COUNT(*) AS n FROM sys_event"
+    args = []
+    cond = []
+    if ip:
+        cond.append("ip=?")
+        args.append(str(ip))
+    if action:
+        cond.append("substr(action,1,?)=?")
+        args.extend([len(str(action)), str(action)])
+    if cond:
+        sql += " WHERE " + " AND ".join(cond)
+    rows = _query_ro(sql, tuple(args))
+    try:
+        return int((rows[0] or {}).get("n") or 0)
+    except (IndexError, TypeError, ValueError):
+        return 0
+
+
+def trim_sys_event(max_rows=5000):
+    """裁剪最旧的系统端口事件，保留最近 max_rows 条（后台 tick 调用）。
+
+    与 trim_logs/trim_ai_review 同一套写法（MIN/MAX(id) 做 O(1) 预判，
+    确认超限后才发一条 DELETE），理由见 trim_logs 的 docstring。
+    """
+    try:
+        max_rows = int(max_rows)
+    except (TypeError, ValueError):
+        return
+    if max_rows < 0:
+        max_rows = 0
+    rows = _query_ro(
+        "SELECT (SELECT MIN(id) FROM sys_event) AS lo,"
+        " (SELECT MAX(id) FROM sys_event) AS hi"
+    )
+    if not rows:
+        return
+    lo, hi = rows[0]["lo"], rows[0]["hi"]
+    if lo is None or hi is None:
+        return
+    excess = hi - lo + 1 - max_rows
+    if excess <= 0:
+        return
+    _exec(
+        "DELETE FROM sys_event WHERE id IN "
+        "(SELECT id FROM sys_event ORDER BY id ASC LIMIT ?)",
+        (excess,),
+    )
+
+
+def purge_sys_event():
+    """清空系统端口检测事件（面板「清空观察记录」用），返回删除条数。"""
+    cur = _exec("DELETE FROM sys_event")
+    try:
+        return int(cur.rowcount or 0)
+    except (TypeError, ValueError):       # pragma: no cover - 防御性
+        return 0
+
+
 def clear_blacklist():
     """清空黑名单全部条目（一键解封永久封禁），返回删除条数。
 
@@ -1580,10 +1749,18 @@ def trim_ai_review(max_rows=5000):
 def stats():
     """概览统计（面板 /api/overview 与插件端 waf_overview，纯展示）。
 
-    7 次聚合在大表上可达几十毫秒（`COUNT(DISTINCT ip)` 与多次全表 COUNT），
+    多次聚合在大表上可达几十毫秒（`COUNT(DISTINCT ip)` 与多次全表 COUNT），
     迁移前全程占着全局 _lock，把这期间的每连接决策写入都堵在后面。现在：
       - 全部走只读连接，共用一条（避免每次新建连接）；
       - 不占全局 _lock，与决策路径的写入/缓存重建完全解耦。
+
+    连接口径有两套，各自解决一个问题，都在返回值里（只增不改）：
+      - `conns_24h`：近 24 小时窗口内的连接数。滑动窗口，不随日志裁剪饱和；
+      - `conns_total`：`sqlite_sequence.seq`，即 `conn_log` 自建库以来被插入过的
+        总条数（含后来被裁剪掉的、以及被拒绝的连接）。DELETE 与 VACUUM 都不回退
+        该计数器，所以它是唯一能表示「真累计」的零迁移口径；
+      - `total_conns`：`conn_log` **现存行数**（受 `log_max_rows` 裁剪），保留是
+        为了兼容旧前端/旧插件版本，面板已不再把它当主值展示。
     """
     # 「今日」按服务器本地时区零点计算（面板展示的是本地时间）。
     # 注意：不可用 (ts // 86400 * 86400)，那是 UTC 零点，在东八区 00:00-08:00
@@ -1599,6 +1776,20 @@ def stats():
         # 每条 SQL 都写成字面量：既符合“参数必定绑定”的可审计要求，
         # 也让习惯读 SQL 就能定位索引的人一眼看出走的哪条索引。
         total = val(c.execute("SELECT COUNT(*) FROM conn_log").fetchone())
+        # 近 24 小时连接：`ts>=?` 走 idx_conn_log_ts 覆盖索引，20 万行实测 0.2ms。
+        since24 = now - 86400
+        conns_24h = val(c.execute(
+            "SELECT COUNT(*) FROM conn_log WHERE ts>=?", (since24,)).fetchone())
+        # 真累计：读 AUTOINCREMENT 的分配计数器。老库/异常时退化为现存行数
+        # （宁可少算成「窗口量」，也不要抛异常把整个概览打成 500）。
+        conns_total = total
+        try:
+            row = c.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name='conn_log'").fetchone()
+            if row is not None and row[0] is not None:
+                conns_total = int(row[0])
+        except sqlite3.Error:
+            pass
         today = val(c.execute(
             "SELECT COUNT(*) FROM conn_log WHERE ts>=?", (today0,)).fetchone())
         rejected = val(c.execute(
@@ -1614,8 +1805,19 @@ def stats():
         uniq = val(c.execute(
             "SELECT COUNT(DISTINCT ip) FROM conn_log WHERE ts>=?",
             (today0,)).fetchone())
+        # 近 24h 新增封禁：临时封禁写入与永久名单写入各算一条（面板口径是
+        # 「条目数」，不是去重 IP 数）。两个子查询合一，只发一次 SQL：
+        # 分别走 idx_ban_log_ip（banned_at 无条件过滤）与 ip_list 的 type 索引。
+        bans_24h = val(c.execute(
+            "SELECT (SELECT COUNT(*) FROM ban_log WHERE banned_at>=?)"
+            " + (SELECT COUNT(*) FROM ip_list"
+            "    WHERE list_type='black' AND created_at>=?)",
+            (since24, since24)).fetchone())
     return {
         "total_conns": total,
+        "conns_24h": conns_24h,
+        "conns_total": conns_total,
+        "bans_24h": bans_24h,
         "today_conns": today,
         "today_rejected": rejected,
         "today_uniq_ip": uniq,

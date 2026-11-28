@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # 相对导入：无论本包以 app 还是 frpwaf_app 名字载入都能正确解析，
 # 避免在面板常驻进程里与外部通用 "app" 包冲突。
 from . import (__author__, __version__, ai, auth, blockpage, config, engine,  # noqa: E402
-               firewall, geo, job, store, upgrade)
+               firewall, geo, job, store, sysdetect, upgrade)
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
 
@@ -777,6 +777,30 @@ def _need_choice(body, key, choices, default=None):
     return v
 
 
+def _sysdetect_query(qs):
+    """解析 `/api/sysdetect` 的 GET 查询参数，返回规范化后的 (limit, offset, ip, action, hours)。
+
+    单独抽出来是为了让 `_api_sysdetect` 保持可读：参数都有缺省值与上限，
+    非法值一律回退默认而不是报错（这是个只读展示接口，不该因为前端少传一个
+    参数就红一片）。分页同时接受 offset 与 page（page 仅在未给 offset 时生效）。
+    """
+    lim = _int(qs.get("limit", [50])[0])
+    if lim <= 0 or lim > 500:
+        lim = 50
+    offset = _int(qs.get("offset", [""])[0])
+    if offset < 0:
+        offset = 0
+    page = _int(qs.get("page", [""])[0])
+    if "offset" not in qs and page > 0:
+        offset = (page - 1) * lim
+    ip = str(qs.get("ip", [""])[0] or "").strip()
+    action = str(qs.get("action", [""])[0] or "").strip()
+    hours = _int(qs.get("hours", [""])[0])
+    if hours <= 0 or hours > 720:
+        hours = 24
+    return lim, offset, ip, action, hours
+
+
 def _need_cidr(body, key="cidr", default=None):
     """取 IP/CIDR 入参：必须是字符串且能被 ipaddress 解析，返回规范化结果。
 
@@ -983,6 +1007,10 @@ _ROUTES = {
     "/api/upgrade/apply": ({"POST"}, "_api_upgrade_apply"),   # 原为 and method == "POST"
     "/api/service": ({"POST"}, "_api_service"),           # 原为 and method == "POST"
     "/api/syslog": ({"GET", "POST"}, "_api_syslog"),
+    # 系统端口（非 frp 端口）检测：观察记录列表 + 清空。
+    # P0 只输只读观察（GET 事件列表 / POST action=clear），不在这里做设置项编辑：
+    # 开关与阈值先只走配置文件，避免在 dry-run 定阈前就把它变成「随手可改的按钮」。
+    "/api/sysdetect": ({"GET", "POST"}, "_api_sysdetect"),
     "/api/version": ({"GET", "POST"}, "_api_version"),
 }
 
@@ -1391,6 +1419,15 @@ class Handler(BaseHTTPRequestHandler):
         st["strict_addr"] = bool(cfg.get("strict_addr", False))
         st["ai_allow_private"] = _allow_private_ai(cfg)
         st["geo_available"] = geo.db_info().get("available", False)
+        # 内核层丢弃：命中 ipset 的包在 INPUT 链被 DROP，根本到不了 frps，
+        # 也就不会写 conn_log（「今日拦截」只能统计到达 WAF 的连接）。
+        # 故单独读 iptables 计数器展示：只读 -L、带 8 秒缓存、读不到就降级。
+        try:
+            st.update(firewall.drop_fields())
+        except Exception:
+            # 取数炸了也不能让整个概览 500：三个字段降级为「不可用」
+            st.update({"kern_dropped": 0, "kern_dropped_bytes": 0,
+                       "kern_drop_available": False})
         return self._json({"code": 0, "data": st})
 
     def _api_config(self, cfg, qs, method):
@@ -1463,6 +1500,18 @@ class Handler(BaseHTTPRequestHandler):
             "block_page_addr": str,
             # 安全水位告警 webhook（空 = 关闭；保存后立即生效，无需重启）
             "alert_webhook": str,
+            # 系统端口（非 frp 端口）检测：开关 + 阈值参数 + 保护网段。
+            # 这些键原先只能手改配置文件，现在走面板；**类型校验统一在下面**，
+            # 但 sys_protect_ips 还需要额外的 CIDR 格式校验（见后面的单独分支）。
+            "sys_detect_enabled": bool, "sys_detect_dry_run": bool,
+            "sys_trust_ssh_login": bool,
+            "sys_ssh_threshold": int, "sys_ssh_window": int,
+            "sys_ssh_ban_seconds": int, "sys_ban_max_seconds": int,
+            "sys_ban_max_per_hour": int, "sys_ssh_poll_interval": int,
+            "sys_ssh_max_lines": int,
+            # 日志路径（留空=自动探测）与「永不封禁网段」列表。
+            # sys_protect_ips 额外过 CIDR 校验（见下方单独分支），这里只定类型。
+            "sys_protect_ips": str, "sys_ssh_log": str,
         }
         # 新增开关（不配置时保持旧行为）：宽松布尔解析，避免 "false" 被当成 True。
         #   strict_addr：地址解析失败时拒连（fail-closed）
@@ -1506,6 +1555,20 @@ class Handler(BaseHTTPRequestHandler):
         if _bad:
             return self._json({"code": 1, "msg": "以下设置项的值类型不正确：%s"
                                % "、".join(_bad[:6])})
+        # ---- 系统端口检测：保护网段的 CIDR 校验 ----
+        # 为什么单独校验：本项决定「谁永远不会被内核丢弃」，而 DROP 是**全端口**的
+        # ——把自己出口 IP 写成非法 CIDR 又不报错，就是一条把 owner 锁在门外、
+        # 且面板上毫无提示的路径。因此非法条目**整批拒绝**（不是丢掉坏行后照写）。
+        # 归一化后回写 patch：类型转换循环已经把原值（已 strip）放进了 patch，
+        # 这里用规范写法覆盖它（`112.48.13.214` → `112.48.13.214/32`），
+        # 这样重进设置页看到的就是内核判定时用的同一串。
+        if "sys_protect_ips" in patch:
+            _ok, _norm, _bad = config.cidr_list_error(patch["sys_protect_ips"])
+            if not _ok:
+                return self._json({"code": 1, "msg":
+                                   "保护网段含非法 CIDR：%s（支持单个 IP 或 a.b.c.d/n 形式）"
+                                   % "、".join(_bad)})
+            patch["sys_protect_ips"] = _norm
         # 掩码回写防护：GET 回显的 ****** 不得写回（会毁掉真实密钥）
         _strip_masked(patch)
         # SSRF 防护：接口地址变更即校验，否则可先存恶意地址、再走 /api/ai/test 绕开
@@ -1564,6 +1627,7 @@ class Handler(BaseHTTPRequestHandler):
         if _hpp == _bpp:
             return self._json({"code": 1, "msg": "回调端口不能与拦截页端口相同（均为 %d）" % _hpp})
         config.save(patch)   # patch 语义：锁内合并磁盘现状，避免覆盖并发写入方字段
+        self._audit_sysdetect(cfg, patch, body)
         _fw_sync()   # 开关/名单变化立即生效（关闭内核封禁时同步清理残留）
         blockpage.ensure()   # 拦截页端口/开关变更后立即生效
         # 监听地址/端口/并发上限变了：立即重绑（失败会回退旧监听并报错）
@@ -1810,6 +1874,13 @@ class Handler(BaseHTTPRequestHandler):
     def _api_kernban(self, cfg, qs, method):
         st = firewall.status()
         st["enabled"] = bool(cfg.get("fw_sync_enabled", True))
+        # 按丢弃次数排序的来源 Top N（只读；带 10 秒缓存，重复刷新不会反复 fork）。
+        # 取数失败只降级这个键：内核封禁页面的其余信息不能因为归因取不到而空白。
+        try:
+            st["top"] = firewall.top_sources()
+        except Exception:
+            st["top"] = {"available": False, "counters": False,
+                         "sampled_at": 0, "items": []}
         return self._json({"code": 0, "data": st})
 
     def _api_kernban_sync(self, cfg, qs, method):
@@ -1978,6 +2049,121 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             lines = []
         return self._json({"code": 0, "data": {"lines": lines[-lim:], "total": len(lines)}})
+
+    def _audit_sysdetect(self, cfg, patch, body):
+        """系统端口检测的高危变更写审计日志（相当于记录「谁把锁拆了」）。
+
+        只记**状态跳变**，不记普通保存：
+          - `sys_detect_dry_run` 由开→关（从只观察变成真封禁，内核 DROP 是全端口的）；
+          - `sys_protect_ips` 被清空或删短（保护网段缩水 = 可被封的地址变多）；
+          - `sys_detect_enabled` 与 `sys_trust_ssh_login` 被关闭。
+
+        why 不用「每次都记」：观察期里 owner 会反复调阈值，每次都写一条只会
+        把真正的危险操作淹没在噪声里。
+        """
+        def _as_bool(v, default=False):
+            if v is None:
+                return default
+            try:
+                return bool(_to_bool(v))
+            except Exception:
+                return default
+
+        old_dry = _as_bool(cfg.get("sys_detect_dry_run"), True)
+        new_dry = _as_bool(patch.get("sys_detect_dry_run"), old_dry)
+        if old_dry and not new_dry:
+            _audit("系统端口检测：**关闭观察模式**（此后命中阈值的来源会被真封禁，"
+                   "而且内核 DROP 是全端口的）；当前保护网段 %s"
+                   % (str(patch.get("sys_protect_ips",
+                                      cfg.get("sys_protect_ips") or "") or "（空）")))
+        old_en = _as_bool(cfg.get("sys_detect_enabled"), False)
+        new_en = _as_bool(patch.get("sys_detect_enabled"), old_en)
+        if old_en and not new_en:
+            _audit("系统端口检测：关闭检测总开关（不再从 auth.log 统计失败事件）")
+        old_trust = _as_bool(cfg.get("sys_trust_ssh_login"), True)
+        new_trust = _as_bool(patch.get("sys_trust_ssh_login"), old_trust)
+        if old_trust and not new_trust:
+            _audit("系统端口检测：关闭「SSH 登录写信任」（成功登录不再自动免封）")
+        if "sys_protect_ips" in patch:
+            self._audit_protect_ips(cfg.get("sys_protect_ips"),
+                                    patch.get("sys_protect_ips"))
+
+    def _audit_protect_ips(self, old_raw, new_raw):
+        """保护网段变更的审计（只在「清空」与「变少」时写）。
+
+        增多是安全方向的操作，不必记；把条目删少才是把 owner 自己推向误封。
+        """
+        def _n(raw):
+            parts = str(raw or "").replace("\n", ",").replace(";", ",").split(",")
+            return len([p for p in parts if p.strip()])
+
+        old_raw = str(old_raw or "").strip()
+        new_raw = str(new_raw or "").strip()
+        if old_raw == new_raw:
+            return
+        if not new_raw:
+            _audit("系统端口检测：清空保护网段（原先 %d 条），现已无任何免封地址"
+                   % _n(old_raw))
+        elif _n(new_raw) < _n(old_raw):
+            _audit("系统端口检测：保护网段由 %d 条减为 %d 条"
+                   % (_n(old_raw), _n(new_raw)))
+
+    def _api_sysdetect(self, cfg, qs, method):
+        """系统端口（非 frp 端口）检测：观察记录与状态。
+
+        GET  ：检测状态（开关/阈值/读取位置/滑窗计数/活跃会话）
+               + 事件分页列表 + 时间窗汇总。
+        POST ：action=clear 清空观察记录（只动 sys_event，不解封任何 IP）。
+
+        为何不在本接口里改开关/阈值：配置写入统一走 `/api/config`（那里有
+        sys_* 字段的类型校验与保护网段的 CIDR 校验），本接口只读。
+
+        GET 参数：
+            limit   每页条数（默认 50，上限 500）
+            offset  偏移量（默认 0）
+            page    页码（1 起；仅在未给 offset 时生效）
+            ip      按来源 IP 精确筛选
+            action  按 action 前缀筛选（observed / banned / skipped）
+            hours   汇总时间窗（小时，默认 24，上限 720；0 = 全部）
+        """
+        if method == "GET":
+            lim, offset, ip, action, hours = _sysdetect_query(qs)
+            try:
+                events = store.list_sys_event(lim, ip=ip or None,
+                                              action=action or None, offset=offset)
+            except Exception:
+                events = []
+            try:
+                total = store.count_sys_event(ip=ip or None, action=action or None)
+            except Exception:
+                total = 0
+            try:
+                # 汇总口径与列表筛选解耦：owner 要看的是「整体 24h 分布」，
+                # 跟着当前 IP 筛选变会让「阈值是否合适」的判断失去依据。
+                summary = store.summary_sys_event(
+                    int(time.time()) - hours * 3600)
+            except Exception:
+                summary = {}
+            summary["hours"] = hours
+            try:
+                st = sysdetect.status()
+            except Exception:
+                st = {}
+            geo.enrich(events)
+            pages = int((total + lim - 1) // lim) if total > 0 else 0
+            return self._json({"code": 0, "data": st, "events": events,
+                               "total": total, "limit": lim, "offset": offset,
+                               "page": (offset // lim) + 1, "pages": pages,
+                               "summary": summary})
+        body = self._body()
+        action = body.get("action")
+        if action == "clear":
+            n = store.purge_sys_event()
+            _audit("清空系统端口检测观察记录（%d 条）" % n)
+            _log("清空系统端口检测观察记录（%d 条）" % n)
+            return self._json({"code": 0, "msg": "已清空观察记录（%d 条）" % n})
+        # 未知 action：与 /api/iplist、/api/bans 同一口径
+        return self._json({"code": 1, "msg": "未知操作"})
 
     def _api_version(self, cfg, qs, method):
         return self._json({"code": 0, "version": __version__})
@@ -2288,9 +2474,12 @@ def _bg_loop():
             for name in engine.cool_check():
                 _log("代理级冷却：%s 触发分布式突发阈值，冷却期内新 IP 将被拒绝" % name)
             cfg = config.get()
-            store.trim_logs(int(cfg.get("log_max_rows") or 50000))
+            store.trim_logs(int(cfg.get("log_max_rows")
+                              or config.DEFAULTS["log_max_rows"]))
             store.trim_bans(20000)
             store.trim_ai_review(5000)
+            # 系统端口检测事件（试运行观察产物）：只增不改的小表，同样按上限裁剪
+            store.trim_sys_event(5000)
             # 回源段学习表自愈：删过期条目 + 超限淘汰；单独兜底，失败不影响后续内核同步
             try:
                 n_exp, n_evict = store.purge_expired_trusted_cidrs()
@@ -2385,11 +2574,16 @@ def main():
     write_pid()
     _bind_firewall_logger()   # firewall 限频告警并入运行日志（接口缺失时静默跳过）
     _guard_load()   # 登录失败计数跨重启恢复（全局冷却不再因重启而清零）
+    sysdetect.set_logger(_log)   # 系统端口检测并入同一份运行日志
     cfg = config.get()
     t = threading.Thread(target=_bg_loop, daemon=True)
     t.start()
     threading.Thread(target=_snapshot_loop, daemon=True).start()
     threading.Thread(target=ai.loop_forever, daemon=True).start()
+    # 系统端口检测（默认关闭；独立后台线程，与 ai.loop_forever 并列）。
+    # 绝不塞进 _bg_loop：那里每轮 30s 且要保证内核同步不被阻塞；
+    # 也绝不进入 engine.decide() 的每连接热路径。
+    threading.Thread(target=sysdetect.loop_forever, daemon=True).start()
     blockpage.ensure()   # 拦截页服务（独立端口，受 block_page_enabled 控制）
 
     # 1) 面板 + /api（并发闸门 max_concurrent）

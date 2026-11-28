@@ -5,8 +5,10 @@
 配置保存在 data/frpwaf.json，首次运行自动生成（含默认管理员 admin/123456）。
 """
 import copy
+import ipaddress
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -192,6 +194,43 @@ DEFAULTS = {
     # 「敏感服务 20 次/60s -> 永久黑名单」而把自己封掉。
     # 例：`mysql80-tcp,ssh-tcp,codebuddy*`
     "auto_ban_exempt_proxies": "",
+    # ---- 系统端口（非 frp 端口）检测：auth.log 增量 tail ----
+    # 背景：22/6379/8888 等端口不过 frps 回调，engine.decide() 永远看不到它们。
+    # 本组配置驱动 app/sysdetect.py 的独立后台线程，从 auth.log 的失败类事件
+    # 统计来源，达阈值后写**临时封禁**（ban_log），由现有内核链路下发 ipset。
+    #
+    # 为什么默认关闭：内核 DROP 是**全端口**的，被封后 7080/8888 面板一样进不去，
+    # 无法通过面板自助解封（只能上云厂商控制台/VNC）。所以必须显式开启。
+    "sys_detect_enabled": False,
+    # 试运行（只观察不封禁）：即使打开总开关也**默认先观察**。
+    # 没有真实分布就无法定可信阈值，凭直觉拍一个数是本功能唯一真正的风险来源；
+    # 观察期只写 sys_event（action=observed），面板/日志能看到「本应封禁 X」。
+    "sys_detect_dry_run": True,
+    # 日志路径；留空 = 自动探测 /var/log/auth.log（Debian/Ubuntu）→ /var/log/secure。
+    # 只接受绝对路径，含 `..` 的会被忽略（不把它当成任意文件读取通道）。
+    "sys_ssh_log": "",
+    # 计数窗口（秒）与阈值（同 IP 窗口内失败次数）。
+    # 8 次/600s 的取值依据：远高于「自己敲错两三次凭据」，又低于典型集中尝试密度；
+    # 阈值 0 = 只计数不处置（显式关闭触发）。
+    "sys_ssh_window": 600,
+    "sys_ssh_threshold": 8,
+    # 临时封禁时长（秒）。刻意短：自助解封的唯一可靠保证是「封得够短」，
+    # 内核条目自带 timeout，即使守护进程挂了到期也会自动消失。
+    "sys_ssh_ban_seconds": 600,
+    # 单条封禁时长上限（秒）：配置写错（例如填了 99999999）也不会变成事实上的永久封禁。
+    "sys_ban_max_seconds": 3600,
+    # 轮询与单轮处理上限：性能红线，单轮处理有限行数，日志暴涨时也不长时间占线程。
+    "sys_ssh_poll_interval": 5,
+    "sys_ssh_max_lines": 2000,
+    # 全局熔断：一小时内最多新增多少条封禁，超限停止新增（应对整段被扫导致的批量误伤）。
+    "sys_ban_max_per_hour": 30,
+    # 永不封禁的网段（逗号/空白分隔的 CIDR）。建议把自己常用出口/办公 IP 写进来。
+    "sys_protect_ips": "",
+    # 成功的 SSH 登录（含 publickey）是否写入 trust_login_ip（登录即信任）。
+    # 默认开启：这是「别把自己锁在门外」的前提——内核 DROP 是全端口的，
+    # 一旦误封，22 端口也进不去。TTL 复用 trust_login_ttl（0 = 关闭该机制）。
+    # 失败的登录**永不**写入，否则等于给攻击方发豁免。
+    "sys_trust_ssh_login": True,
     "ai_ban_seconds": 1800,               # 疑似封禁时长（秒）；确凿判定走永久黑名单
     "ai_suspicious_ban": True,            # 疑似（suspicious）是否自动临时封禁
     "ai_ssh_strict": True,                # SSH 相关（SSH 爆破 / ssh 代理）是否从严
@@ -379,6 +418,87 @@ def normalize_burst_cool(cfg):
         elif _p > 100:
             cfg["proxy_cool_single_pct"] = 100
     return cfg
+
+
+def normalize_sysdetect(cfg):
+    """系统端口检测参数防呆（写入路径 + 回显路径）。
+
+    sysdetect 在读取时已经对每个数字做了「非数字 → 默认值」的兜底，所以这里
+    只处理「改了不会报错、但会让回显与实际行为不一致」的形态。
+
+    **刻意不把 `sys_ssh_threshold = 0` 纠正成默认值**：0 在 DEFAULTS 与
+    `sysdetect.handle_fail()` 里是已文档化的显式语义（只计数、不处置）。
+    把它静默拉高到 8，等于把「用户明确关了触发」惄惄重新武装——
+    那反而可能凑出他本来在避免的封禁。负数与 0 同义（均不处置），一并保留。
+
+    反之 `sys_ssh_window` 必须 ≥1：sysdetect 里窗口 0 会回退成默认值，
+    若配置里留着 0，就会出现「面板显示 0 秒、实际按 600 秒算」的偏差。
+
+    就地修改并返回传入字典（便于链式调用）。
+    """
+    try:
+        int(cfg.get("sys_ssh_threshold"))
+    except (TypeError, ValueError):
+        # 非数字（含 None）无法表达「只计数」的意图，只能回退默认
+        cfg["sys_ssh_threshold"] = DEFAULTS["sys_ssh_threshold"]
+    for _k in ("sys_ssh_window", "sys_ssh_ban_seconds", "sys_ban_max_seconds",
+               "sys_ban_max_per_hour", "sys_ssh_poll_interval"):
+        try:
+            _v = int(cfg.get(_k))
+        except (TypeError, ValueError):
+            cfg[_k] = DEFAULTS[_k]
+            continue
+        _floor = 1 if _k == "sys_ssh_window" else 0
+        if _v < _floor:
+            cfg[_k] = DEFAULTS[_k]
+    try:
+        cfg["sys_protect_ips"] = str(cfg.get("sys_protect_ips") or "").strip()
+    except Exception:
+        cfg["sys_protect_ips"] = ""
+    return cfg
+
+
+# CIDR 列表分隔符：逗号/分号/换行/空白都当分隔（面板里多半是粘一整列 IP）。
+_CIDR_SPLIT = re.compile(r"[,;\s]+")
+
+# 单次校验最多回报多少个非法条目（避免整段贴错时把提示撑爆）。
+_CIDR_BAD_LIMIT = 6
+
+
+def cidr_list_error(raw):
+    """校验「永不封禁网段」（`sys_protect_ips`）的输入，返回 (ok, normalized, bad)。
+
+    这一项决定「谁永远不会被内核丢弃」，而 DROP 是**全端口**的：写坏了不会报错，
+    只会让保护静默失效——正是 owner 把自己锁在门外的路径。因此格式错误一律拒绝
+    写入，而不是「尽力解析、丢掉坏行」：被丢掉的坏行可能就是 owner 自己的出口 IP。
+
+    归一化规则：合法条目按输入顺序去重，统一用 `ip_network(..., strict=False)`
+    的规范写法（`112.48.13.214` → `112.48.13.214/32`），以逗号 + 空格拼接。
+    空输入是合法的（清空保护名单是一个明确的意图，由 UI 做二次确认）。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return True, "", []
+    good = []
+    bad = []
+    seen = set()
+    for part in _CIDR_SPLIT.split(text):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            net = ipaddress.ip_network(part, strict=False)
+        except ValueError:
+            bad.append(part)
+            continue
+        key = str(net)
+        if key in seen:
+            continue
+        seen.add(key)
+        good.append(key)
+    if bad:
+        return False, "", bad[:_CIDR_BAD_LIMIT]
+    return True, ", ".join(good), []
 
 
 def normalize_listen(cfg):
@@ -693,6 +813,7 @@ def save(patch):
         normalize_block_page(merged)    # 防呆：拦截页端口非法/冲突回退；重定向端口白名单化
         normalize_listen(merged)        # 防呆：监听端口/并发上限非法回退
         normalize_addr_policy(merged)   # 防呆：strict_addr / ai_allow_private 布尔归一化
+        normalize_sysdetect(merged)     # 防呆：系统端口检测阈值/窗口非法回退默认
         normalize_password_flag(merged)  # 防呆：password_changed 与口令实值对齐
         if not merged.get("secret"):
             merged["secret"] = secrets.token_hex(32)
